@@ -108,22 +108,37 @@ async def on_member_join(member: discord.Member):
 
 @bot.tree.command(name="回顶", description="回到楼主（第1楼）")
 async def back_to_top(interaction: discord.Interaction):
-    """发送该频道第一条消息的跳转链接"""
-    # 获取该频道的第一条消息
+    """直接显示首楼内容，并回复首楼实现跳转"""
     async for first_msg in interaction.channel.history(oldest_first=True, limit=1):
-        jump_url = first_msg.jump_url
+        # 回复首楼 —— Discord 会自动生成跳转横条，点击即可回到首楼
+        content = first_msg.content or "*（无文字内容）*"
+        if len(content) > 1900:
+            content = content[:1900] + "\n\n*（内容过长已截断）*"
+
         embed = discord.Embed(
-            title="🔝 回顶",
-            description=f"[点击跳转到楼主（第1楼）]({jump_url})",
+            title="🔝 首楼（楼主）",
+            description=content,
             color=discord.Color.blue(),
+            timestamp=first_msg.created_at,
         )
-        embed.add_field(name="楼主", value=first_msg.author.mention, inline=True)
-        embed.add_field(
-            name="发布时间",
-            value=discord.utils.format_dt(first_msg.created_at, "R"),
-            inline=True,
+        embed.set_author(
+            name=first_msg.author.display_name,
+            icon_url=first_msg.author.display_avatar.url,
         )
-        await interaction.response.send_message(embed=embed)
+
+        # 如果有附件也一并显示
+        if first_msg.attachments:
+            attachment_urls = "\n".join(
+                f"[{a.filename}]({a.url})" for a in first_msg.attachments
+            )
+            embed.add_field(name="附件", value=attachment_urls[:1024], inline=False)
+
+        # 用 reply 发送，回复横条直接可跳转回首楼
+        await interaction.response.send_message(
+            embed=embed,
+            reference=first_msg,
+            mention_author=False,
+        )
         return
 
     await interaction.response.send_message("该频道还没有任何消息。", ephemeral=True)
