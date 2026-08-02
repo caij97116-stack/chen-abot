@@ -1,5 +1,6 @@
 import os
 import json
+import random
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -25,10 +26,31 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 # ─── 数据文件路径 ───
 DATA_FILE = "file_records.json"
+QUESTIONS_FILE = "questions.json"
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool, "comment_count": int } } }
 file_records: dict = {}
+
+# ─── 答题系统 ───
+QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
+QUIZ_PASS_THRESHOLD = 1.0           # 正确率多少算通过（1.0 = 全对）
+QUIZ_VERIFIED_ROLE = "已认证"        # 答题通过后赋予的身份组
+quiz_questions: list = []            # 从 questions.json 加载的题目
+quiz_sessions: dict = {}             # 正在答题的用户: {user_id: {questions, answers, message}}
+
+
+def load_questions():
+    """从 JSON 加载题目"""
+    global quiz_questions
+    try:
+        if os.path.exists(QUESTIONS_FILE):
+            with open(QUESTIONS_FILE, "r", encoding="utf-8") as f:
+                quiz_questions = json.load(f)
+            logger.info(f"已加载 {len(quiz_questions)} 道题目")
+    except Exception as e:
+        logger.error(f"加载题目失败: {e}")
+        quiz_questions = []
 
 
 def save_records():
@@ -60,6 +82,7 @@ def load_records():
 @bot.event
 async def on_ready():
     load_records()
+    load_questions()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -378,6 +401,163 @@ async def _send_file_to_user(interaction: discord.Interaction, record: dict, 文
             f"❌ 获取文件时出错: {e}",
             ephemeral=True,
         )
+
+
+# ═══════════════════════════════════════════
+#  /答题 - 入群审核答题
+# ═══════════════════════════════════════════
+
+class QuizAnswerModal(discord.ui.Modal, title="答题"):
+    """答题输入弹窗"""
+
+    def __init__(self, questions: list, session_user_id: int):
+        super().__init__()
+        self.quiz_questions = questions
+        self.session_user_id = session_user_id
+        self.answer_input = discord.ui.TextInput(
+            label="请输入答案",
+            placeholder=f"依次输入 {len(questions)} 道题的答案，如: A B C D E",
+            style=discord.TextStyle.short,
+            required=True,
+            min_length=len(questions),
+            max_length=len(questions) * 2,
+        )
+        self.add_item(self.answer_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if interaction.user.id != self.session_user_id:
+            await interaction.response.send_message("这不是你的答题！请自己使用 /答题 命令。", ephemeral=True)
+            return
+
+        # 解析用户答案
+        raw = self.answer_input.value.strip().upper()
+        user_answers = []
+        for ch in raw:
+            if ch.isalpha():
+                user_answers.append(ch)
+
+        if len(user_answers) != len(self.quiz_questions):
+            await interaction.response.send_message(
+                f"答案数量不对！需要 {len(self.quiz_questions)} 个答案，你输入了 {len(user_answers)} 个。请重新 /答题。",
+                ephemeral=True,
+            )
+            return
+
+        # 评分
+        correct = 0
+        details = []
+        for i, q in enumerate(self.quiz_questions):
+            expected = q["answer"].upper().strip()
+            given = user_answers[i] if i < len(user_answers) else "?"
+            is_correct = given == expected
+            if is_correct:
+                correct += 1
+            mark = "✅" if is_correct else "❌"
+            details.append(f"{mark} 第{i+1}题: 你的答案 `{given}` → 正确答案 `{expected}`")
+
+        total = len(self.quiz_questions)
+        score = correct / total if total > 0 else 0
+        passed = score >= QUIZ_PASS_THRESHOLD
+
+        # 构建结果 embed
+        if passed:
+            color = discord.Color.green()
+            title = "🎉 答题通过！"
+            summary = f"正确 {correct}/{total}，恭喜你通过了入群审核！"
+        else:
+            color = discord.Color.red()
+            title = "❌ 答题未通过"
+            summary = f"正确 {correct}/{total}，需要全对才能通过。请重新 /答题。"
+
+        embed = discord.Embed(
+            title=title,
+            description=summary + "\n\n" + "\n".join(details),
+            color=color,
+        )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+        # 通过后分配身份组
+        if passed:
+            role = discord.utils.get(interaction.guild.roles, name=QUIZ_VERIFIED_ROLE)
+            if role:
+                try:
+                    await interaction.user.add_roles(role)
+                    logger.info(f"答题通过: {interaction.user.name} 获得 {role.name} 身份组")
+                except discord.Forbidden:
+                    logger.warning(f"无法为 {interaction.user.name} 分配身份组 {QUIZ_VERIFIED_ROLE}")
+            else:
+                logger.warning(f"服务器中没有找到「{QUIZ_VERIFIED_ROLE}」身份组")
+
+        # 清理 session
+        quiz_sessions.pop(interaction.user.id, None)
+
+
+@bot.tree.command(name="答题", description="开始入群审核答题")
+async def start_quiz(interaction: discord.Interaction):
+    """开始答题，从题库中随机抽题"""
+    # 检查是否已有答题进行中
+    if interaction.user.id in quiz_sessions:
+        await interaction.response.send_message(
+            "你有一个答题正在进行中！请先完成它。",
+            ephemeral=True,
+        )
+        return
+
+    if len(quiz_questions) < QUIZ_QUESTIONS_PER_ROUND:
+        await interaction.response.send_message(
+            f"题库中题目不足 {QUIZ_QUESTIONS_PER_ROUND} 道，请联系管理员添加题目。",
+            ephemeral=True,
+        )
+        return
+
+    # 随机抽题
+    selected = random.sample(quiz_questions, QUIZ_QUESTIONS_PER_ROUND)
+
+    # 构建题目展示 embed
+    embed = discord.Embed(
+        title="📝 Chen-Abot 入群答题",
+        description=f"共 {QUIZ_QUESTIONS_PER_ROUND} 道题，需要 **全部答对** 才能通过。\n"
+                    f"点击下方按钮打开答题弹窗，依次输入答案。\n\n"
+                    f"如答案依次为 A、B、C、D、E，则输入 `ABCDE`。",
+        color=discord.Color.blue(),
+    )
+
+    for i, q in enumerate(selected, 1):
+        options_text = "\n".join(q["options"])
+        embed.add_field(
+            name=f"第{i}题: {q['question']}",
+            value=options_text,
+            inline=False,
+        )
+
+    embed.set_footer(text="点击下方「开始答题」按钮输入答案")
+
+    # 创建按钮
+    view = discord.ui.View()
+    modal = QuizAnswerModal(selected, interaction.user.id)
+    button = discord.ui.Button(
+        label="开始答题",
+        style=discord.ButtonStyle.primary,
+        emoji="✍️",
+    )
+
+    async def button_callback(btn_interaction: discord.Interaction):
+        if btn_interaction.user.id != interaction.user.id:
+            await btn_interaction.response.send_message("这不是你的答题！请自己使用 /答题 命令。", ephemeral=True)
+            return
+        await btn_interaction.response.send_modal(modal)
+
+    button.callback = button_callback
+    view.add_item(button)
+
+    # 记录 session
+    quiz_sessions[interaction.user.id] = {
+        "questions": selected,
+        "started_at": datetime.now().isoformat(),
+    }
+
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
 # ═══════════════════════════════════════════
