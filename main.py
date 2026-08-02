@@ -27,7 +27,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 DATA_FILE = "file_records.json"
 
 # ─── 文件记录存储 ───
-# 结构: { "file_id": { "name": str, "uploader_id": int, "channel_id": int, "message_id": int, "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool } } }
+# 结构: { "file_id": { "name": str, "uploader_id": int, ..., "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool, "comment_count": int } } }
 file_records: dict = {}
 
 
@@ -148,77 +148,52 @@ async def back_to_top(interaction: discord.Interaction):
 #  /上传文件 - 上传文件并设置获取条件
 # ═══════════════════════════════════════════
 
-# 获取条件选项（Choice）
-CONDITION_CHOICES = [
-    app_commands.Choice(name="需要密码", value="password"),
-    app_commands.Choice(name="需要点赞首楼", value="like_first"),
-    app_commands.Choice(name="需要评论首楼", value="comment_first"),
+_YES_NO = [
+    app_commands.Choice(name="是", value="yes"),
+    app_commands.Choice(name="否", value="no"),
 ]
 
 
-@bot.tree.command(name="上传文件", description="上传文件到社区，可设置获取条件")
+@bot.tree.command(name="上传文件", description="上传文件到社区，由上传者自定义获取条件")
 @app_commands.describe(
-    文件="要上传的文件（png/json/zip等）",
-    条件1="获取条件1（可选）",
-    密码="如果条件选择了「需要密码」，在此输入密码",
-    条件2="获取条件2（可选，可与条件1叠加）",
+    文件="要上传的文件（png/json/zip/txt/mp4等）",
+    密码="自定义密码，获取文件时需要输入。不填则不需要密码",
+    需要点赞="是否需要给首楼点赞才能获取？",
+    需要评论="是否需要在首楼下评论才能获取？",
+    评论条数="需要评论多少条？（默认1条，仅当「需要评论=是」时生效）",
 )
-@app_commands.choices(条件1=CONDITION_CHOICES, 条件2=CONDITION_CHOICES)
+@app_commands.choices(需要点赞=_YES_NO, 需要评论=_YES_NO)
 async def upload_file(
     interaction: discord.Interaction,
     文件: discord.Attachment,
-    条件1: Optional[app_commands.Choice[str]] = None,
     密码: Optional[str] = None,
-    条件2: Optional[app_commands.Choice[str]] = None,
+    需要点赞: Optional[app_commands.Choice[str]] = None,
+    需要评论: Optional[app_commands.Choice[str]] = None,
+    评论条数: int = 1,
 ):
-    """
-    上传文件并设置获取条件。
-    条件类型:
-    - 需要密码: 获取文件时必须输入密码
-    - 需要点赞首楼: 获取文件前必须给频道第一条消息点赞
-    - 需要评论首楼: 获取文件前必须在频道第一条消息下评论
-    条件1和条件2可以叠加使用。
-    """
     await interaction.response.defer(ephemeral=False)
 
-    # 解析条件
-    chosen = set()
-    if 条件1:
-        chosen.add(条件1.value)
-    if 条件2:
-        chosen.add(条件2.value)
+    if 评论条数 < 1:
+        评论条数 = 1
+    if 评论条数 > 50:
+        评论条数 = 50
 
     conditions = {
-        "password": None,
-        "require_like_first": "like_first" in chosen,
-        "require_comment_first": "comment_first" in chosen,
+        "password": 密码.strip() if 密码 else None,
+        "require_like_first": 需要点赞 is not None and 需要点赞.value == "yes",
+        "require_comment_first": 需要评论 is not None and 需要评论.value == "yes",
+        "comment_count": 评论条数 if (需要评论 is not None and 需要评论.value == "yes") else 0,
     }
 
-    if "password" in chosen:
-        if not 密码:
-            await interaction.followup.send(
-                "❌ 你选择了「需要密码」条件，但没有填写密码！请重新上传并填写密码。",
-                ephemeral=True,
-            )
-            return
-        conditions["password"] = 密码
-
-    # 将文件消息发送到频道
+    # 发送文件到频道
     file_msg = await interaction.channel.send(
         content=f"📁 **{文件.filename}**",
         file=await 文件.to_file(),
     )
 
-    # 获取文件消息中的附件 URL
-    if file_msg.attachments:
-        attachment = file_msg.attachments[0]
-    else:
-        attachment = 文件
-
-    # 生成文件 ID
+    attachment = file_msg.attachments[0] if file_msg.attachments else 文件
     file_id = str(file_msg.id)
 
-    # 保存记录
     file_records[file_id] = {
         "name": 文件.filename,
         "uploader_id": interaction.user.id,
@@ -233,9 +208,7 @@ async def upload_file(
     }
     save_records()
 
-    # 构建条件说明
     cond_desc = _build_condition_description(conditions)
-
     embed = discord.Embed(
         title="✅ 文件上传成功",
         description=f"**文件名:** {文件.filename}\n"
@@ -247,19 +220,18 @@ async def upload_file(
         timestamp=datetime.now(),
     )
     embed.set_footer(text=f"上传者: {interaction.user.display_name}")
-
     await interaction.followup.send(embed=embed)
 
 
 def _build_condition_description(conditions: dict) -> str:
-    """构建条件的可读描述"""
     parts = []
+    if conditions["password"]:
+        parts.append("需要密码")
     if conditions["require_like_first"]:
         parts.append("需要点赞首楼")
     if conditions["require_comment_first"]:
-        parts.append("需要评论首楼")
-    if conditions["password"]:
-        parts.append(f"需要密码")
+        cnt = conditions.get("comment_count", 1)
+        parts.append(f"需要评论首楼 {cnt} 条")
     if not parts:
         return "无条件，所有人可获取"
     return " | ".join(parts)
@@ -323,9 +295,10 @@ async def get_file(
 
         # 检查评论首楼
         if conditions["require_comment_first"]:
-            commented = await _check_user_commented_first(interaction)
-            if not commented:
-                failed_reasons.append("需要在首楼（第一条消息）下方评论")
+            needed = conditions.get("comment_count", 1)
+            count = await _count_user_comments_on_first(interaction)
+            if count < needed:
+                failed_reasons.append(f"需要在首楼下评论 {needed} 条（当前已评论 {count} 条）")
 
     if failed_reasons:
         embed = discord.Embed(
@@ -358,19 +331,19 @@ async def _check_user_liked_first(interaction: discord.Interaction) -> bool:
         return False
 
 
-async def _check_user_commented_first(interaction: discord.Interaction) -> bool:
-    """检查用户是否在频道第一条消息下方评论过"""
+async def _count_user_comments_on_first(interaction: discord.Interaction) -> int:
+    """统计用户在频道第一条消息下方评论了多少条"""
     try:
         async for first_msg in interaction.channel.history(oldest_first=True, limit=1):
             first_msg_id = first_msg.id
-            # 搜索该用户回复首楼的消息
+            count = 0
             async for msg in interaction.channel.history(after=first_msg, limit=200):
                 if msg.author.id == interaction.user.id and msg.reference and msg.reference.message_id == first_msg_id:
-                    return True
-            return False
-        return False
+                    count += 1
+            return count
+        return 0
     except Exception:
-        return False
+        return 0
 
 
 async def _send_file_to_user(interaction: discord.Interaction, record: dict, 文件id: str):
