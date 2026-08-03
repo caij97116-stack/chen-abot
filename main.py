@@ -40,6 +40,7 @@ file_records: dict = {}
 QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
 QUIZ_MAX_ERRORS = 2                # 最多允许错几题（超过则失败）
 QUIZ_COOLDOWN_MINUTES = 25         # 每次失败后增加的冷却时间（分钟）
+QUIZ_QUESTION_TIMEOUT = 300        # 每道题限时（秒），默认 5 分钟
 QUIZ_VERIFIED_ROLE = "已认证"        # 答题通过后赋予的身份组
 QUIZ_CHANNEL_KEYWORD = "答题"        # 答题频道名称关键词（包含此词即可）
 QUIZ_CHANNEL_FILE = "quiz_channels.json"     # 答题频道消息记录
@@ -743,16 +744,33 @@ def _build_question_embed(q: dict, idx: int, total: int) -> discord.Embed:
     return embed
 
 
-def _build_question_view(user_id: int, q_index: int, total: int) -> discord.ui.View:
-    """构建单题选项按钮视图"""
-    view = discord.ui.View(timeout=300)
+class QuizQuestionView(discord.ui.View):
+    """单题选项按钮视图，限时作答"""
 
-    for label in ["A", "B", "C", "D"]:
-        btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, row=0)
-        btn.callback = _make_answer_callback(user_id, q_index, total, label)
-        view.add_item(btn)
+    def __init__(self, user_id: int, q_index: int, total: int, interaction: discord.Interaction):
+        super().__init__(timeout=QUIZ_QUESTION_TIMEOUT)
+        self.user_id = user_id
+        self.q_index = q_index
+        self.total = total
+        self._interaction = interaction
 
-    return view
+        for label in ["A", "B", "C", "D"]:
+            btn = discord.ui.Button(label=label, style=discord.ButtonStyle.primary, row=0)
+            btn.callback = _make_answer_callback(user_id, q_index, total, label)
+            self.add_item(btn)
+
+    async def on_timeout(self):
+        """超时自动清理答题 session"""
+        session = quiz_sessions.get(self.user_id)
+        if session and session.get("current_index") == self.q_index:
+            quiz_sessions.pop(self.user_id, None)
+            try:
+                await self._interaction.followup.send(
+                    f"⏰ 第 {self.q_index + 1} 题答题超时（限时 {QUIZ_QUESTION_TIMEOUT // 60} 分钟），答题已结束，请重新开始。",
+                    ephemeral=True,
+                )
+            except Exception:
+                pass
 
 
 def _make_answer_callback(user_id: int, q_index: int, total: int, answer: str):
@@ -779,7 +797,7 @@ def _make_answer_callback(user_id: int, q_index: int, total: int, answer: str):
             session["current_index"] = next_index
             q = session["questions"][next_index]
             embed = _build_question_embed(q, next_index, total)
-            view = _build_question_view(user_id, next_index, total)
+            view = QuizQuestionView(user_id, next_index, total, interaction)
             await interaction.response.edit_message(embed=embed, view=view)
 
     return callback
@@ -918,7 +936,7 @@ async def _do_quiz(interaction: discord.Interaction):
 
     q = selected[0]
     embed = _build_question_embed(q, 0, QUIZ_QUESTIONS_PER_ROUND)
-    view = _build_question_view(user_id, 0, QUIZ_QUESTIONS_PER_ROUND)
+    view = QuizQuestionView(user_id, 0, QUIZ_QUESTIONS_PER_ROUND, interaction)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
