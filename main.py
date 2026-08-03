@@ -243,19 +243,19 @@ class ConditionView(discord.ui.View):
             await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
             return
         record["conditions"]["require_comment_first"] = not record["conditions"]["require_comment_first"]
-        record["conditions"]["comment_count"] = 1 if record["conditions"]["require_comment_first"] else 0
+        record["conditions"]["min_comment_length"] = 1 if record["conditions"]["require_comment_first"] else 0
         save_records()
         await interaction.response.send_message(
-            f"✅ 评论要求已{'开启（需1条）' if record['conditions']['require_comment_first'] else '关闭'}",
+            f"✅ 评论要求已{'开启（至少1字）' if record['conditions']['require_comment_first'] else '关闭'}",
             ephemeral=True,
         )
 
-    @discord.ui.button(label="🔢 评论条数", style=discord.ButtonStyle.secondary, row=1)
+    @discord.ui.button(label="🔢 评论字数", style=discord.ButtonStyle.secondary, row=1)
     async def set_comment_count(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.uploader_id:
             await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
             return
-        await interaction.response.send_modal(CommentCountModal(self.file_id))
+        await interaction.response.send_modal(CommentLengthModal(self.file_id))
 
     async def on_timeout(self):
         self.disable_all_items()
@@ -263,17 +263,17 @@ class ConditionView(discord.ui.View):
             await self.message.edit(view=self)
 
 
-class CommentCountModal(discord.ui.Modal, title="设置评论条数"):
+class CommentLengthModal(discord.ui.Modal, title="设置评论字数"):
     def __init__(self, file_id: str):
         super().__init__()
         self.file_id = file_id
         self.count_input = discord.ui.TextInput(
-            label="需要评论多少条？",
-            placeholder="输入数字，如 3",
+            label="评论最少需要多少字？",
+            placeholder="输入数字，如 15",
             style=discord.TextStyle.short,
             required=True,
             min_length=1,
-            max_length=2,
+            max_length=3,
         )
         self.add_item(self.count_input)
 
@@ -286,16 +286,16 @@ class CommentCountModal(discord.ui.Modal, title="设置评论条数"):
             count = int(self.count_input.value)
             if count < 1:
                 count = 1
-            if count > 50:
-                count = 50
+            if count > 500:
+                count = 500
         except ValueError:
             await interaction.response.send_message("请输入有效数字。", ephemeral=True)
             return
         record["conditions"]["require_comment_first"] = True
-        record["conditions"]["comment_count"] = count
+        record["conditions"]["min_comment_length"] = count
         save_records()
         await interaction.response.send_message(
-            f"✅ 已设置：需要评论首楼 {count} 条",
+            f"✅ 已设置：评论首楼至少 {count} 字",
             ephemeral=True,
         )
 
@@ -324,7 +324,7 @@ async def upload_file(
         "password": None,
         "require_like_first": False,
         "require_comment_first": False,
-        "comment_count": 0,
+        "min_comment_length": 0,
     }
 
     file_records[file_id] = {
@@ -364,8 +364,8 @@ def _build_condition_description(conditions: dict) -> str:
     if conditions["require_like_first"]:
         parts.append("需要点赞首楼")
     if conditions["require_comment_first"]:
-        cnt = conditions.get("comment_count", 1)
-        parts.append(f"需要评论首楼 {cnt} 条")
+        cnt = conditions.get("min_comment_length", 1)
+        parts.append(f"需要评论首楼（至少{cnt}字）")
     if not parts:
         return "无条件，所有人可获取"
     return " | ".join(parts)
@@ -434,10 +434,10 @@ async def get_file(
                     failed_reasons.append("需要给首楼点赞")
 
             if conditions["require_comment_first"]:
-                needed = conditions.get("comment_count", 1)
-                count = await _count_user_comments_on_first(interaction)
-                if count < needed:
-                    failed_reasons.append(f"需要评论首楼 {needed} 条（当前 {count} 条）")
+                needed = conditions.get("min_comment_length", 1)
+                met = await _check_user_comment_length(interaction, needed)
+                if not met:
+                    failed_reasons.append(f"需要评论首楼至少 {needed} 字")
 
         if failed_reasons:
             results.append((record, None, failed_reasons))
@@ -482,19 +482,19 @@ async def _check_user_liked_first(interaction: discord.Interaction) -> bool:
         return False
 
 
-async def _count_user_comments_on_first(interaction: discord.Interaction) -> int:
-    """统计用户在频道第一条消息下方评论了多少条"""
+async def _check_user_comment_length(interaction: discord.Interaction, min_length: int) -> bool:
+    """检查用户是否在首楼下发过至少 min_length 字的评论"""
     try:
         async for first_msg in interaction.channel.history(oldest_first=True, limit=1):
             first_msg_id = first_msg.id
-            count = 0
             async for msg in interaction.channel.history(after=first_msg, limit=200):
                 if msg.author.id == interaction.user.id and msg.reference and msg.reference.message_id == first_msg_id:
-                    count += 1
-            return count
-        return 0
+                    if len(msg.content) >= min_length:
+                        return True
+            return False
+        return False
     except Exception:
-        return 0
+        return False
 
 
 async def _send_file_to_user(interaction: discord.Interaction, record: dict, 文件id: str):
