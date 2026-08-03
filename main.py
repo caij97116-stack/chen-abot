@@ -973,7 +973,17 @@ async def _show_results(interaction: discord.Interaction, session: dict):
         color=color,
     )
 
-    await interaction.response.edit_message(embed=embed, view=None)
+    msg = await interaction.response.edit_message(embed=embed, view=None)
+
+    # 结果消息一定时间后自动删除（仅答题者可见，超时消失）
+    async def _auto_delete():
+        await asyncio.sleep(30)
+        try:
+            await msg.delete()
+        except Exception:
+            pass
+
+    asyncio.create_task(_auto_delete())
 
     # 通过后分配身份组
     if passed:
@@ -994,6 +1004,15 @@ async def _show_results(interaction: discord.Interaction, session: dict):
 async def _do_quiz(interaction: discord.Interaction):
     """答题核心逻辑，供 /答题 命令和答题频道按钮共用"""
     user_id = interaction.user.id
+
+    # 检查是否已经通过答题
+    role = discord.utils.get(interaction.user.roles, name=QUIZ_VERIFIED_ROLE)
+    if role:
+        await interaction.response.send_message(
+            "✅ 你已经通过了入群审核，拥有「{0}」身份组，无需再次答题！".format(QUIZ_VERIFIED_ROLE),
+            ephemeral=True,
+        )
+        return
 
     # 检查是否有进行中的答题
     if user_id in quiz_sessions:
