@@ -381,6 +381,51 @@ def _format_size(size_bytes: int) -> str:
 
 
 # ═══════════════════════════════════════════
+#  /文件列表 - 查看当前频道存储的文件（仅元数据，无法获取）
+# ═══════════════════════════════════════════
+
+@bot.tree.command(name="文件列表", description="查看当前频道内存储的文件信息（仅查看，无法获取文件）")
+async def file_list(interaction: discord.Interaction):
+    """列出当前频道所有文件，仅元数据，不提供文件内容"""
+    await interaction.response.defer(ephemeral=True)
+
+    channel_files = {
+        fid: rec for fid, rec in file_records.items()
+        if str(rec.get("source_channel_id", rec.get("channel_id"))) == str(interaction.channel.id)
+    }
+
+    if not channel_files:
+        await interaction.followup.send("📭 当前频道没有存储的文件。", ephemeral=True)
+        return
+
+    sorted_files = sorted(
+        channel_files.items(),
+        key=lambda x: x[1].get("upload_time", ""),
+        reverse=True,
+    )
+
+    embed = discord.Embed(
+        title=f"📋 文件列表（共 {len(sorted_files)} 个）",
+        color=discord.Color.blue(),
+    )
+
+    for file_id, rec in sorted_files:
+        cond_desc = _build_condition_description(rec["conditions"])
+        upload_time = rec.get("upload_time", "未知")[:10]
+        embed.add_field(
+            name=f"📁 {rec['name']}",
+            value=f"上传者: <@{rec['uploader_id']}>\n"
+                  f"大小: {_format_size(rec['size'])}\n"
+                  f"条件: {cond_desc}\n"
+                  f"时间: {upload_time}",
+            inline=False,
+        )
+
+    embed.set_footer(text="仅查看元数据，获取文件仍需满足条件")
+    await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+# ═══════════════════════════════════════════
 #  /获取文件 - 获取已上传的文件（需满足条件）
 # ═══════════════════════════════════════════
 
