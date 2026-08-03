@@ -1,4 +1,5 @@
 import os
+import io
 import json
 import random
 import asyncio
@@ -29,10 +30,10 @@ bot = commands.Bot(command_prefix=None, intents=intents)
 # ─── 数据文件路径 ───
 DATA_FILE = "file_records.json"
 QUESTIONS_FILE = "questions.json"
-FILES_DIR = "files"
+FILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
 
 # ─── 文件记录存储 ───
-# 结构: { "file_id": { "name": str, "uploader_id": int, ..., "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool, "comment_count": int } } }
+# 结构: { "file_id": { "name": str, "uploader_id": int, ..., "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool, "min_comment_length": int } } }
 file_records: dict = {}
 
 # ─── 答题系统 ───
@@ -182,7 +183,7 @@ class ConditionsModal(discord.ui.Modal, title="设置获取条件"):
             "password": password,
             "require_like_first": False,
             "require_comment_first": False,
-            "comment_count": 0,
+            "min_comment_length": 0,
         }
         record["conditions"] = new_conditions
         save_records()
@@ -407,12 +408,12 @@ class GetFileView(discord.ui.View):
             reverse=True,
         )
 
-        for file_id, rec in sorted_files:
+        for i, (file_id, rec) in enumerate(sorted_files[:25]):  # Discord 最多 25 个按钮
             btn = discord.ui.Button(
                 label=f"获取 {rec['name'][:60]}",
                 style=discord.ButtonStyle.primary,
                 custom_id=file_id,
-                row=0,
+                row=i // 5,  # 每行最多 5 个按钮
             )
             btn.callback = self.make_callback(file_id)
             self.add_item(btn)
@@ -564,12 +565,22 @@ async def _check_user_comment_length(interaction: discord.Interaction, min_lengt
         async for first_msg in interaction.channel.history(oldest_first=True, limit=1):
             first_msg_id = first_msg.id
             async for msg in interaction.channel.history(after=first_msg, limit=200):
-                if msg.author.id == interaction.user.id and msg.reference and msg.reference.message_id == first_msg_id:
+                if msg.author.id != interaction.user.id:
+                    continue
+                # 检查是否是回复首楼的消息
+                ref = msg.reference
+                if ref is None:
+                    continue
+                ref_msg_id = getattr(ref, "message_id", None)
+                if ref_msg_id is None:
+                    continue
+                if ref_msg_id == first_msg_id:
                     if len(msg.content) >= min_length:
                         return True
             return False
         return False
-    except Exception:
+    except Exception as e:
+        logger.error(f"检查评论长度失败: {e}")
         return False
 
 
@@ -577,24 +588,35 @@ async def _send_file_to_user(interaction: discord.Interaction, record: dict, 文
     """发送文件给用户"""
     try:
         file_path = record.get("file_path")
+        logger.info(f"获取文件: file_path={file_path}, name={record.get('name')}, exists={os.path.exists(file_path) if file_path else 'N/A'}")
+
         if file_path and os.path.exists(file_path):
+            file_size = os.path.getsize(file_path)
+            logger.info(f"文件大小: {file_size} bytes")
+
             with open(file_path, "rb") as f:
                 file_bytes = f.read()
-            discord_file = discord.File(file_bytes, filename=record["name"])
+
+            discord_file = discord.File(
+                fp=io.BytesIO(file_bytes),
+                filename=record["name"],
+            )
             await interaction.followup.send(
                 content=f"📁 **{record['name']}**\n"
                         f"上传者: <@{record['uploader_id']}>",
                 file=discord_file,
                 ephemeral=True,
             )
+            logger.info(f"文件发送成功: {record['name']}")
             return
 
+        logger.warning(f"文件不存在: {file_path}")
         await interaction.followup.send(
             "❌ 文件已丢失，请重新上传。",
             ephemeral=True,
         )
     except Exception as e:
-        logger.error(f"获取文件失败: {e}")
+        logger.error(f"获取文件失败: {e}", exc_info=True)
         await interaction.followup.send(
             f"❌ 获取文件时出错: {e}",
             ephemeral=True,
