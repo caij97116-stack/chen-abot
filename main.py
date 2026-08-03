@@ -423,13 +423,15 @@ class GetFileView(discord.ui.View):
 
     def make_callback(self, file_id: str):
         async def callback(interaction: discord.Interaction):
+            await interaction.response.defer(ephemeral=True)
+
             if interaction.user.id != self.interaction_user_id:
-                await interaction.response.send_message("这不是你的操作。", ephemeral=True)
+                await interaction.followup.send("这不是你的操作。", ephemeral=True)
                 return
 
             record = self.channel_files.get(file_id)
             if not record:
-                await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+                await interaction.followup.send("文件记录已丢失。", ephemeral=True)
                 return
 
             conditions = record["conditions"]
@@ -453,7 +455,7 @@ class GetFileView(discord.ui.View):
                         failed_reasons.append(f"需要评论首楼至少 {min_len} 字")
 
             if failed_reasons:
-                await interaction.response.send_message(
+                await interaction.followup.send(
                     "❌ " + "，".join(failed_reasons),
                     ephemeral=True,
                 )
