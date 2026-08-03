@@ -1,6 +1,8 @@
 import os
 import json
 import random
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -578,6 +580,27 @@ async def on_app_command_error(interaction: discord.Interaction, error):
 
 
 # ═══════════════════════════════════════════
+#  HTTP 服务器（用于 Render 健康检查，免费 Web Service 需要）
+# ═══════════════════════════════════════════
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"OK")
+    def log_message(self, format, *args):
+        pass  # 不输出 HTTP 日志
+
+
+def run_http_server():
+    port = int(os.getenv("PORT", 8000))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    logger.info(f"🌐 HTTP 服务器已启动，端口: {port}")
+    server.serve_forever()
+
+
+# ═══════════════════════════════════════════
 #  启动 Bot
 # ═══════════════════════════════════════════
 
@@ -587,6 +610,9 @@ if __name__ == "__main__":
         logger.error("❌ 未设置 DISCORD_BOT_TOKEN 环境变量！")
         logger.error("请在环境变量中设置 DISCORD_BOT_TOKEN，或创建 .env 文件。")
         exit(1)
+
+    # 启动 HTTP 服务器（在后台线程）
+    threading.Thread(target=run_http_server, daemon=True).start()
 
     logger.info("🚀 正在启动 Chen-Abot...")
     bot.run(token)
