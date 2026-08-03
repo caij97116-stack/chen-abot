@@ -227,8 +227,6 @@ class ConditionView(discord.ui.View):
             await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
             return
         record["conditions"]["require_like_first"] = not record["conditions"]["require_like_first"]
-        record["conditions"]["require_comment_first"] = False
-        record["conditions"]["comment_count"] = 0
         save_records()
         await interaction.response.send_message(
             f"✅ 点赞要求已{'开启' if record['conditions']['require_like_first'] else '关闭'}",
@@ -245,7 +243,6 @@ class ConditionView(discord.ui.View):
             await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
             return
         record["conditions"]["require_comment_first"] = not record["conditions"]["require_comment_first"]
-        record["conditions"]["require_like_first"] = False
         record["conditions"]["comment_count"] = 1 if record["conditions"]["require_comment_first"] else 0
         save_records()
         await interaction.response.send_message(
@@ -295,7 +292,6 @@ class CommentCountModal(discord.ui.Modal, title="设置评论条数"):
             await interaction.response.send_message("请输入有效数字。", ephemeral=True)
             return
         record["conditions"]["require_comment_first"] = True
-        record["conditions"]["require_like_first"] = False
         record["conditions"]["comment_count"] = count
         save_records()
         await interaction.response.send_message(
