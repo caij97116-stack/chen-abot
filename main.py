@@ -157,8 +157,152 @@ async def back_to_top(interaction: discord.Interaction):
 
 
 # ═══════════════════════════════════════════
-#  /上传文件 - 上传文件（条件单独设置）
+#  /上传文件 - 上传文件，上传后弹出条件设置
 # ═══════════════════════════════════════════
+
+class ConditionsModal(discord.ui.Modal, title="设置获取条件"):
+    """上传后弹出的条件设置窗口"""
+
+    def __init__(self, file_id: str):
+        super().__init__()
+        self.file_id = file_id
+        self.password_input = discord.ui.TextInput(
+            label="密码（留空则不设密码）",
+            placeholder="输入密码，或留空跳过",
+            style=discord.TextStyle.short,
+            required=False,
+            max_length=50,
+        )
+        self.add_item(self.password_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+
+        if record["uploader_id"] != interaction.user.id:
+            await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
+            return
+
+        password = self.password_input.value.strip() or None
+        new_conditions = {
+            "password": password,
+            "require_like_first": False,
+            "require_comment_first": False,
+            "comment_count": 0,
+        }
+        record["conditions"] = new_conditions
+        save_records()
+
+        cond_desc = _build_condition_description(new_conditions)
+        await interaction.response.send_message(
+            f"✅ 条件已设置：{cond_desc}",
+            ephemeral=True,
+        )
+
+
+class ConditionView(discord.ui.View):
+    """上传确认消息上的按钮"""
+
+    def __init__(self, file_id: str, uploader_id: int):
+        super().__init__(timeout=300)
+        self.file_id = file_id
+        self.uploader_id = uploader_id
+
+    @discord.ui.button(label="🔒 设置获取条件", style=discord.ButtonStyle.primary)
+    async def set_conditions_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.uploader_id:
+            await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
+            return
+        await interaction.response.send_modal(ConditionsModal(self.file_id))
+
+    @discord.ui.button(label="👍 需要点赞", style=discord.ButtonStyle.secondary, row=1)
+    async def toggle_like(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.uploader_id:
+            await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
+            return
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        record["conditions"]["require_like_first"] = not record["conditions"]["require_like_first"]
+        record["conditions"]["require_comment_first"] = False
+        record["conditions"]["comment_count"] = 0
+        save_records()
+        await interaction.response.send_message(
+            f"✅ 点赞要求已{'开启' if record['conditions']['require_like_first'] else '关闭'}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="💬 需要评论", style=discord.ButtonStyle.secondary, row=1)
+    async def toggle_comment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.uploader_id:
+            await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
+            return
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        record["conditions"]["require_comment_first"] = not record["conditions"]["require_comment_first"]
+        record["conditions"]["require_like_first"] = False
+        record["conditions"]["comment_count"] = 1 if record["conditions"]["require_comment_first"] else 0
+        save_records()
+        await interaction.response.send_message(
+            f"✅ 评论要求已{'开启（需1条）' if record['conditions']['require_comment_first'] else '关闭'}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🔢 评论条数", style=discord.ButtonStyle.secondary, row=1)
+    async def set_comment_count(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.uploader_id:
+            await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
+            return
+        await interaction.response.send_modal(CommentCountModal(self.file_id))
+
+    async def on_timeout(self):
+        self.disable_all_items()
+        if self.message:
+            await self.message.edit(view=self)
+
+
+class CommentCountModal(discord.ui.Modal, title="设置评论条数"):
+    def __init__(self, file_id: str):
+        super().__init__()
+        self.file_id = file_id
+        self.count_input = discord.ui.TextInput(
+            label="需要评论多少条？",
+            placeholder="输入数字，如 3",
+            style=discord.TextStyle.short,
+            required=True,
+            min_length=1,
+            max_length=2,
+        )
+        self.add_item(self.count_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        try:
+            count = int(self.count_input.value)
+            if count < 1:
+                count = 1
+            if count > 50:
+                count = 50
+        except ValueError:
+            await interaction.response.send_message("请输入有效数字。", ephemeral=True)
+            return
+        record["conditions"]["require_comment_first"] = True
+        record["conditions"]["require_like_first"] = False
+        record["conditions"]["comment_count"] = count
+        save_records()
+        await interaction.response.send_message(
+            f"✅ 已设置：需要评论首楼 {count} 条",
+            ephemeral=True,
+        )
+
 
 @bot.tree.command(name="上传文件", description="上传文件到当前频道")
 @app_commands.describe(
@@ -180,7 +324,6 @@ async def upload_file(
     attachment = file_msg.attachments[0] if file_msg.attachments else 文件
     file_id = str(file_msg.id)
 
-    # 默认无条件
     conditions = {
         "password": None,
         "require_like_first": False,
@@ -208,87 +351,14 @@ async def upload_file(
         description=f"**文件名:** {文件.filename}\n"
                     f"**大小:** {_format_size(文件.size)}\n\n"
                     f"当前无条件限制，所有人可直接 `/获取文件`。\n"
-                    f"如需设置条件，请使用 `/设置条件`。",
+                    f"点击下方按钮设置获取条件 ⬇️",
         color=discord.Color.green(),
         timestamp=datetime.now(),
     )
     embed.set_footer(text=f"上传者: {interaction.user.display_name}")
-    await interaction.followup.send(embed=embed)
 
-
-# ═══════════════════════════════════════════
-#  /设置条件 - 为当前频道文件设置获取条件
-# ═══════════════════════════════════════════
-
-_YES_NO = [
-    app_commands.Choice(name="是", value="yes"),
-    app_commands.Choice(name="否", value="no"),
-]
-
-
-@bot.tree.command(name="设置条件", description="为当前频道的文件设置获取条件")
-@app_commands.describe(
-    密码="自定义密码，获取文件时需要输入。不填则不需要密码",
-    需要点赞="是否需要给首楼点赞才能获取？",
-    需要评论="是否需要在首楼下评论才能获取？",
-    评论条数="需要评论多少条？（默认1条，仅当「需要评论=是」时生效）",
-)
-@app_commands.choices(需要点赞=_YES_NO, 需要评论=_YES_NO)
-async def set_conditions(
-    interaction: discord.Interaction,
-    密码: Optional[str] = None,
-    需要点赞: Optional[app_commands.Choice[str]] = None,
-    需要评论: Optional[app_commands.Choice[str]] = None,
-    评论条数: int = 1,
-):
-    await interaction.response.defer(ephemeral=True)
-
-    # 查找当前频道内的文件
-    channel_files = {
-        fid: rec for fid, rec in file_records.items()
-        if str(rec.get("source_channel_id", rec.get("channel_id"))) == str(interaction.channel.id)
-    }
-
-    if not channel_files:
-        await interaction.followup.send(
-            "📭 当前频道还没有上传过文件，请先使用 `/上传文件`。",
-            ephemeral=True,
-        )
-        return
-
-    # 检查是否为上传者
-    for fid, rec in channel_files.items():
-        if rec["uploader_id"] != interaction.user.id:
-            await interaction.followup.send(
-                "❌ 只有上传者才能设置获取条件。",
-                ephemeral=True,
-            )
-            return
-
-    if 评论条数 < 1:
-        评论条数 = 1
-    if 评论条数 > 50:
-        评论条数 = 50
-
-    new_conditions = {
-        "password": 密码.strip() if 密码 else None,
-        "require_like_first": 需要点赞 is not None and 需要点赞.value == "yes",
-        "require_comment_first": 需要评论 is not None and 需要评论.value == "yes",
-        "comment_count": 评论条数 if (需要评论 is not None and 需要评论.value == "yes") else 0,
-    }
-
-    # 更新所有当前频道文件的获取条件
-    updated = 0
-    for fid in channel_files:
-        file_records[fid]["conditions"] = new_conditions
-        updated += 1
-    save_records()
-
-    cond_desc = _build_condition_description(new_conditions)
-    await interaction.followup.send(
-        f"✅ 已更新 {updated} 个文件的获取条件：{cond_desc}",
-        ephemeral=True,
-    )
+    view = ConditionView(file_id, interaction.user.id)
+    view.message = await interaction.followup.send(embed=embed, view=view)
 
 
 def _build_condition_description(conditions: dict) -> str:
