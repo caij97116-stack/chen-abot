@@ -95,6 +95,24 @@ async def on_ready():
 
 
 # ═══════════════════════════════════════════
+#  新成员自动身份组
+# ═══════════════════════════════════════════
+
+MEMBER_ROLE_NAME = "入岛新人"
+
+
+@bot.event
+async def on_member_join(member: discord.Member):
+    role = discord.utils.get(member.guild.roles, name=MEMBER_ROLE_NAME)
+    if role:
+        try:
+            await member.add_roles(role)
+            logger.info(f"已为 {member.name} 分配 {MEMBER_ROLE_NAME} 身份组")
+        except discord.Forbidden:
+            pass
+
+
+# ═══════════════════════════════════════════
 #  /回顶 - 回到楼主（第1楼）
 # ═══════════════════════════════════════════
 
