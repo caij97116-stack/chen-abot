@@ -24,3 +24,4 @@ env/
 # 上传的文件
 files/
 storage_config.json
+quiz_channels.json

@@ -40,8 +40,11 @@ file_records: dict = {}
 QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
 QUIZ_PASS_THRESHOLD = 1.0           # 正确率多少算通过（1.0 = 全对）
 QUIZ_VERIFIED_ROLE = "已认证"        # 答题通过后赋予的身份组
+QUIZ_CHANNEL_KEYWORD = "答题"        # 答题频道名称关键词（包含此词即可）
+QUIZ_CHANNEL_FILE = "quiz_channels.json"  # 答题频道消息记录
 quiz_questions: list = []            # 从 questions.json 加载的题目
 quiz_sessions: dict = {}             # 正在答题的用户: {user_id: {questions, answers, message}}
+quiz_channel_messages: dict = {}     # 答题频道消息: {channel_id: message_id}
 
 
 def load_questions():
@@ -79,6 +82,26 @@ def load_records():
         file_records = {}
 
 
+def load_quiz_channels():
+    """加载答题频道消息记录"""
+    global quiz_channel_messages
+    try:
+        if os.path.exists(QUIZ_CHANNEL_FILE):
+            with open(QUIZ_CHANNEL_FILE, "r", encoding="utf-8") as f:
+                quiz_channel_messages = json.load(f)
+    except Exception:
+        quiz_channel_messages = {}
+
+
+def save_quiz_channels():
+    """保存答题频道消息记录"""
+    try:
+        with open(QUIZ_CHANNEL_FILE, "w", encoding="utf-8") as f:
+            json.dump(quiz_channel_messages, f)
+    except Exception as e:
+        logger.error(f"保存答题频道信息失败: {e}")
+
+
 # ═══════════════════════════════════════════
 #  Bot 启动与就绪
 # ═══════════════════════════════════════════
@@ -87,6 +110,7 @@ def load_records():
 async def on_ready():
     load_records()
     load_questions()
+    load_quiz_channels()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -94,6 +118,9 @@ async def on_ready():
         logger.info(f"🔧 已同步 {len(synced)} 个斜杠命令")
     except Exception as e:
         logger.error(f"命令同步失败: {e}")
+
+    # 在答题频道中发布/更新答题按钮消息
+    await setup_quiz_channels()
 
 
 # ═══════════════════════════════════════════
@@ -112,6 +139,42 @@ async def on_member_join(member: discord.Member):
             logger.info(f"已为 {member.name} 分配 {MEMBER_ROLE_NAME} 身份组")
         except discord.Forbidden:
             pass
+
+
+async def setup_quiz_channels():
+    """在名称包含 QUIZ_CHANNEL_KEYWORD 的频道中发布答题按钮消息"""
+    quiz_embed = discord.Embed(
+        title="📝 入群审核答题",
+        description="点击下方按钮开始答题，需要 **全部答对** 才能通过审核。\n\n"
+                    "如果按钮无法使用，请使用 `/答题` 命令。",
+        color=discord.Color.blue(),
+    )
+    quiz_embed.set_footer(text="答题消息仅自己可见")
+
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if QUIZ_CHANNEL_KEYWORD not in channel.name:
+                continue
+
+            try:
+                existing_msg_id = quiz_channel_messages.get(str(channel.id))
+                if existing_msg_id:
+                    try:
+                        msg = await channel.fetch_message(int(existing_msg_id))
+                        await msg.edit(embed=quiz_embed, view=PersistentQuizView())
+                        logger.info(f"更新答题按钮: #{channel.name}")
+                        continue
+                    except Exception:
+                        pass
+
+                msg = await channel.send(embed=quiz_embed, view=PersistentQuizView())
+                quiz_channel_messages[str(channel.id)] = str(msg.id)
+                save_quiz_channels()
+                logger.info(f"发布答题按钮: #{channel.name}")
+            except discord.Forbidden:
+                logger.warning(f"无权限在 #{channel.name} 发送消息")
+            except Exception as e:
+                logger.error(f"答题频道 #{channel.name} 设置失败: {e}")
 
 
 # ═══════════════════════════════════════════
@@ -624,8 +687,24 @@ async def _send_file_to_user(interaction: discord.Interaction, record: dict, 文
 
 
 # ═══════════════════════════════════════════
-#  /答题 - 入群审核答题
+#  答题系统 - 持久化按钮视图 + 共享逻辑
 # ═══════════════════════════════════════════
+
+class PersistentQuizView(discord.ui.View):
+    """答题频道持久化按钮视图（无超时，重启后恢复）"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="开始答题",
+        style=discord.ButtonStyle.primary,
+        emoji="✍️",
+        custom_id="persistent_quiz_start",
+    )
+    async def quiz_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_quiz(interaction)
+
 
 class QuizAnswerModal(discord.ui.Modal, title="答题"):
     """答题输入弹窗"""
@@ -713,10 +792,8 @@ class QuizAnswerModal(discord.ui.Modal, title="答题"):
         quiz_sessions.pop(interaction.user.id, None)
 
 
-@bot.tree.command(name="答题", description="开始入群审核答题")
-async def start_quiz(interaction: discord.Interaction):
-    """开始答题，从题库中随机抽题"""
-    # 检查是否已有答题进行中
+async def _do_quiz(interaction: discord.Interaction):
+    """答题核心逻辑，供 /答题 命令和答题频道按钮共用"""
     if interaction.user.id in quiz_sessions:
         await interaction.response.send_message(
             "你有一个答题正在进行中！请先完成它。",
@@ -778,6 +855,15 @@ async def start_quiz(interaction: discord.Interaction):
     }
 
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# ═══════════════════════════════════════════
+#  /答题 - 备用命令（答题频道按钮失效时使用）
+# ═══════════════════════════════════════════
+
+@bot.tree.command(name="答题", description="开始入群审核答题（备用命令）")
+async def start_quiz(interaction: discord.Interaction):
+    await _do_quiz(interaction)
 
 
 # ═══════════════════════════════════════════
@@ -845,6 +931,8 @@ if __name__ == "__main__":
 
     async def main():
         await start_http_server()
+        # 注册持久化答题按钮（必须在 bot.start() 之前）
+        bot.add_view(PersistentQuizView())
         logger.info("🚀 正在启动 Chen-Abot...")
         try:
             await bot.start(token)
