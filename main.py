@@ -300,7 +300,7 @@ class CommentLengthModal(discord.ui.Modal, title="设置评论字数"):
         )
 
 
-@bot.tree.command(name="上传文件", description="上传文件到当前频道（重复上传会覆盖旧文件）")
+@bot.tree.command(name="上传文件", description="上传文件到当前频道")
 @app_commands.describe(
     文件="要上传的文件（png/json/zip/txt/mp4等）",
 )
@@ -320,11 +320,7 @@ async def upload_file(
 
     old_conditions = None
     if channel_files:
-        # 继承第一个文件的条件
         old_conditions = next(iter(channel_files.values()))["conditions"]
-        # 删除旧文件记录
-        for fid in channel_files:
-            del file_records[fid]
 
     # 发送新文件到隐藏存储频道
     file_msg = await storage.send(
@@ -359,7 +355,7 @@ async def upload_file(
 
     cond_desc = _build_condition_description(conditions)
     embed = discord.Embed(
-        title="✅ 文件上传成功" + ("（已覆盖旧文件）" if old_conditions else ""),
+        title="✅ 文件上传成功",
         description=f"**文件名:** {文件.filename}\n"
                     f"**大小:** {_format_size(文件.size)}\n\n"
                     f"获取条件: {cond_desc}\n\n"
