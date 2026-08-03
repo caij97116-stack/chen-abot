@@ -141,6 +141,15 @@ async def on_member_join(member: discord.Member):
 
 
 # ═══════════════════════════════════════════
+#  /ping - 检查 bot 是否在线
+# ═══════════════════════════════════════════
+
+@bot.tree.command(name="ping", description="检查机器人是否在线")
+async def ping(interaction: discord.Interaction):
+    await interaction.response.send_message("🏓 Pong！在线中", ephemeral=True)
+
+
+# ═══════════════════════════════════════════
 #  /回顶 - 回到楼主（第1楼）
 # ═══════════════════════════════════════════
 
@@ -320,23 +329,33 @@ async def upload_file(
 ):
     await interaction.response.defer(ephemeral=False)
 
-    storage = await get_storage_channel(interaction.guild)
+    try:
+        storage = await get_storage_channel(interaction.guild)
+    except Exception as e:
+        logger.error(f"获取存储频道失败: {e}")
+        await interaction.followup.send("❌ 无法访问文件存储频道，请检查 bot 权限。", ephemeral=True)
+        return
 
-    # 查找当前频道已有的文件，继承条件
-    channel_files = {
-        fid: rec for fid, rec in file_records.items()
-        if str(rec.get("source_channel_id", rec.get("channel_id"))) == str(interaction.channel.id)
-    }
+    try:
+        # 查找当前频道已有的文件，继承条件
+        channel_files = {
+            fid: rec for fid, rec in file_records.items()
+            if str(rec.get("source_channel_id", rec.get("channel_id"))) == str(interaction.channel.id)
+        }
 
-    old_conditions = None
-    if channel_files:
-        old_conditions = next(iter(channel_files.values()))["conditions"]
+        old_conditions = None
+        if channel_files:
+            old_conditions = next(iter(channel_files.values()))["conditions"]
 
-    # 发送新文件到隐藏存储频道
-    file_msg = await storage.send(
-        content=f"📁 **{文件.filename}**",
-        file=await 文件.to_file(),
-    )
+        # 发送新文件到隐藏存储频道
+        file_msg = await storage.send(
+            content=f"📁 **{文件.filename}**",
+            file=await 文件.to_file(),
+        )
+    except Exception as e:
+        logger.error(f"上传文件失败: {e}")
+        await interaction.followup.send(f"❌ 上传失败: {e}", ephemeral=True)
+        return
 
     attachment = file_msg.attachments[0] if file_msg.attachments else 文件
     file_id = str(file_msg.id)
