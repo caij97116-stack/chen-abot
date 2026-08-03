@@ -98,11 +98,27 @@ async def on_ready():
 #  新成员自动身份组
 # ═══════════════════════════════════════════
 
+WELCOME_CHANNEL = "欢迎频道"
 MEMBER_ROLE_NAME = "入岛新人"
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
+    channel = discord.utils.get(member.guild.text_channels, name=WELCOME_CHANNEL)
+    if channel is None:
+        channel = member.guild.system_channel
+
+    if channel:
+        embed = discord.Embed(
+            title="👋 欢迎加入社区！",
+            description=f"欢迎 {member.mention} 来到 **{member.guild.name}**！",
+            color=discord.Color.green(),
+            timestamp=datetime.now(),
+        )
+        embed.set_thumbnail(url=member.display_avatar.url)
+        embed.set_footer(text=f"你是第 {len(member.guild.members)} 位成员")
+        await channel.send(embed=embed)
+
     role = discord.utils.get(member.guild.roles, name=MEMBER_ROLE_NAME)
     if role:
         try:
