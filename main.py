@@ -301,7 +301,7 @@ async def upload_file(
     interaction: discord.Interaction,
     文件: discord.Attachment,
 ):
-    await interaction.response.defer(ephemeral=False)
+    await interaction.response.defer(ephemeral=True)
 
     try:
         # 确保 files 目录存在
