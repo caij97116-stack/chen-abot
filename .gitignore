@@ -20,3 +20,7 @@ Thumbs.db
 venv/
 .venv/
 env/
+
+# 上传的文件
+files/
+storage_config.json

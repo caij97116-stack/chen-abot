@@ -5,7 +5,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
-from aiohttp import web, ClientSession
+from aiohttp import web
 import logging
 from datetime import datetime
 from typing import Optional
@@ -29,8 +29,7 @@ bot = commands.Bot(command_prefix=None, intents=intents)
 # ─── 数据文件路径 ───
 DATA_FILE = "file_records.json"
 QUESTIONS_FILE = "questions.json"
-CONFIG_FILE = "storage_config.json"
-STORAGE_CHANNEL = "chen-abot-file-storage"
+FILES_DIR = "files"
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool, "comment_count": int } } }
@@ -77,54 +76,6 @@ def load_records():
     except Exception as e:
         logger.error(f"加载文件记录失败: {e}")
         file_records = {}
-
-
-async def get_storage_channel(guild: discord.Guild):
-    """获取或创建文件存储频道（仅 bot 可见），ID 持久化到文件"""
-    # 从文件读取缓存的频道 ID
-    saved_id = None
-    try:
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, "r") as f:
-                config = json.load(f)
-                saved_id = config.get("storage_channel_id")
-    except Exception:
-        pass
-
-    # 用缓存的 ID 获取
-    if saved_id:
-        channel = guild.get_channel(saved_id)
-        if channel:
-            return channel
-
-    # 按名称搜索（遍历所有频道，避免 emoji 编码问题）
-    for ch in guild.text_channels:
-        if ch.name == STORAGE_CHANNEL:
-            channel = ch
-            break
-    else:
-        channel = None
-
-    if channel:
-        # 保存 ID
-        with open(CONFIG_FILE, "w") as f:
-            json.dump({"storage_channel_id": channel.id}, f)
-        return channel
-
-    # 创建新频道
-    overwrites = {
-        guild.default_role: discord.PermissionOverwrite(read_messages=False),
-        guild.me: discord.PermissionOverwrite(read_messages=True),
-    }
-    channel = await guild.create_text_channel(
-        STORAGE_CHANNEL,
-        overwrites=overwrites,
-        topic="Bot 文件存储，请勿删除",
-    )
-    with open(CONFIG_FILE, "w") as f:
-        json.dump({"storage_channel_id": channel.id}, f)
-    logger.info(f"已创建存储频道: {channel.name}")
-    return channel
 
 
 # ═══════════════════════════════════════════
@@ -352,35 +303,31 @@ async def upload_file(
     await interaction.response.defer(ephemeral=False)
 
     try:
-        storage = await get_storage_channel(interaction.guild)
-    except Exception as e:
-        logger.error(f"获取存储频道失败: {e}")
-        await interaction.followup.send("❌ 无法访问文件存储频道，请检查 bot 权限。", ephemeral=True)
-        return
+        # 确保 files 目录存在
+        os.makedirs(FILES_DIR, exist_ok=True)
 
-    try:
-        # 查找当前频道已有的文件，继承条件
-        channel_files = {
-            fid: rec for fid, rec in file_records.items()
-            if str(rec.get("source_channel_id", rec.get("channel_id"))) == str(interaction.channel.id)
-        }
+        # 读取文件内容
+        file_bytes = await 文件.read()
 
-        old_conditions = None
-        if channel_files:
-            old_conditions = next(iter(channel_files.values()))["conditions"]
-
-        # 发送新文件到隐藏存储频道
-        file_msg = await storage.send(
-            content=f"📁 **{文件.filename}**",
-            file=await 文件.to_file(),
-        )
+        # 生成文件 ID 并保存到磁盘
+        file_id = str(int(datetime.now().timestamp() * 1000))
+        file_path = os.path.join(FILES_DIR, file_id)
+        with open(file_path, "wb") as f:
+            f.write(file_bytes)
     except Exception as e:
         logger.error(f"上传文件失败: {e}")
         await interaction.followup.send(f"❌ 上传失败: {e}", ephemeral=True)
         return
 
-    attachment = file_msg.attachments[0] if file_msg.attachments else 文件
-    file_id = str(file_msg.id)
+    # 查找当前频道已有的文件，继承条件
+    channel_files = {
+        fid: rec for fid, rec in file_records.items()
+        if str(rec.get("source_channel_id")) == str(interaction.channel.id)
+    }
+
+    old_conditions = None
+    if channel_files:
+        old_conditions = next(iter(channel_files.values()))["conditions"]
 
     conditions = old_conditions if old_conditions else {
         "password": None,
@@ -393,12 +340,10 @@ async def upload_file(
         "name": 文件.filename,
         "uploader_id": interaction.user.id,
         "uploader_name": interaction.user.display_name,
-        "channel_id": storage.id,
         "source_channel_id": interaction.channel.id,
         "guild_id": interaction.guild.id,
-        "message_id": file_msg.id,
-        "attachment_url": attachment.url,
-        "size": 文件.size,
+        "file_path": file_path,
+        "size": len(file_bytes),
         "conditions": conditions,
         "upload_time": datetime.now().isoformat(),
     }
@@ -530,7 +475,7 @@ async def get_file(
 
     channel_files = {
         fid: rec for fid, rec in file_records.items()
-        if str(rec.get("source_channel_id", rec.get("channel_id"))) == str(interaction.channel.id)
+        if str(rec.get("source_channel_id")) == str(interaction.channel.id)
     }
 
     if not channel_files:
@@ -631,42 +576,21 @@ async def _check_user_comment_length(interaction: discord.Interaction, min_lengt
 async def _send_file_to_user(interaction: discord.Interaction, record: dict, 文件id: str):
     """发送文件给用户"""
     try:
-        # 获取原始消息中的附件
-        channel = bot.get_channel(record["channel_id"])
-        if channel:
-            try:
-                original_msg = await channel.fetch_message(record["message_id"])
-                if original_msg.attachments:
-                    file_bytes = await original_msg.attachments[0].read()
-                    discord_file = discord.File(file_bytes, filename=record["name"])
-                    await interaction.followup.send(
-                        content=f"📁 **{record['name']}**\n"
-                                f"上传者: <@{record['uploader_id']}>\n"
-                                f"文件ID: `{文件id}`",
-                        file=discord_file,
-                        ephemeral=True,
-                    )
-                    return
-            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
-                pass
-
-        # 如果无法从原始消息获取，尝试从 URL 下载
-        async with ClientSession() as session:
-            async with session.get(record["attachment_url"]) as resp:
-                if resp.status == 200:
-                    file_bytes = await resp.read()
-                    discord_file = discord.File(file_bytes, filename=record["name"])
-                    await interaction.followup.send(
-                        content=f"📁 **{record['name']}**\n"
-                                f"上传者: <@{record['uploader_id']}>\n"
-                                f"文件ID: `{文件id}`",
-                        file=discord_file,
-                        ephemeral=True,
-                    )
-                    return
+        file_path = record.get("file_path")
+        if file_path and os.path.exists(file_path):
+            with open(file_path, "rb") as f:
+                file_bytes = f.read()
+            discord_file = discord.File(file_bytes, filename=record["name"])
+            await interaction.followup.send(
+                content=f"📁 **{record['name']}**\n"
+                        f"上传者: <@{record['uploader_id']}>",
+                file=discord_file,
+                ephemeral=True,
+            )
+            return
 
         await interaction.followup.send(
-            "❌ 无法读取文件，原始文件可能已被删除。",
+            "❌ 文件已丢失，请重新上传。",
             ephemeral=True,
         )
     except Exception as e:
