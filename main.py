@@ -5,7 +5,7 @@ import asyncio
 import discord
 from discord.ext import commands
 from discord import app_commands
-from aiohttp import web
+from aiohttp import web, ClientSession
 import logging
 from datetime import datetime
 from typing import Optional
@@ -378,8 +378,7 @@ async def _send_file_to_user(interaction: discord.Interaction, record: dict, 文
                 pass
 
         # 如果无法从原始消息获取，尝试从 URL 下载
-        import aiohttp
-        async with aiohttp.ClientSession() as session:
+        async with ClientSession() as session:
             async with session.get(record["attachment_url"]) as resp:
                 if resp.status == 200:
                     file_bytes = await resp.read()
@@ -583,8 +582,12 @@ async def on_app_command_error(interaction: discord.Interaction, error):
 #  HTTP 服务器（平台健康检查用，可选）
 # ═══════════════════════════════════════════
 
+_runner = None
+
+
 async def start_http_server():
     """启动轻量 HTTP 服务器用于平台健康检查"""
+    global _runner
     port = int(os.getenv("PORT", 8080))
     app = web.Application()
     
@@ -592,9 +595,9 @@ async def start_http_server():
         return web.Response(text="OK")
     
     app.router.add_get("/", health_check)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", port)
+    _runner = web.AppRunner(app)
+    await _runner.setup()
+    site = web.TCPSite(_runner, "0.0.0.0", port)
     await site.start()
     logger.info(f"🌐 HTTP 健康检查已启动，端口: {port}")
 
@@ -612,9 +615,28 @@ if __name__ == "__main__":
     token = token.strip()
     logger.info(f"🔑 Token 长度: {len(token)} 字符，开头: {token[:10]}...")
 
+    async def shutdown():
+        """优雅关闭：清理 HTTP runner 和 bot 连接"""
+        logger.info("🛑 正在关闭...")
+        if _runner:
+            await _runner.cleanup()
+        if not bot.is_closed():
+            await bot.close()
+        logger.info("✅ 已关闭")
+
     async def main():
         await start_http_server()
         logger.info("🚀 正在启动 Chen-Abot...")
-        await bot.start(token)
+        try:
+            await bot.start(token)
+        except discord.LoginFailure as e:
+            logger.error(f"❌ Token 无效: {e}")
+        except Exception as e:
+            logger.error(f"❌ 启动失败: {e}")
+        finally:
+            await shutdown()
 
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
