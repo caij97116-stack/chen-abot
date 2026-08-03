@@ -2,11 +2,10 @@ import os
 import json
 import random
 import asyncio
-import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import discord
 from discord.ext import commands
 from discord import app_commands
+from aiohttp import web
 import logging
 from datetime import datetime
 from typing import Optional
@@ -581,24 +580,23 @@ async def on_app_command_error(interaction: discord.Interaction, error):
 
 
 # ═══════════════════════════════════════════
-#  HTTP 服务器（用于 Render 健康检查，免费 Web Service 需要）
+#  HTTP 服务器（平台健康检查用，可选）
 # ═══════════════════════════════════════════
 
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"OK")
-    def log_message(self, format, *args):
-        pass  # 不输出 HTTP 日志
-
-
-def run_http_server():
-    port = int(os.getenv("PORT", 8000))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    logger.info(f"🌐 HTTP 服务器已启动，端口: {port}")
-    server.serve_forever()
+async def start_http_server():
+    """启动轻量 HTTP 服务器用于平台健康检查"""
+    port = int(os.getenv("PORT", 8080))
+    app = web.Application()
+    
+    async def health_check(request):
+        return web.Response(text="OK")
+    
+    app.router.add_get("/", health_check)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"🌐 HTTP 健康检查已启动，端口: {port}")
 
 
 # ═══════════════════════════════════════════
@@ -614,12 +612,9 @@ if __name__ == "__main__":
     token = token.strip()
     logger.info(f"🔑 Token 长度: {len(token)} 字符，开头: {token[:10]}...")
 
-    # 启动 HTTP 服务器（在后台线程，Render 健康检查需要）
-    threading.Thread(target=run_http_server, daemon=True).start()
-
-    async def start_bot():
+    async def main():
+        await start_http_server()
         logger.info("🚀 正在启动 Chen-Abot...")
         await bot.start(token)
 
-    logger.info("🚀 正在启动 Chen-Abot...")
-    asyncio.run(start_bot())
+    asyncio.run(main())
