@@ -912,18 +912,14 @@ async def _show_results(interaction: discord.Interaction, session: dict):
     user_id = interaction.user.id
 
     correct = 0
-    details = []
+    wrong_nums = []
     for i, q in enumerate(questions):
         expected = q["answer"].upper().strip()
         given = answers[i] if i < len(answers) else "?"
-        is_correct = given == expected
-        if is_correct:
+        if given == expected:
             correct += 1
-        mark = "✅" if is_correct else "❌"
-        details.append(
-            f"{mark} 第{i + 1}题: {q['question'][:40]}..."
-            f" → 你的答案 `{given}`，正确答案 `{expected}`"
-        )
+        else:
+            wrong_nums.append(i + 1)
 
     errors = total - correct
     passed = errors <= QUIZ_MAX_ERRORS
@@ -943,7 +939,6 @@ async def _show_results(interaction: discord.Interaction, session: dict):
         quiz_cooldowns[str(user_id)] = cooldown
         save_quiz_cooldowns()
     else:
-        # 通过后清除冷却记录
         quiz_cooldowns.pop(str(user_id), None)
         save_quiz_cooldowns()
 
@@ -951,24 +946,30 @@ async def _show_results(interaction: discord.Interaction, session: dict):
     if passed:
         color = discord.Color.green()
         title = "🎉 答题通过！"
-        summary = f"正确 {correct}/{total}（错误 {errors} 个，≤{QUIZ_MAX_ERRORS} 个），恭喜你通过了入群审核！"
+        description = (
+            f"正确 {correct}/{total} 题，恭喜你获得了「{QUIZ_VERIFIED_ROLE}」身份组！\n\n"
+            f"现在你可以去探索更多小岛内容了，祝你玩得开心～"
+        )
     else:
         color = discord.Color.red()
         title = "❌ 答题未通过"
+        wrong_list = "、".join(f"第{n}题" for n in wrong_nums)
+        description = (
+            f"正确 {correct}/{total} 题，错了 {errors} 题（超过 {QUIZ_MAX_ERRORS} 题需重考）\n\n"
+            f"答错的题目：{wrong_list}\n\n"
+            f"📖 建议去查看社区规则和公告，了解清楚后再来答题哦～"
+        )
         if cooldown_minutes > 0:
-            summary = (
-                f"正确 {correct}/{total}（错误 {errors} 个，超过 {QUIZ_MAX_ERRORS} 个需重考）\n\n"
-                f"⏳ 第 {cooldown['fail_count']} 次失败，需要等待 **{cooldown_minutes} 分钟** 后才能重新答题"
+            description += (
+                f"\n\n⏳ 第 {cooldown['fail_count']} 次失败，需要等待 **{cooldown_minutes} 分钟** 后才能重新答题"
             )
         else:
-            summary = (
-                f"正确 {correct}/{total}（错误 {errors} 个，超过 {QUIZ_MAX_ERRORS} 个需重考）\n\n"
-                f"你可以立即重新答题"
-            )
+            description += "\n\n你可以立即重新答题"
+        description += "\n\n💪 别灰心，下次一定能过！"
 
     embed = discord.Embed(
         title=title,
-        description=summary + "\n\n" + "\n".join(details),
+        description=description,
         color=color,
     )
 
