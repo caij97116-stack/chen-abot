@@ -30,7 +30,7 @@ bot = commands.Bot(command_prefix=None, intents=intents)
 DATA_FILE = "file_records.json"
 QUESTIONS_FILE = "questions.json"
 CONFIG_FILE = "storage_config.json"
-STORAGE_CHANNEL = "📁-文件存储"
+STORAGE_CHANNEL = "chen-abot-file-storage"
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool, "comment_count": int } } }
