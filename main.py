@@ -24,7 +24,7 @@ intents.message_content = True
 intents.members = True
 intents.guilds = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
+bot = commands.Bot(command_prefix=None, intents=intents)
 
 # ─── 数据文件路径 ───
 DATA_FILE = "file_records.json"
@@ -92,39 +92,6 @@ async def on_ready():
         logger.info(f"🔧 已同步 {len(synced)} 个斜杠命令")
     except Exception as e:
         logger.error(f"命令同步失败: {e}")
-
-
-# ═══════════════════════════════════════════
-#  新成员欢迎系统
-# ═══════════════════════════════════════════
-
-WELCOME_CHANNEL = "欢迎频道"
-MEMBER_ROLE_NAME = "社区成员"
-
-
-@bot.event
-async def on_member_join(member: discord.Member):
-    channel = discord.utils.get(member.guild.text_channels, name=WELCOME_CHANNEL)
-    if channel is None:
-        channel = member.guild.system_channel
-
-    if channel:
-        embed = discord.Embed(
-            title="👋 欢迎加入社区！",
-            description=f"欢迎 {member.mention} 来到 **{member.guild.name}**！",
-            color=discord.Color.green(),
-            timestamp=datetime.now(),
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        embed.set_footer(text=f"你是第 {len(member.guild.members)} 位成员")
-        await channel.send(embed=embed)
-
-    role = discord.utils.get(member.guild.roles, name=MEMBER_ROLE_NAME)
-    if role:
-        try:
-            await member.add_roles(role)
-        except discord.Forbidden:
-            pass
 
 
 # ═══════════════════════════════════════════
