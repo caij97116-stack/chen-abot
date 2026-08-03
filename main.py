@@ -99,12 +99,9 @@ QUIZ_MAX_ERRORS = 2                # 最多允许错几题（超过则失败）
 QUIZ_COOLDOWN_MINUTES = 25         # 每次失败后增加的冷却时间（分钟）
 QUIZ_QUESTION_TIMEOUT = 300        # 每道题限时（秒），默认 5 分钟
 QUIZ_VERIFIED_ROLE = "已认证"        # 答题通过后赋予的身份组
-QUIZ_CHANNEL_KEYWORD = "答题"        # 答题频道名称关键词（包含此词即可）
-QUIZ_CHANNEL_FILE = "quiz_channels.json"     # 答题频道消息记录
 QUIZ_COOLDOWN_FILE = "quiz_cooldowns.json"   # 答题冷却记录
 quiz_questions: list = []            # 从 questions.json 加载的题目
 quiz_sessions: dict = {}             # 正在答题的用户: {user_id: {questions, current_index, answers, started_at}}
-quiz_channel_messages: dict = {}     # 答题频道消息: {channel_id: message_id}
 quiz_cooldowns: dict = {}            # 冷却记录: {user_id: {fail_count: int, cooldown_until: str|None}}
 
 
@@ -240,20 +237,34 @@ async def setup_quiz_channels():
                 continue
 
             try:
+                # 清理频道里所有 bot 之前发的消息，只保留一个
                 existing_msg_id = quiz_channel_messages.get(str(channel.id))
-                if existing_msg_id:
-                    try:
-                        msg = await channel.fetch_message(int(existing_msg_id))
-                        await msg.edit(embed=quiz_embed, view=PersistentQuizView())
-                        logger.info(f"更新答题按钮: #{channel.name}")
-                        continue
-                    except Exception:
-                        pass
+                kept = False
 
-                msg = await channel.send(embed=quiz_embed, view=PersistentQuizView())
-                quiz_channel_messages[str(channel.id)] = str(msg.id)
-                save_quiz_channels()
-                logger.info(f"发布答题按钮: #{channel.name}")
+                async for old_msg in channel.history(limit=50):
+                    if old_msg.author.id != bot.user.id:
+                        continue
+                    if existing_msg_id and str(old_msg.id) == existing_msg_id:
+                        # 这是记录中的那条，更新它
+                        try:
+                            await old_msg.edit(embed=quiz_embed, view=PersistentQuizView())
+                            kept = True
+                            logger.info(f"更新答题按钮: #{channel.name}")
+                        except Exception:
+                            pass
+                    else:
+                        # 多余的旧消息，删掉
+                        try:
+                            await old_msg.delete()
+                        except Exception:
+                            pass
+
+                if not kept:
+                    # 没有有效记录，发一条新的
+                    msg = await channel.send(embed=quiz_embed, view=PersistentQuizView())
+                    quiz_channel_messages[str(channel.id)] = str(msg.id)
+                    save_quiz_channels()
+                    logger.info(f"发布答题按钮: #{channel.name}")
             except discord.Forbidden:
                 logger.warning(f"无权限在 #{channel.name} 发送消息")
             except Exception as e:
