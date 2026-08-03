@@ -381,12 +381,86 @@ def _format_size(size_bytes: int) -> str:
 
 
 # ═══════════════════════════════════════════
-#  /文件列表 - 查看当前频道存储的文件（仅元数据，无法获取）
+#  /获取文件 - 查看文件列表并获取
 # ═══════════════════════════════════════════
 
-@bot.tree.command(name="文件列表", description="查看当前频道内存储的文件信息（仅查看，无法获取文件）")
-async def file_list(interaction: discord.Interaction):
-    """列出当前频道所有文件，仅元数据，不提供文件内容"""
+class GetFileView(discord.ui.View):
+    """文件列表视图，每个文件一个获取按钮"""
+
+    def __init__(self, channel_files: dict, interaction_user_id: int, password: Optional[str]):
+        super().__init__(timeout=300)
+        self.channel_files = channel_files
+        self.interaction_user_id = interaction_user_id
+        self.password = password
+
+        sorted_files = sorted(
+            channel_files.items(),
+            key=lambda x: x[1].get("upload_time", ""),
+            reverse=True,
+        )
+
+        for file_id, rec in sorted_files:
+            btn = discord.ui.Button(
+                label=f"获取 {rec['name'][:60]}",
+                style=discord.ButtonStyle.primary,
+                custom_id=file_id,
+                row=0,
+            )
+            btn.callback = self.make_callback(file_id)
+            self.add_item(btn)
+
+    def make_callback(self, file_id: str):
+        async def callback(interaction: discord.Interaction):
+            if interaction.user.id != self.interaction_user_id:
+                await interaction.response.send_message("这不是你的操作。", ephemeral=True)
+                return
+
+            record = self.channel_files.get(file_id)
+            if not record:
+                await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+                return
+
+            conditions = record["conditions"]
+            is_uploader = interaction.user.id == record["uploader_id"]
+            failed_reasons = []
+
+            if not is_uploader:
+                if conditions["password"]:
+                    if not self.password:
+                        failed_reasons.append("需要输入密码")
+                    elif self.password != conditions["password"]:
+                        failed_reasons.append("密码错误")
+
+                if conditions["require_like_first"]:
+                    if not await _check_user_liked_first(interaction):
+                        failed_reasons.append("需要给首楼点赞")
+
+                if conditions["require_comment_first"]:
+                    min_len = conditions.get("min_comment_length", 1)
+                    if not await _check_user_comment_length(interaction, min_len):
+                        failed_reasons.append(f"需要评论首楼至少 {min_len} 字")
+
+            if failed_reasons:
+                await interaction.response.send_message(
+                    "❌ " + "，".join(failed_reasons),
+                    ephemeral=True,
+                )
+                return
+
+            await _send_file_to_user(interaction, record, file_id)
+
+        return callback
+
+
+@bot.tree.command(name="获取文件", description="查看当前频道文件列表并获取")
+@app_commands.describe(
+    密码="如果上传者设置了密码，请在此输入",
+)
+async def get_file(
+    interaction: discord.Interaction,
+    密码: Optional[str] = None,
+):
+    """显示频道内所有文件，可点击按钮获取"""
     await interaction.response.defer(ephemeral=True)
 
     channel_files = {
@@ -395,7 +469,7 @@ async def file_list(interaction: discord.Interaction):
     }
 
     if not channel_files:
-        await interaction.followup.send("📭 当前频道没有存储的文件。", ephemeral=True)
+        await interaction.followup.send("📭 当前频道还没有上传过文件。", ephemeral=True)
         return
 
     sorted_files = sorted(
@@ -412,105 +486,52 @@ async def file_list(interaction: discord.Interaction):
     for file_id, rec in sorted_files:
         cond_desc = _build_condition_description(rec["conditions"])
         upload_time = rec.get("upload_time", "未知")[:10]
+        is_uploader = interaction.user.id == rec["uploader_id"]
+
+        # 检查用户已满足的条件
+        met_parts = []
+        unmet_parts = []
+        conditions = rec["conditions"]
+
+        if is_uploader:
+            met_parts.append("✅ 上传者（无条件）")
+        else:
+            if conditions["password"]:
+                if 密码 and 密码 == conditions["password"]:
+                    met_parts.append("✅ 密码正确")
+                else:
+                    unmet_parts.append("❌ 需要密码")
+            if conditions["require_like_first"]:
+                liked = await _check_user_liked_first(interaction)
+                if liked:
+                    met_parts.append("✅ 已点赞")
+                else:
+                    unmet_parts.append("❌ 未点赞")
+            if conditions["require_comment_first"]:
+                min_len = conditions.get("min_comment_length", 1)
+                met = await _check_user_comment_length(interaction, min_len)
+                if met:
+                    met_parts.append(f"✅ 已评论（≥{min_len}字）")
+                else:
+                    unmet_parts.append(f"❌ 评论不足{min_len}字")
+
+            if not conditions["password"] and not conditions["require_like_first"] and not conditions["require_comment_first"]:
+                met_parts.append("✅ 无条件")
+
+        status = "\n".join(met_parts + unmet_parts) if (met_parts or unmet_parts) else "✅ 无条件"
+
         embed.add_field(
             name=f"📁 {rec['name']}",
             value=f"上传者: <@{rec['uploader_id']}>\n"
                   f"大小: {_format_size(rec['size'])}\n"
-                  f"条件: {cond_desc}\n"
-                  f"时间: {upload_time}",
+                  f"时间: {upload_time}\n"
+                  f"{status}",
             inline=False,
         )
 
-    embed.set_footer(text="仅查看元数据，获取文件仍需满足条件")
-    await interaction.followup.send(embed=embed, ephemeral=True)
-
-
-# ═══════════════════════════════════════════
-#  /获取文件 - 获取已上传的文件（需满足条件）
-# ═══════════════════════════════════════════
-
-@bot.tree.command(name="获取文件", description="获取当前频道内上传的文件（自动检测，需满足获取条件）")
-@app_commands.describe(
-    密码="如果上传者设置了密码，请在此输入",
-)
-async def get_file(
-    interaction: discord.Interaction,
-    密码: Optional[str] = None,
-):
-    """自动检测当前频道内上传的文件，满足条件后获取"""
-    await interaction.response.defer(ephemeral=True)
-
-    # 查找当前频道内上传的所有文件
-    channel_files = {
-        fid: rec for fid, rec in file_records.items()
-        if str(rec.get("source_channel_id", rec.get("channel_id"))) == str(interaction.channel.id)
-    }
-
-    if not channel_files:
-        await interaction.followup.send(
-            "📭 当前频道还没有上传过文件。",
-            ephemeral=True,
-        )
-        return
-
-    # 按上传时间排序，最新的在前
-    sorted_files = sorted(
-        channel_files.items(),
-        key=lambda x: x[1].get("upload_time", ""),
-        reverse=True,
-    )
-
-    results = []
-    for file_id, record in sorted_files:
-        conditions = record["conditions"]
-        is_uploader = interaction.user.id == record["uploader_id"]
-        failed_reasons = []
-
-        if not is_uploader:
-            if conditions["password"]:
-                if not 密码:
-                    failed_reasons.append("需要输入密码")
-                elif 密码 != conditions["password"]:
-                    failed_reasons.append("密码错误")
-
-            if conditions["require_like_first"]:
-                liked = await _check_user_liked_first(interaction)
-                if not liked:
-                    failed_reasons.append("需要给首楼点赞")
-
-            if conditions["require_comment_first"]:
-                needed = conditions.get("min_comment_length", 1)
-                met = await _check_user_comment_length(interaction, needed)
-                if not met:
-                    failed_reasons.append(f"需要评论首楼至少 {needed} 字")
-
-        if failed_reasons:
-            results.append((record, None, failed_reasons))
-        else:
-            results.append((record, file_id, None))
-
-    # 如果所有文件都失败了，汇总展示
-    all_failed = all(r[1] is None for r in results)
-    if all_failed:
-        desc_lines = []
-        for record, _, reasons in results:
-            cond_desc = _build_condition_description(record["conditions"])
-            desc_lines.append(f"**{record['name']}** — {cond_desc}")
-            desc_lines.append("  " + "\n  ".join(f"• {r}" for r in reasons))
-        embed = discord.Embed(
-            title="🔒 无法获取文件",
-            description="\n".join(desc_lines),
-            color=discord.Color.red(),
-        )
-        if any(r[0]["conditions"]["password"] for r in results):
-            embed.set_footer(text="提示: 使用 /获取文件 密码:xxx 来输入密码")
-        await interaction.followup.send(embed=embed, ephemeral=True)
-        return
-
-    # 发送符合条件的文件
-    for record, file_id, _ in results:
-        if file_id is not None:
-            await _send_file_to_user(interaction, record, file_id)
+    embed.set_footer(text="点击下方按钮获取文件")
+    view = GetFileView(channel_files, interaction.user.id, 密码)
+    await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 async def _check_user_liked_first(interaction: discord.Interaction) -> bool:
