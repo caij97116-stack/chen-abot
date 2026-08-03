@@ -98,10 +98,13 @@ QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
 QUIZ_MAX_ERRORS = 2                # 最多允许错几题（超过则失败）
 QUIZ_COOLDOWN_MINUTES = 25         # 每次失败后增加的冷却时间（分钟）
 QUIZ_QUESTION_TIMEOUT = 300        # 每道题限时（秒），默认 5 分钟
-QUIZ_VERIFIED_ROLE = "已认证"        # 答题通过后赋予的身份组
+QUIZ_VERIFIED_ROLE = "你过关！小岛居民"        # 答题通过后赋予的身份组
+QUIZ_CHANNEL_KEYWORD = "答题"        # 答题频道名称关键词（包含此词即可）
+QUIZ_CHANNEL_FILE = "quiz_channels.json"     # 答题频道消息记录
 QUIZ_COOLDOWN_FILE = "quiz_cooldowns.json"   # 答题冷却记录
 quiz_questions: list = []            # 从 questions.json 加载的题目
 quiz_sessions: dict = {}             # 正在答题的用户: {user_id: {questions, current_index, answers, started_at}}
+quiz_channel_messages: dict = {}     # 答题频道消息: {channel_id: message_id}
 quiz_cooldowns: dict = {}            # 冷却记录: {user_id: {fail_count: int, cooldown_until: str|None}}
 
 
