@@ -30,6 +30,7 @@ bot = commands.Bot(command_prefix=None, intents=intents)
 DATA_FILE = "file_records.json"
 QUESTIONS_FILE = "questions.json"
 STORAGE_CHANNEL = "📁-文件存储"
+_storage_channel_id = None
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool, "comment_count": int } } }
@@ -80,18 +81,27 @@ def load_records():
 
 async def get_storage_channel(guild: discord.Guild):
     """获取或创建文件存储频道（仅 bot 可见）"""
+    global _storage_channel_id
+    if _storage_channel_id:
+        channel = guild.get_channel(_storage_channel_id)
+        if channel:
+            return channel
+        _storage_channel_id = None
+    channel = discord.utils.get(guild.text_channels, name=STORAGE_CHANNEL)
+    if channel:
+        _storage_channel_id = channel.id
+        return channel
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
         guild.me: discord.PermissionOverwrite(read_messages=True),
     }
-    channel = discord.utils.get(guild.text_channels, name=STORAGE_CHANNEL)
-    if channel is None:
-        channel = await guild.create_text_channel(
-            STORAGE_CHANNEL,
-            overwrites=overwrites,
-            topic="📁 Bot 文件存储，请勿删除",
-        )
-        logger.info(f"已创建存储频道: {channel.name}")
+    channel = await guild.create_text_channel(
+        STORAGE_CHANNEL,
+        overwrites=overwrites,
+        topic="Bot 文件存储，请勿删除",
+    )
+    _storage_channel_id = channel.id
+    logger.info(f"已创建存储频道: {channel.name}")
     return channel
 
 
