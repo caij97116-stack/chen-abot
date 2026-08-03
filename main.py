@@ -300,7 +300,7 @@ class CommentLengthModal(discord.ui.Modal, title="设置评论字数"):
         )
 
 
-@bot.tree.command(name="上传文件", description="上传文件到当前频道")
+@bot.tree.command(name="上传文件", description="上传文件到当前频道（重复上传会覆盖旧文件）")
 @app_commands.describe(
     文件="要上传的文件（png/json/zip/txt/mp4等）",
 )
@@ -310,8 +310,23 @@ async def upload_file(
 ):
     await interaction.response.defer(ephemeral=False)
 
-    # 发送文件到隐藏存储频道
     storage = await get_storage_channel(interaction.guild)
+
+    # 查找当前频道已有的文件，继承条件
+    channel_files = {
+        fid: rec for fid, rec in file_records.items()
+        if str(rec.get("source_channel_id", rec.get("channel_id"))) == str(interaction.channel.id)
+    }
+
+    old_conditions = None
+    if channel_files:
+        # 继承第一个文件的条件
+        old_conditions = next(iter(channel_files.values()))["conditions"]
+        # 删除旧文件记录
+        for fid in channel_files:
+            del file_records[fid]
+
+    # 发送新文件到隐藏存储频道
     file_msg = await storage.send(
         content=f"📁 **{文件.filename}**",
         file=await 文件.to_file(),
@@ -320,7 +335,7 @@ async def upload_file(
     attachment = file_msg.attachments[0] if file_msg.attachments else 文件
     file_id = str(file_msg.id)
 
-    conditions = {
+    conditions = old_conditions if old_conditions else {
         "password": None,
         "require_like_first": False,
         "require_comment_first": False,
@@ -342,12 +357,13 @@ async def upload_file(
     }
     save_records()
 
+    cond_desc = _build_condition_description(conditions)
     embed = discord.Embed(
-        title="✅ 文件上传成功",
+        title="✅ 文件上传成功" + ("（已覆盖旧文件）" if old_conditions else ""),
         description=f"**文件名:** {文件.filename}\n"
                     f"**大小:** {_format_size(文件.size)}\n\n"
-                    f"当前无条件限制，所有人可直接 `/获取文件`。\n"
-                    f"点击下方按钮设置获取条件 ⬇️",
+                    f"获取条件: {cond_desc}\n\n"
+                    f"点击下方按钮修改条件 ⬇️",
         color=discord.Color.green(),
         timestamp=datetime.now(),
     )
