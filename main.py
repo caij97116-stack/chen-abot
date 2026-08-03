@@ -611,6 +611,9 @@ if __name__ == "__main__":
         logger.error("请在环境变量中设置 DISCORD_BOT_TOKEN，或创建 .env 文件。")
         exit(1)
 
+    token = token.strip()
+    logger.info(f"🔑 Token 长度: {len(token)} 字符，开头: {token[:10]}...")
+
     # 启动 HTTP 服务器（在后台线程）
     threading.Thread(target=run_http_server, daemon=True).start()
 
