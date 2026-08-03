@@ -29,6 +29,7 @@ bot = commands.Bot(command_prefix=None, intents=intents)
 # ─── 数据文件路径 ───
 DATA_FILE = "file_records.json"
 QUESTIONS_FILE = "questions.json"
+STORAGE_CHANNEL = "📁-文件存储"
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool, "comment_count": int } } }
@@ -75,6 +76,23 @@ def load_records():
     except Exception as e:
         logger.error(f"加载文件记录失败: {e}")
         file_records = {}
+
+
+async def get_storage_channel(guild: discord.Guild):
+    """获取或创建文件存储频道（仅 bot 可见）"""
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        guild.me: discord.PermissionOverwrite(read_messages=True),
+    }
+    channel = discord.utils.get(guild.text_channels, name=STORAGE_CHANNEL)
+    if channel is None:
+        channel = await guild.create_text_channel(
+            STORAGE_CHANNEL,
+            overwrites=overwrites,
+            topic="📁 Bot 文件存储，请勿删除",
+        )
+        logger.info(f"已创建存储频道: {channel.name}")
+    return channel
 
 
 # ═══════════════════════════════════════════
@@ -179,8 +197,9 @@ async def upload_file(
         "comment_count": 评论条数 if (需要评论 is not None and 需要评论.value == "yes") else 0,
     }
 
-    # 发送文件到频道
-    file_msg = await interaction.channel.send(
+    # 发送文件到隐藏存储频道（避免公开显示）
+    storage = await get_storage_channel(interaction.guild)
+    file_msg = await storage.send(
         content=f"📁 **{文件.filename}**",
         file=await 文件.to_file(),
     )
@@ -192,7 +211,7 @@ async def upload_file(
         "name": 文件.filename,
         "uploader_id": interaction.user.id,
         "uploader_name": interaction.user.display_name,
-        "channel_id": interaction.channel.id,
+        "channel_id": storage.id,
         "guild_id": interaction.guild.id,
         "message_id": file_msg.id,
         "attachment_url": attachment.url,
