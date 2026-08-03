@@ -29,8 +29,8 @@ bot = commands.Bot(command_prefix=None, intents=intents)
 # ─── 数据文件路径 ───
 DATA_FILE = "file_records.json"
 QUESTIONS_FILE = "questions.json"
+CONFIG_FILE = "storage_config.json"
 STORAGE_CHANNEL = "📁-文件存储"
-_storage_channel_id = None
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool, "comment_count": int } } }
@@ -80,17 +80,38 @@ def load_records():
 
 
 async def get_storage_channel(guild: discord.Guild):
-    """获取或创建文件存储频道（仅 bot 可见）"""
-    global _storage_channel_id
-    if _storage_channel_id:
-        channel = guild.get_channel(_storage_channel_id)
+    """获取或创建文件存储频道（仅 bot 可见），ID 持久化到文件"""
+    # 从文件读取缓存的频道 ID
+    saved_id = None
+    try:
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, "r") as f:
+                config = json.load(f)
+                saved_id = config.get("storage_channel_id")
+    except Exception:
+        pass
+
+    # 用缓存的 ID 获取
+    if saved_id:
+        channel = guild.get_channel(saved_id)
         if channel:
             return channel
-        _storage_channel_id = None
-    channel = discord.utils.get(guild.text_channels, name=STORAGE_CHANNEL)
+
+    # 按名称搜索（遍历所有频道，避免 emoji 编码问题）
+    for ch in guild.text_channels:
+        if ch.name == STORAGE_CHANNEL:
+            channel = ch
+            break
+    else:
+        channel = None
+
     if channel:
-        _storage_channel_id = channel.id
+        # 保存 ID
+        with open(CONFIG_FILE, "w") as f:
+            json.dump({"storage_channel_id": channel.id}, f)
         return channel
+
+    # 创建新频道
     overwrites = {
         guild.default_role: discord.PermissionOverwrite(read_messages=False),
         guild.me: discord.PermissionOverwrite(read_messages=True),
@@ -100,7 +121,8 @@ async def get_storage_channel(guild: discord.Guild):
         overwrites=overwrites,
         topic="Bot 文件存储，请勿删除",
     )
-    _storage_channel_id = channel.id
+    with open(CONFIG_FILE, "w") as f:
+        json.dump({"storage_channel_id": channel.id}, f)
     logger.info(f"已创建存储频道: {channel.name}")
     return channel
 
