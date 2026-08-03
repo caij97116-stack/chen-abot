@@ -21,8 +21,7 @@ venv/
 .venv/
 env/
 
-# 上传的文件
-files/
-storage_config.json
+# 上传的文件（存储频道配置）
+storage_channel.json
 quiz_channels.json
 quiz_cooldowns.json

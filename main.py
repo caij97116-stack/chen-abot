@@ -30,11 +30,68 @@ bot = commands.Bot(command_prefix=None, intents=intents)
 # ─── 数据文件路径 ───
 DATA_FILE = "file_records.json"
 QUESTIONS_FILE = "questions.json"
-FILES_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "files")
+STORAGE_CHANNEL_FILE = "storage_channel.json"
 
 # ─── 文件记录存储 ───
-# 结构: { "file_id": { "name": str, "uploader_id": int, ..., "conditions": { "password": str|None, "require_like_first": bool, "require_comment_first": bool, "min_comment_length": int } } }
+# 结构: { "file_id": { "name": str, "uploader_id": int, ..., "storage_msg_id": str, "conditions": { ... } } }
 file_records: dict = {}
+
+# ─── 存储频道管理 ───
+# 结构: { "guild_id": "channel_id" }
+storage_channels: dict = {}
+
+def load_storage_channels():
+    global storage_channels
+    try:
+        if os.path.exists(STORAGE_CHANNEL_FILE):
+            with open(STORAGE_CHANNEL_FILE, "r", encoding="utf-8") as f:
+                storage_channels = json.load(f)
+    except Exception:
+        storage_channels = {}
+
+def save_storage_channels():
+    try:
+        with open(STORAGE_CHANNEL_FILE, "w", encoding="utf-8") as f:
+            json.dump(storage_channels, f)
+    except Exception as e:
+        logger.error(f"保存存储频道信息失败: {e}")
+
+async def get_or_create_storage_channel(guild: discord.Guild) -> discord.TextChannel:
+    """获取或创建固定存储频道（仅最高权限者和 bot 可见）"""
+    guild_id = str(guild.id)
+    channel_id = storage_channels.get(guild_id)
+
+    if channel_id:
+        channel = guild.get_channel(int(channel_id))
+        if channel:
+            return channel
+
+    # 创建新频道：仅 guild owner 和 bot 可见
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        guild.me: discord.PermissionOverwrite(
+            read_messages=True,
+            send_messages=True,
+            attach_files=True,
+            read_message_history=True,
+        ),
+    }
+    if guild.owner:
+        overwrites[guild.owner] = discord.PermissionOverwrite(read_messages=True)
+
+    try:
+        channel = await guild.create_text_channel(
+            name="📁-文件存储",
+            overwrites=overwrites,
+            reason="Chen-Abot 文件存储频道",
+        )
+        storage_channels[guild_id] = str(channel.id)
+        save_storage_channels()
+        logger.info(f"已创建存储频道: #{channel.name} in {guild.name}")
+        return channel
+    except Exception as e:
+        logger.error(f"创建存储频道失败: {e}")
+        raise
 
 # ─── 答题系统 ───
 QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
@@ -136,6 +193,7 @@ async def on_ready():
     load_questions()
     load_quiz_channels()
     load_quiz_cooldowns()
+    load_storage_channels()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -392,17 +450,23 @@ async def upload_file(
     await interaction.response.defer(ephemeral=True)
 
     try:
-        # 确保 files 目录存在
-        os.makedirs(FILES_DIR, exist_ok=True)
-
         # 读取文件内容
         file_bytes = await 文件.read()
 
-        # 生成文件 ID 并保存到磁盘
-        file_id = str(int(datetime.now().timestamp() * 1000))
-        file_path = os.path.join(FILES_DIR, file_id)
-        with open(file_path, "wb") as f:
-            f.write(file_bytes)
+        # 获取存储频道
+        storage_channel = await get_or_create_storage_channel(interaction.guild)
+
+        # 将文件发送到存储频道
+        discord_file = discord.File(
+            fp=io.BytesIO(file_bytes),
+            filename=文件.filename,
+        )
+        storage_msg = await storage_channel.send(
+            content=f"📁 {文件.filename} | 上传者: {interaction.user.display_name} (ID: {interaction.user.id})",
+            file=discord_file,
+        )
+
+        file_id = str(storage_msg.id)
     except Exception as e:
         logger.error(f"上传文件失败: {e}")
         await interaction.followup.send(f"❌ 上传失败: {e}", ephemeral=True)
@@ -431,8 +495,8 @@ async def upload_file(
         "uploader_name": interaction.user.display_name,
         "source_channel_id": interaction.channel.id,
         "guild_id": interaction.guild.id,
-        "file_path": file_path,
-        "size": len(file_bytes),
+        "storage_msg_id": str(storage_msg.id),
+        "size": 文件.size,
         "conditions": conditions,
         "upload_time": datetime.now().isoformat(),
     }
@@ -673,36 +737,59 @@ async def _check_user_comment_length(interaction: discord.Interaction, min_lengt
 
 
 async def _send_file_to_user(interaction: discord.Interaction, record: dict, 文件id: str):
-    """发送文件给用户"""
+    """从存储频道拉取文件并发送给用户"""
     try:
-        file_path = record.get("file_path")
-        logger.info(f"获取文件: file_path={file_path}, name={record.get('name')}, exists={os.path.exists(file_path) if file_path else 'N/A'}")
+        storage_msg_id = record.get("storage_msg_id")
+        guild_id = record.get("guild_id")
 
-        if file_path and os.path.exists(file_path):
-            file_size = os.path.getsize(file_path)
-            logger.info(f"文件大小: {file_size} bytes")
-
-            with open(file_path, "rb") as f:
-                file_bytes = f.read()
-
-            discord_file = discord.File(
-                fp=io.BytesIO(file_bytes),
-                filename=record["name"],
-            )
-            await interaction.followup.send(
-                content=f"📁 **{record['name']}**\n"
-                        f"上传者: <@{record['uploader_id']}>",
-                file=discord_file,
-                ephemeral=True,
-            )
-            logger.info(f"文件发送成功: {record['name']}")
+        if not storage_msg_id or not guild_id:
+            await interaction.followup.send("❌ 文件记录无效。", ephemeral=True)
             return
 
-        logger.warning(f"文件不存在: {file_path}")
+        guild = interaction.client.get_guild(guild_id)
+        if not guild:
+            await interaction.followup.send("❌ 找不到服务器。", ephemeral=True)
+            return
+
+        guild_id_str = str(guild_id)
+        channel_id = storage_channels.get(guild_id_str)
+        if not channel_id:
+            await interaction.followup.send("❌ 存储频道不存在，请重新上传文件。", ephemeral=True)
+            return
+
+        channel = guild.get_channel(int(channel_id))
+        if not channel:
+            await interaction.followup.send("❌ 存储频道已删除，请重新上传文件。", ephemeral=True)
+            return
+
+        try:
+            msg = await channel.fetch_message(int(storage_msg_id))
+        except discord.NotFound:
+            await interaction.followup.send("❌ 文件已被删除，请重新上传。", ephemeral=True)
+            return
+        except Exception as e:
+            logger.error(f"获取存储消息失败: {e}")
+            await interaction.followup.send(f"❌ 获取文件时出错: {e}", ephemeral=True)
+            return
+
+        if not msg.attachments:
+            await interaction.followup.send("❌ 文件附件丢失，请重新上传。", ephemeral=True)
+            return
+
+        attachment = msg.attachments[0]
+        file_bytes = await attachment.read()
+
+        discord_file = discord.File(
+            fp=io.BytesIO(file_bytes),
+            filename=record["name"],
+        )
         await interaction.followup.send(
-            "❌ 文件已丢失，请重新上传。",
+            content=f"📁 **{record['name']}**\n"
+                    f"上传者: <@{record['uploader_id']}>",
+            file=discord_file,
             ephemeral=True,
         )
+        logger.info(f"文件发送成功: {record['name']}")
     except Exception as e:
         logger.error(f"获取文件失败: {e}", exc_info=True)
         await interaction.followup.send(
