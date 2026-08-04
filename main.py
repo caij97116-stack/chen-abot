@@ -529,7 +529,7 @@ async def upload_file(
     embed.set_footer(text=f"上传者: {interaction.user.display_name}")
 
     view = ConditionView(file_id, interaction.user.id)
-    view.message = await interaction.followup.send(embed=embed, view=view)
+    view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
 def _build_condition_description(conditions: dict) -> str:
