@@ -25,3 +25,4 @@ env/
 storage_channel.json
 quiz_channels.json
 quiz_cooldowns.json
+faq.json

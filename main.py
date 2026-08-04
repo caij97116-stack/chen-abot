@@ -31,6 +31,7 @@ bot = commands.Bot(command_prefix=None, intents=intents)
 DATA_FILE = "file_records.json"
 QUESTIONS_FILE = "questions.json"
 STORAGE_CHANNEL_FILE = "storage_channel.json"
+FAQ_FILE = "faq.json"
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "storage_msg_id": str, "conditions": { ... } } }
@@ -92,6 +93,27 @@ async def get_or_create_storage_channel(guild: discord.Guild) -> discord.TextCha
     except Exception as e:
         logger.error(f"创建存储频道失败: {e}")
         raise
+
+# ─── FAQ 常见问题 ───
+# 结构: { "keyword": "answer", ... }
+faq_data: dict = {}
+
+def load_faq():
+    global faq_data
+    try:
+        if os.path.exists(FAQ_FILE):
+            with open(FAQ_FILE, "r", encoding="utf-8") as f:
+                faq_data = json.load(f)
+            logger.info(f"已加载 {len(faq_data)} 条 FAQ")
+    except Exception:
+        faq_data = {}
+
+def save_faq():
+    try:
+        with open(FAQ_FILE, "w", encoding="utf-8") as f:
+            json.dump(faq_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存 FAQ 失败: {e}")
 
 # ─── 答题系统 ───
 QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
@@ -194,6 +216,7 @@ async def on_ready():
     load_quiz_channels()
     load_quiz_cooldowns()
     load_storage_channels()
+    load_faq()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -1068,6 +1091,119 @@ async def _do_quiz(interaction: discord.Interaction):
 @bot.tree.command(name="答题", description="开始入群审核答题（备用命令）")
 async def start_quiz(interaction: discord.Interaction):
     await _do_quiz(interaction)
+
+
+# ═══════════════════════════════════════════
+#  FAQ 常见问题系统
+# ═══════════════════════════════════════════
+
+@bot.tree.command(name="添加faq", description="添加一条常见问题（仅服务器最高权限者可用）")
+@app_commands.describe(关键词="触发关键词", 答案="自动回复的内容")
+async def add_faq(interaction: discord.Interaction, 关键词: str, 答案: str):
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("只有服务器最高权限者才能使用此命令。", ephemeral=True)
+        return
+
+    keyword = 关键词.strip().lower()
+    if len(keyword) < 2:
+        await interaction.response.send_message("关键词至少需要2个字符。", ephemeral=True)
+        return
+
+    faq_data[keyword] = 答案.strip()
+    save_faq()
+    await interaction.response.send_message(
+        f"✅ 已添加 FAQ：**{keyword}** → {答案}",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="删除faq", description="删除一条常见问题（仅服务器最高权限者可用）")
+@app_commands.describe(关键词="要删除的关键词")
+async def remove_faq(interaction: discord.Interaction, 关键词: str):
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("只有服务器最高权限者才能使用此命令。", ephemeral=True)
+        return
+
+    keyword = 关键词.strip().lower()
+    if keyword in faq_data:
+        del faq_data[keyword]
+        save_faq()
+        await interaction.response.send_message(f"✅ 已删除 FAQ：**{keyword}**", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"未找到关键词 **{keyword}**。", ephemeral=True)
+
+
+@bot.tree.command(name="常见问题", description="查看所有常见问题列表")
+async def list_faq(interaction: discord.Interaction):
+    if not faq_data:
+        await interaction.response.send_message("📭 还没有添加任何常见问题。", ephemeral=True)
+        return
+
+    embed = discord.Embed(
+        title="📋 常见问题列表",
+        color=discord.Color.blue(),
+    )
+    for keyword, answer in faq_data.items():
+        embed.add_field(
+            name=f"💬 {keyword}",
+            value=answer[:200] + ("..." if len(answer) > 200 else ""),
+            inline=False,
+        )
+
+    embed.set_footer(text=f"共 {len(faq_data)} 条 | 发送包含关键词的消息即可自动回复")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# FAQ 自动回复监听
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
+    if not message.guild:
+        return
+
+    # 检查消息中是否包含 FAQ 关键词
+    content = message.content.strip().lower()
+    for keyword, answer in faq_data.items():
+        if keyword in content:
+            try:
+                await message.reply(answer, mention_author=False)
+            except Exception:
+                pass
+            break  # 只匹配第一个关键词
+
+    # 必须调用，否则斜杠命令不会响应
+    await bot.process_commands(message)
+
+
+# ═══════════════════════════════════════════
+#  公告推送
+# ═══════════════════════════════════════════
+
+@bot.tree.command(name="公告", description="发送公告到指定频道（仅服务器最高权限者可用）")
+@app_commands.describe(频道="目标频道", 内容="公告内容")
+async def announce(interaction: discord.Interaction, 频道: discord.TextChannel, 内容: str):
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("只有服务器最高权限者才能使用此命令。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    embed = discord.Embed(
+        title="📢 公告",
+        description=内容,
+        color=discord.Color.gold(),
+        timestamp=datetime.now(),
+    )
+    embed.set_footer(text=f"发布者: {interaction.user.display_name}")
+
+    try:
+        await 频道.send(embed=embed)
+        await interaction.followup.send(f"✅ 公告已发送到 {频道.mention}", ephemeral=True)
+    except discord.Forbidden:
+        await interaction.followup.send(f"❌ 没有权限在 {频道.mention} 发送消息。", ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"❌ 发送失败: {e}", ephemeral=True)
 
 
 # ═══════════════════════════════════════════
