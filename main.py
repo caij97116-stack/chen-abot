@@ -34,6 +34,9 @@ STORAGE_CHANNEL_FILE = "storage_channel.json"
 FAQ_FILE = "faq.json"
 POINTS_FILE = "points.json"
 CHECKIN_CHANNEL_FILE = "checkin_channels.json"
+REPORT_FILE = "report_data.json"
+REPORT_CHANNEL_KEYWORD = "间谍"          # 举报入口频道关键词
+REPORT_REVIEW_CHANNEL_NAME = "举报审核"   # 审核工单频道名称
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "storage_msg_id": str, "conditions": { ... } } }
@@ -156,6 +159,43 @@ def save_checkin_channels():
     except Exception as e:
         logger.error(f"保存签到频道信息失败: {e}")
 
+# ─── 举报系统 ───
+# 结构: { "report_id": { "guild_id": str, "thread_id": str, "parent_channel_id": str, "reporter_id": str, "reporter_name": str, "target_id": str, "target_name": str, "reason": str, "anonymous": bool, "status": "pending|reviewing|completed", "review_message_id": str, "created_at": str } }
+report_data: dict = {}
+report_channel_messages: dict = {}  # 举报入口频道消息: { "channel_id": "message_id" }
+
+def load_reports():
+    global report_data
+    try:
+        if os.path.exists(REPORT_FILE):
+            with open(REPORT_FILE, "r", encoding="utf-8") as f:
+                report_data = json.load(f)
+    except Exception:
+        report_data = {}
+
+def save_reports():
+    try:
+        with open(REPORT_FILE, "w", encoding="utf-8") as f:
+            json.dump(report_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存举报数据失败: {e}")
+
+def load_report_channels():
+    global report_channel_messages
+    try:
+        if os.path.exists("report_channels.json"):
+            with open("report_channels.json", "r", encoding="utf-8") as f:
+                report_channel_messages = json.load(f)
+    except Exception:
+        report_channel_messages = {}
+
+def save_report_channels():
+    try:
+        with open("report_channels.json", "w", encoding="utf-8") as f:
+            json.dump(report_channel_messages, f)
+    except Exception as e:
+        logger.error(f"保存举报频道信息失败: {e}")
+
 # ─── 答题系统 ───
 QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
 QUIZ_MAX_ERRORS = 2                # 最多允许错几题（超过则失败）
@@ -260,6 +300,8 @@ async def on_ready():
     load_faq()
     load_points()
     load_checkin_channels()
+    load_reports()
+    load_report_channels()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -273,6 +315,9 @@ async def on_ready():
 
     # 在签到频道中发布/更新签到按钮消息
     await setup_checkin_channels()
+
+    # 在举报频道中发布/更新举报按钮消息
+    await setup_report_channels()
 
 
 # ═══════════════════════════════════════════
@@ -1351,10 +1396,500 @@ async def _do_checkin(interaction: discord.Interaction):
         ephemeral=True,
     )
 
+    # 30秒后自动删除签到消息
+    async def _auto_delete_checkin():
+        await asyncio.sleep(30)
+        try:
+            await interaction.delete_original_response()
+        except Exception:
+            pass
+    asyncio.create_task(_auto_delete_checkin())
+
 
 @bot.tree.command(name="签到", description="每日签到领取随机积分（1~20）")
 async def checkin_command(interaction: discord.Interaction):
     await _do_checkin(interaction)
+
+
+# ═══════════════════════════════════════════
+#  举报/工单系统
+# ═══════════════════════════════════════════
+
+async def get_or_create_report_review_channel(guild: discord.Guild) -> discord.TextChannel:
+    """获取或创建举报审核频道（仅最高权限者和 bot 可见）"""
+    # 先查找是否已存在
+    for channel in guild.text_channels:
+        if channel.name == REPORT_REVIEW_CHANNEL_NAME:
+            return channel
+
+    overwrites = {
+        guild.default_role: discord.PermissionOverwrite(read_messages=False),
+        guild.me: discord.PermissionOverwrite(
+            read_messages=True,
+            send_messages=True,
+            attach_files=True,
+            read_message_history=True,
+            create_public_threads=True,
+            create_private_threads=True,
+            manage_threads=True,
+        ),
+    }
+    if guild.owner:
+        overwrites[guild.owner] = discord.PermissionOverwrite(read_messages=True)
+
+    try:
+        channel = await guild.create_text_channel(
+            name=REPORT_REVIEW_CHANNEL_NAME,
+            overwrites=overwrites,
+            reason="Chen-Abot 举报审核频道",
+        )
+        logger.info(f"已创建举报审核频道: #{channel.name} in {guild.name}")
+        return channel
+    except Exception as e:
+        logger.error(f"创建举报审核频道失败: {e}")
+        raise
+
+
+# ─── 举报入口：持久化按钮 ───
+
+class PersistentReportEntryView(discord.ui.View):
+    """举报频道持久化按钮视图"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="📢 举报违规行为",
+        style=discord.ButtonStyle.danger,
+        custom_id="persistent_report_entry",
+    )
+    async def report_entry(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 显示10秒阅读倒计时
+        embed = discord.Embed(
+            title="📋 举报须知",
+            description=(
+                "请仔细阅读以下规则：\n\n"
+                "1. 请如实举报，恶意举报将被处罚\n"
+                "2. 举报内容需包含被举报人ID、违规简述\n"
+                "3. 可匿名举报，举报人信息仅岛主可见\n"
+                "4. 举报后可在子频道补充图片和详细说明\n"
+                "5. 岛主审理完毕后会通知你\n\n"
+                "⏳ **请等待 10 秒后点击下方按钮开始举报**"
+            ),
+            color=discord.Color.orange(),
+        )
+        embed.set_footer(text="阅读完毕后方可开始举报")
+
+        view = ReportCountdownView(interaction.user.id)
+        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+# ─── 10 秒倒计时视图 ───
+
+class ReportCountdownView(discord.ui.View):
+    """10秒阅读倒计时，到期后显示开始举报按钮"""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=15)
+        self.user_id = user_id
+        self._ready = False
+        self._msg = None
+
+        # 倒计时按钮（不可点击，仅显示倒计时）
+        self.countdown_btn = discord.ui.Button(
+            label="请阅读上方规则 (10秒)",
+            style=discord.ButtonStyle.secondary,
+            disabled=True,
+        )
+        self.add_item(self.countdown_btn)
+
+        # 开始举报按钮（初始隐藏）
+        self.start_btn = discord.ui.Button(
+            label="✅ 开始举报",
+            style=discord.ButtonStyle.danger,
+        )
+        self.start_btn.callback = self.start_report
+        self.remove_item(self.start_btn)
+
+        # 启动倒计时
+        asyncio.create_task(self._countdown())
+
+    async def _countdown(self):
+        for i in range(10, 0, -1):
+            await asyncio.sleep(1)
+            self.countdown_btn.label = f"请阅读上方规则 ({i}秒)"
+            try:
+                if self._msg:
+                    await self._msg.edit(view=self)
+            except Exception:
+                pass
+
+        self._ready = True
+        self.countdown_btn.label = "✅ 已阅读完毕"
+        self.countdown_btn.style = discord.ButtonStyle.success
+        self.add_item(self.start_btn)
+        try:
+            if self._msg:
+                await self._msg.edit(view=self)
+        except Exception:
+            pass
+
+    async def start_report(self, interaction: discord.Interaction):
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("这不是你的操作。", ephemeral=True)
+            return
+        if not self._ready:
+            await interaction.response.send_message("请先阅读举报规则！", ephemeral=True)
+            return
+        await interaction.response.send_modal(ReportFormModal(interaction.user))
+
+
+# ─── 举报表单 Modal ───
+
+class ReportFormModal(discord.ui.Modal, title="提交举报"):
+    def __init__(self, reporter: discord.Member):
+        super().__init__()
+        self.reporter = reporter
+
+        self.target_id = discord.ui.TextInput(
+            label="被举报人 ID（数字ID）",
+            placeholder="请输入被举报人的 Discord 用户 ID",
+            style=discord.TextStyle.short,
+            required=True,
+            min_length=5,
+            max_length=30,
+        )
+        self.add_item(self.target_id)
+
+        self.target_name = discord.ui.TextInput(
+            label="被举报人名称",
+            placeholder="请输入被举报人的显示名称",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=100,
+        )
+        self.add_item(self.target_name)
+
+        self.reason = discord.ui.TextInput(
+            label="违规简述",
+            placeholder="简要描述违规行为",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=500,
+        )
+        self.add_item(self.reason)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        target_id = self.target_id.value.strip()
+        target_name = self.target_name.value.strip()
+        reason = self.reason.value.strip()
+
+        # 询问是否匿名
+        view = AnonymousChoiceView(
+            interaction.user,
+            target_id,
+            target_name,
+            reason,
+        )
+        await interaction.followup.send(
+            "请选择举报方式：",
+            view=view,
+            ephemeral=True,
+        )
+
+
+# ─── 匿名选择视图 ───
+
+class AnonymousChoiceView(discord.ui.View):
+    def __init__(self, reporter: discord.Member, target_id: str, target_name: str, reason: str):
+        super().__init__(timeout=120)
+        self.reporter = reporter
+        self.target_id = target_id
+        self.target_name = target_name
+        self.reason = reason
+
+    @discord.ui.button(label="🔒 匿名举报", style=discord.ButtonStyle.secondary)
+    async def anonymous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.reporter.id:
+            await interaction.response.send_message("这不是你的操作。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await _create_report(interaction, self.reporter, self.target_id, self.target_name, self.reason, anonymous=True)
+
+    @discord.ui.button(label="👤 实名举报", style=discord.ButtonStyle.primary)
+    async def named(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.reporter.id:
+            await interaction.response.send_message("这不是你的操作。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await _create_report(interaction, self.reporter, self.target_id, self.target_name, self.reason, anonymous=False)
+
+
+async def _create_report(
+    interaction: discord.Interaction,
+    reporter: discord.Member,
+    target_id: str,
+    target_name: str,
+    reason: str,
+    anonymous: bool,
+):
+    """创建举报工单：创建子频道（线程）+ 发送审核工单"""
+    guild = interaction.guild
+    report_id = str(interaction.id)
+
+    try:
+        # 在举报频道中为举报人创建帖子线程
+        report_thread = await interaction.channel.create_thread(
+            name=f"举报-{reporter.display_name[:20]}",
+            type=discord.ChannelType.private_thread if isinstance(interaction.channel, discord.TextChannel) else discord.ChannelType.public_thread,
+            reason="举报工单子频道",
+        )
+        # 将举报人加入线程
+        await report_thread.add_user(reporter)
+
+        # 在子频道中发送汇总信息
+        reporter_label = "匿名用户" if anonymous else f"{reporter.mention} ({reporter.display_name})"
+        thread_embed = discord.Embed(
+            title="📋 举报工单已创建",
+            description=(
+                f"**举报人:** {reporter_label}\n"
+                f"**被举报人ID:** {target_id}\n"
+                f"**被举报人名称:** {target_name}\n"
+                f"**违规简述:** {reason}\n\n"
+                "📎 **请在下方补充图片、链接等更多证据**\n"
+                "岛主审理完毕后会通知你。"
+            ),
+            color=discord.Color.orange(),
+            timestamp=datetime.now(),
+        )
+        thread_embed.set_footer(text=f"工单ID: {report_id}")
+        await report_thread.send(embed=thread_embed)
+    except Exception as e:
+        logger.error(f"创建举报子频道失败: {e}")
+        await interaction.followup.send(
+            f"❌ 创建举报子频道失败: {e}\n请确认服务器已开启线程功能。",
+            ephemeral=True,
+        )
+        return
+
+    # 创建审核工单频道中的卡片
+    try:
+        review_channel = await get_or_create_report_review_channel(guild)
+
+        review_embed = discord.Embed(
+            title="📋 新举报工单",
+            description=(
+                f"**工单ID:** {report_id}\n"
+                f"**举报人:** {reporter_label}\n"
+                f"**被举报人ID:** {target_id}\n"
+                f"**被举报人名称:** {target_name}\n"
+                f"**违规简述:** {reason}\n"
+                f"**状态:** ⏳ 待审理"
+            ),
+            color=discord.Color.orange(),
+            timestamp=datetime.now(),
+        )
+        review_embed.set_footer(text=f"举报人子频道: {report_thread.name}")
+
+        view = PersistentReportReviewView(report_id, report_thread.id)
+        review_msg = await review_channel.send(embed=review_embed, view=view)
+
+        # 保存举报数据
+        report_data[report_id] = {
+            "guild_id": str(guild.id),
+            "thread_id": str(report_thread.id),
+            "parent_channel_id": str(interaction.channel.id),
+            "reporter_id": str(reporter.id),
+            "reporter_name": reporter.display_name,
+            "target_id": target_id,
+            "target_name": target_name,
+            "reason": reason,
+            "anonymous": anonymous,
+            "status": "pending",
+            "review_message_id": str(review_msg.id),
+            "review_channel_id": str(review_channel.id),
+            "created_at": datetime.now().isoformat(),
+        }
+        save_reports()
+
+        await interaction.followup.send(
+            f"✅ 举报已提交！工单ID: {report_id}\n"
+            f"你可以在子频道 {report_thread.mention} 中补充更多证据。",
+            ephemeral=True,
+        )
+    except Exception as e:
+        logger.error(f"创建审核工单失败: {e}")
+        await interaction.followup.send(
+            f"举报已创建子频道 {report_thread.mention}，但审核工单创建失败: {e}",
+            ephemeral=True,
+        )
+
+
+# ─── 审核工单按钮视图 ───
+
+class PersistentReportReviewView(discord.ui.View):
+    """审核工单持久化按钮视图"""
+
+    def __init__(self, report_id: str, thread_id: int):
+        super().__init__(timeout=None)
+        self.report_id = report_id
+        self.thread_id = thread_id
+
+    @discord.ui.button(
+        label="🔍 正在审理",
+        style=discord.ButtonStyle.primary,
+        custom_id="report_reviewing",
+    )
+    async def reviewing(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 只有最高权限者能操作
+        if interaction.user.id != interaction.guild.owner_id:
+            await interaction.response.send_message("只有岛主才能审理举报。", ephemeral=True)
+            return
+
+        rec = report_data.get(self.report_id)
+        if not rec:
+            await interaction.response.send_message("工单数据丢失。", ephemeral=True)
+            return
+
+        rec["status"] = "reviewing"
+        save_reports()
+
+        # 通知举报人子频道
+        guild = interaction.guild
+        thread = guild.get_thread(self.thread_id)
+        if thread:
+            try:
+                notify_embed = discord.Embed(
+                    title="🔍 岛主正在审理你的举报",
+                    description="感谢你的举报，岛主已开始审理此工单，请耐心等待。",
+                    color=discord.Color.blue(),
+                )
+                await thread.send(embed=notify_embed)
+            except Exception:
+                pass
+
+        # 更新审核频道消息
+        review_embed = interaction.message.embeds[0]
+        review_embed.color = discord.Color.blue()
+        # 更新状态字段
+        for i, field in enumerate(review_embed.fields):
+            review_embed.set_field_at(i, name=field.name, value=field.value, inline=field.inline)
+        review_embed.description = review_embed.description.replace("⏳ 待审理", "🔍 审理中")
+
+        await interaction.response.edit_message(embed=review_embed, view=self)
+        await interaction.followup.send("✅ 已标记为审理中，举报人已收到通知。", ephemeral=True)
+
+    @discord.ui.button(
+        label="✅ 审理完毕",
+        style=discord.ButtonStyle.success,
+        custom_id="report_completed",
+    )
+    async def completed(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 只有最高权限者能操作
+        if interaction.user.id != interaction.guild.owner_id:
+            await interaction.response.send_message("只有岛主才能审理举报。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        rec = report_data.get(self.report_id)
+        if not rec:
+            await interaction.followup.send("工单数据丢失。", ephemeral=True)
+            return
+
+        rec["status"] = "completed"
+        save_reports()
+
+        # 通知举报人子频道
+        guild = interaction.guild
+        thread = guild.get_thread(self.thread_id)
+        if thread:
+            try:
+                done_embed = discord.Embed(
+                    title="✅ 你的举报已处理完毕",
+                    description="岛主已审理完毕此工单，感谢你的举报。\n\n此子频道将在 10 秒后自动删除。",
+                    color=discord.Color.green(),
+                )
+                await thread.send(embed=done_embed)
+
+                # 10秒后删除子频道
+                async def _delete_thread():
+                    await asyncio.sleep(10)
+                    try:
+                        await thread.delete()
+                        logger.info(f"举报子频道已删除: {thread.name}")
+                    except Exception as e:
+                        logger.error(f"删除举报子频道失败: {e}")
+
+                asyncio.create_task(_delete_thread())
+            except Exception:
+                pass
+
+        # 更新审核频道消息
+        review_embed = interaction.message.embeds[0]
+        review_embed.color = discord.Color.green()
+        review_embed.description = review_embed.description.replace("⏳ 待审理", "✅ 已处理").replace("🔍 审理中", "✅ 已处理")
+
+        # 禁用按钮
+        for child in self.children:
+            child.disabled = True
+
+        await interaction.message.edit(embed=review_embed, view=self)
+        await interaction.followup.send("✅ 工单已处理完毕，举报子频道将被删除。", ephemeral=True)
+
+
+async def setup_report_channels():
+    """在名称包含 REPORT_CHANNEL_KEYWORD 的频道中发布举报按钮消息"""
+    report_embed = discord.Embed(
+        title="🚨 报告！有间谍！",
+        description=(
+            "发现违规行为？点击下方按钮提交举报工单。\n\n"
+            "举报流程：\n"
+            "1. 点击按钮阅读举报规则\n"
+            "2. 等待 10 秒后开始填写举报信息\n"
+            "3. 在专属子频道中补充证据\n"
+            "4. 岛主审理完毕后通知你"
+        ),
+        color=discord.Color.red(),
+    )
+    report_embed.set_footer(text="恶意举报将受到处罚，请如实举报")
+
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if REPORT_CHANNEL_KEYWORD not in channel.name:
+                continue
+
+            try:
+                existing_msg_id = report_channel_messages.get(str(channel.id))
+                kept = False
+
+                async for old_msg in channel.history(limit=50):
+                    if old_msg.author.id != bot.user.id:
+                        continue
+                    if existing_msg_id and str(old_msg.id) == existing_msg_id:
+                        try:
+                            await old_msg.edit(embed=report_embed, view=PersistentReportEntryView())
+                            kept = True
+                            logger.info(f"更新举报按钮: #{channel.name}")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await old_msg.delete()
+                        except Exception:
+                            pass
+
+                if not kept:
+                    msg = await channel.send(embed=report_embed, view=PersistentReportEntryView())
+                    report_channel_messages[str(channel.id)] = str(msg.id)
+                    save_report_channels()
+                    logger.info(f"发布举报按钮: #{channel.name}")
+            except discord.Forbidden:
+                logger.warning(f"无权限在 #{channel.name} 发送消息")
+            except Exception as e:
+                logger.error(f"举报频道 #{channel.name} 设置失败: {e}")
 
 
 # ═══════════════════════════════════════════
@@ -1422,9 +1957,11 @@ if __name__ == "__main__":
 
     async def main():
         await start_http_server()
-        # 注册持久化答题按钮（必须在 bot.start() 之前）
+        # 注册持久化视图（必须在 bot.start() 之前）
         bot.add_view(PersistentQuizView())
         bot.add_view(PersistentCheckinView())
+        bot.add_view(PersistentReportEntryView())
+        bot.add_view(PersistentReportReviewView("", 0))
         logger.info("🚀 正在启动 Chen-Abot...")
         try:
             await bot.start(token)
