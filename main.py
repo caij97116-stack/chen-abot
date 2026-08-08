@@ -609,7 +609,8 @@ async def upload_file(
         and rec.get("status") == "published"
     }
     old_conditions = None
-    if channel_files:
+    has_previous = bool(channel_files)
+    if has_previous:
         old_conditions = next(iter(channel_files.values())).get("conditions")
 
     conditions = old_conditions if old_conditions else {
@@ -636,7 +637,7 @@ async def upload_file(
     save_records()
 
     # 显示阶段1完成 → 进入阶段2（设置条件）
-    await _show_draft_setup(interaction, draft_id)
+    await _show_draft_setup(interaction, draft_id, has_previous)
 
 
 # ─── 阶段2: 草稿设置面板（条件 + 文件/附件名称修改）───
@@ -751,13 +752,31 @@ class DraftSetupView(discord.ui.View):
             logger.error(f"整合ZIP失败: {e}", exc_info=True)
             await interaction.followup.send(f"❌ 整合失败: {e}", ephemeral=True)
 
+    @discord.ui.button(label="⚡ 快速发布", style=discord.ButtonStyle.success, row=3)
+    async def quick_publish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_owner(interaction):
+            await interaction.response.send_message("只有上传者才能发布。", ephemeral=True)
+            return
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        await _publish_file(interaction, self.file_id, record)
+
+        # 禁用所有按钮
+        self.disable_all_items()
+        if hasattr(self, "message") and self.message:
+            await self.message.edit(view=self)
+
     async def on_timeout(self):
         self.disable_all_items()
         if hasattr(self, "message") and self.message:
             await self.message.edit(view=self)
 
 
-async def _show_draft_setup(interaction: discord.Interaction, file_id: str):
+async def _show_draft_setup(interaction: discord.Interaction, file_id: str, has_previous: bool = False):
     """显示草稿设置面板（阶段2）"""
     record = file_records.get(file_id)
     if not record:
@@ -769,16 +788,20 @@ async def _show_draft_setup(interaction: discord.Interaction, file_id: str):
         for a in record["attachments"]
     )
 
+    hint = ""
+    if has_previous:
+        hint = "\n💡 已继承频道上次的条件，可直接点击「⚡ 快速发布」"
+
     embed = discord.Embed(
         title="⚙️ 阶段2: 设置获取条件",
         description=f"**文件标题:** {record['name']}\n"
                     f"**附件数:** {len(record['attachments'])} 个\n\n"
                     f"**附件列表:**\n{attach_list}\n\n"
-                    f"**当前条件:** {cond_desc}",
+                    f"**当前条件:** {cond_desc}{hint}",
         color=discord.Color.blue(),
         timestamp=datetime.now(),
     )
-    embed.set_footer(text="设置完成后点击「编辑内容」进入下一步")
+    embed.set_footer(text="快速发布跳过编辑直接发布 | 编辑内容可添加说明")
 
     view = DraftSetupView(file_id, interaction.user.id)
     view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
@@ -1160,11 +1183,6 @@ class PublishedFileView(discord.ui.View):
                     description=f"{_format_size(att['size'])}",
                     value=f"file_{i}",
                 ))
-            options.append(discord.SelectOption(
-                label="📋 表单信息",
-                description="下载文件说明与条件信息",
-                value="form_info",
-            ))
 
         self.select_menu = discord.ui.Select(
             placeholder=f"选择要下载的文件（共 {len(options)} 项）" if options else "选择文件",
@@ -1229,51 +1247,13 @@ class PublishedFileView(discord.ui.View):
             return
 
         # 根据选择发送文件
-        if self.selected_value == "form_info":
-            await _send_form_info(interaction, record)
-        elif self.selected_value.startswith("file_"):
+        if self.selected_value.startswith("file_"):
             idx = int(self.selected_value.split("_")[1])
             attachments = record.get("attachments", [])
             if idx < len(attachments):
                 await _send_attachment_to_user(interaction, record, idx)
             else:
                 await interaction.followup.send("❌ 附件索引无效。", ephemeral=True)
-
-
-async def _send_form_info(interaction: discord.Interaction, record: dict):
-    """发送表单信息（文本文件）"""
-    cond_desc = _build_condition_description(record.get("conditions", {}))
-    desc = record.get("description", "") or "（无说明）"
-    attach_list = "\n".join(
-        f"- {a['custom_name']} ({_format_size(a['size'])})"
-        for a in record.get("attachments", [])
-    )
-
-    form_text = (
-        f"📋 文件信息表单\n"
-        f"{'=' * 40}\n"
-        f"文件标题: {record.get('name', '未知')}\n"
-        f"上传者: {record.get('uploader_name', '未知')}\n"
-        f"上传时间: {record.get('upload_time', '未知')}\n"
-        f"总大小: {_format_size(record.get('size', 0))}\n"
-        f"获取条件: {cond_desc}\n\n"
-        f"📝 内容说明:\n{desc}\n\n"
-        f"📎 附件列表:\n{attach_list}\n"
-    )
-
-    form_bytes = io.BytesIO(form_text.encode("utf-8"))
-    discord_file = discord.File(
-        fp=form_bytes,
-        filename=f"{record.get('name', '表单')}_表单信息.txt",
-    )
-    await interaction.followup.send(
-        content=f"📋 **{record.get('name', '文件')}** 表单信息",
-        file=discord_file,
-        ephemeral=True,
-    )
-
-    # 记录下载日志
-    _log_download(interaction, record, "表单信息")
 
 
 async def _send_attachment_to_user(interaction: discord.Interaction, record: dict, idx: int):
