@@ -1167,12 +1167,13 @@ def _build_published_card(record: dict, file_id: str):
 
 
 class PublishedFileView(discord.ui.View):
-    """公开卡片：文件下拉选择 + 下载按钮（持久化）"""
+    """公开卡片：文件下拉选择 + 密码输入 + 下载按钮（持久化）"""
 
     def __init__(self, file_id: str = "", record: dict = None):
         super().__init__(timeout=None)  # 持久化
         self._file_id = file_id
         self._record = record
+        self._password = None  # 用户输入的密码（仅当前会话有效）
 
         # 构建选项（在 build 时设置）
         options = []
@@ -1193,6 +1194,15 @@ class PublishedFileView(discord.ui.View):
         self.select_menu.callback = self.on_select
         self.add_item(self.select_menu)
 
+        self.password_btn = discord.ui.Button(
+            label="🔒 输入密码",
+            style=discord.ButtonStyle.secondary,
+            custom_id="pub_file_password",
+            row=1,
+        )
+        self.password_btn.callback = self.on_password_btn
+        self.add_item(self.password_btn)
+
         self.download_btn = discord.ui.Button(
             label="⬇️ 下载",
             style=discord.ButtonStyle.primary,
@@ -1207,6 +1217,10 @@ class PublishedFileView(discord.ui.View):
     async def on_select(self, interaction: discord.Interaction):
         self.selected_value = self.select_menu.values[0]
         await interaction.response.defer()
+
+    async def on_password_btn(self, interaction: discord.Interaction):
+        """打开密码输入框"""
+        await interaction.response.send_modal(PublicPasswordModal(self))
 
     async def on_download(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -1223,21 +1237,22 @@ class PublishedFileView(discord.ui.View):
             await interaction.followup.send("❌ 文件记录已丢失。", ephemeral=True)
             return
 
-        # 检查条件
+        # 检查条件 — 对所有人（含上传者）强制执行
         conditions = record.get("conditions", {})
-        is_uploader = interaction.user.id == record.get("uploader_id")
         failed_reasons = []
 
-        if not is_uploader:
-            if conditions.get("password"):
-                failed_reasons.append("需要密码（暂不支持公开下载密码验证）")
-            if conditions.get("require_like_first"):
-                if not await _check_user_liked_first(interaction):
-                    failed_reasons.append("需要给首楼点赞")
-            if conditions.get("require_comment_first"):
-                min_len = conditions.get("min_comment_length", 1)
-                if not await _check_user_comment_length(interaction, min_len):
-                    failed_reasons.append(f"需要评论首楼至少 {min_len} 字")
+        if conditions.get("password"):
+            if not self._password:
+                failed_reasons.append("需要输入密码（点击 🔒输入密码 按钮）")
+            elif self._password != conditions["password"]:
+                failed_reasons.append("密码错误")
+        if conditions.get("require_like_first"):
+            if not await _check_user_liked_first(interaction):
+                failed_reasons.append("需要给首楼点赞")
+        if conditions.get("require_comment_first"):
+            min_len = conditions.get("min_comment_length", 1)
+            if not await _check_user_comment_length(interaction, min_len):
+                failed_reasons.append(f"需要评论首楼至少 {min_len} 字")
 
         if failed_reasons:
             await interaction.followup.send(
@@ -1254,6 +1269,26 @@ class PublishedFileView(discord.ui.View):
                 await _send_attachment_to_user(interaction, record, idx)
             else:
                 await interaction.followup.send("❌ 附件索引无效。", ephemeral=True)
+
+
+class PublicPasswordModal(discord.ui.Modal, title="输入下载密码"):
+    """公开卡片上的密码输入框"""
+
+    def __init__(self, view: PublishedFileView):
+        super().__init__()
+        self._view = view
+        self.pwd = discord.ui.TextInput(
+            label="请输入下载密码",
+            placeholder="输入上传者设置的密码",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=50,
+        )
+        self.add_item(self.pwd)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        self._view._password = self.pwd.value.strip()
+        await interaction.response.send_message("✅ 密码已记录，现在可以点击下载了", ephemeral=True)
 
 
 async def _send_attachment_to_user(interaction: discord.Interaction, record: dict, idx: int):
@@ -1365,24 +1400,22 @@ class GetFileView(discord.ui.View):
                 return
 
             conditions = record.get("conditions", {})
-            is_uploader = interaction.user.id == record["uploader_id"]
             failed_reasons = []
 
-            if not is_uploader:
-                if conditions.get("password"):
-                    if not self.password:
-                        failed_reasons.append("需要输入密码")
-                    elif self.password != conditions["password"]:
-                        failed_reasons.append("密码错误")
+            if conditions.get("password"):
+                if not self.password:
+                    failed_reasons.append("需要输入密码（使用 /获取文件 密码:xxx）")
+                elif self.password != conditions["password"]:
+                    failed_reasons.append("密码错误")
 
-                if conditions.get("require_like_first"):
-                    if not await _check_user_liked_first(interaction):
-                        failed_reasons.append("需要给首楼点赞")
+            if conditions.get("require_like_first"):
+                if not await _check_user_liked_first(interaction):
+                    failed_reasons.append("需要给首楼点赞")
 
-                if conditions.get("require_comment_first"):
-                    min_len = conditions.get("min_comment_length", 1)
-                    if not await _check_user_comment_length(interaction, min_len):
-                        failed_reasons.append(f"需要评论首楼至少 {min_len} 字")
+            if conditions.get("require_comment_first"):
+                min_len = conditions.get("min_comment_length", 1)
+                if not await _check_user_comment_length(interaction, min_len):
+                    failed_reasons.append(f"需要评论首楼至少 {min_len} 字")
 
             if failed_reasons:
                 await interaction.followup.send(
