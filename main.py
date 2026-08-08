@@ -32,6 +32,8 @@ DATA_FILE = "file_records.json"
 QUESTIONS_FILE = "questions.json"
 STORAGE_CHANNEL_FILE = "storage_channel.json"
 FAQ_FILE = "faq.json"
+POINTS_FILE = "points.json"
+CHECKIN_CHANNEL_FILE = "checkin_channels.json"
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "storage_msg_id": str, "conditions": { ... } } }
@@ -114,6 +116,45 @@ def save_faq():
             json.dump(faq_data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"保存 FAQ 失败: {e}")
+
+# ─── 签到系统 ───
+# 积分: { "guild_id": { "user_id": {"points": int, "last_checkin": "YYYY-MM-DD"} } }
+points_data: dict = {}
+# 签到频道消息: { "channel_id": "message_id" }
+checkin_channel_messages: dict = {}
+CHECKIN_CHANNEL_KEYWORD = "签到"  # 签到频道名称关键词
+
+def load_points():
+    global points_data
+    try:
+        if os.path.exists(POINTS_FILE):
+            with open(POINTS_FILE, "r", encoding="utf-8") as f:
+                points_data = json.load(f)
+    except Exception:
+        points_data = {}
+
+def save_points():
+    try:
+        with open(POINTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(points_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存积分失败: {e}")
+
+def load_checkin_channels():
+    global checkin_channel_messages
+    try:
+        if os.path.exists(CHECKIN_CHANNEL_FILE):
+            with open(CHECKIN_CHANNEL_FILE, "r", encoding="utf-8") as f:
+                checkin_channel_messages = json.load(f)
+    except Exception:
+        checkin_channel_messages = {}
+
+def save_checkin_channels():
+    try:
+        with open(CHECKIN_CHANNEL_FILE, "w", encoding="utf-8") as f:
+            json.dump(checkin_channel_messages, f)
+    except Exception as e:
+        logger.error(f"保存签到频道信息失败: {e}")
 
 # ─── 答题系统 ───
 QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
@@ -217,6 +258,8 @@ async def on_ready():
     load_quiz_cooldowns()
     load_storage_channels()
     load_faq()
+    load_points()
+    load_checkin_channels()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -227,6 +270,9 @@ async def on_ready():
 
     # 在答题频道中发布/更新答题按钮消息
     await setup_quiz_channels()
+
+    # 在签到频道中发布/更新签到按钮消息
+    await setup_checkin_channels()
 
 
 # ═══════════════════════════════════════════
@@ -1207,6 +1253,111 @@ async def announce(interaction: discord.Interaction, 频道: discord.TextChannel
 
 
 # ═══════════════════════════════════════════
+#  签到系统 - 每日签到 + 随机积分
+# ═══════════════════════════════════════════
+
+class PersistentCheckinView(discord.ui.View):
+    """签到频道持久化按钮视图（无超时，重启后恢复）"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="每日签到",
+        style=discord.ButtonStyle.success,
+        emoji="✅",
+        custom_id="persistent_checkin",
+    )
+    async def checkin_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_checkin(interaction)
+
+
+async def setup_checkin_channels():
+    """在名称包含 CHECKIN_CHANNEL_KEYWORD 的频道中发布签到按钮消息"""
+    checkin_embed = discord.Embed(
+        title="🏝️ 小岛每日签到",
+        description="每天签到可获得 **1~20 随机积分**！\n\n"
+                    "点击下方按钮签到，或使用 `/签到` 命令。",
+        color=discord.Color.green(),
+    )
+    checkin_embed.set_footer(text="每天只能签到一次，UTC+8 零点刷新")
+
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if CHECKIN_CHANNEL_KEYWORD not in channel.name:
+                continue
+
+            try:
+                existing_msg_id = checkin_channel_messages.get(str(channel.id))
+                kept = False
+
+                async for old_msg in channel.history(limit=50):
+                    if old_msg.author.id != bot.user.id:
+                        continue
+                    if existing_msg_id and str(old_msg.id) == existing_msg_id:
+                        try:
+                            await old_msg.edit(embed=checkin_embed, view=PersistentCheckinView())
+                            kept = True
+                            logger.info(f"更新签到按钮: #{channel.name}")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await old_msg.delete()
+                        except Exception:
+                            pass
+
+                if not kept:
+                    msg = await channel.send(embed=checkin_embed, view=PersistentCheckinView())
+                    checkin_channel_messages[str(channel.id)] = str(msg.id)
+                    save_checkin_channels()
+                    logger.info(f"发布签到按钮: #{channel.name}")
+            except discord.Forbidden:
+                logger.warning(f"无权限在 #{channel.name} 发送消息")
+            except Exception as e:
+                logger.error(f"签到频道 #{channel.name} 设置失败: {e}")
+
+
+async def _do_checkin(interaction: discord.Interaction):
+    """签到核心逻辑，供按钮和 /签到 命令共用"""
+    guild_id = str(interaction.guild.id)
+    user_id = str(interaction.user.id)
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    # 初始化 guild 数据
+    if guild_id not in points_data:
+        points_data[guild_id] = {}
+
+    user_data = points_data[guild_id].get(user_id, {"points": 0, "last_checkin": ""})
+
+    # 检查今天是否已签到
+    if user_data.get("last_checkin") == today:
+        await interaction.response.send_message(
+            f"⏳ 你今天已经签到过了！当前积分: **{user_data['points']}**\n明天再来吧～",
+            ephemeral=True,
+        )
+        return
+
+    # 随机积分
+    earned = random.randint(1, 20)
+    user_data["points"] = user_data.get("points", 0) + earned
+    user_data["last_checkin"] = today
+    points_data[guild_id][user_id] = user_data
+    save_points()
+
+    await interaction.response.send_message(
+        f"✅ 签到成功！获得 **{earned}** 积分 🎉\n"
+        f"当前总积分: **{user_data['points']}**",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="签到", description="每日签到领取随机积分（1~20）")
+async def checkin_command(interaction: discord.Interaction):
+    await _do_checkin(interaction)
+
+
+# ═══════════════════════════════════════════
 #  错误处理
 # ═══════════════════════════════════════════
 
@@ -1273,6 +1424,7 @@ if __name__ == "__main__":
         await start_http_server()
         # 注册持久化答题按钮（必须在 bot.start() 之前）
         bot.add_view(PersistentQuizView())
+        bot.add_view(PersistentCheckinView())
         logger.info("🚀 正在启动 Chen-Abot...")
         try:
             await bot.start(token)
