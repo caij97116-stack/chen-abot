@@ -41,10 +41,33 @@ REPORT_REVIEW_CHANNEL_NAME = "举报审核"   # 审核工单频道名称
 GUIDE_CHANNEL_KEYWORD = "指路"           # 指路频道关键词
 GUIDE_CHANNEL_FILE = "guide_channels.json"
 DOWNLOAD_LOGS_FILE = "download_logs.json"
+PUBLISHED_FILE = "channel_published.json"
 
 # ─── 文件记录存储 ───
-# 结构: { "file_id": { "name": str, "uploader_id": int, ..., "storage_msg_id": str, "conditions": { ... } } }
+# 结构: { "file_id": { "name": str, "uploader_id": int, "status": "draft|published", "description": str,
+#                      "attachments": [{ "original_name": str, "custom_name": str, "storage_msg_id": str, "size": int }],
+#                      "conditions": { ... }, "published_msg_id": str, "source_channel_id": int, "guild_id": int, "upload_time": str } }
 file_records: dict = {}
+
+# ─── 频道已发布消息追踪 ───
+# 结构: { "channel_id": { "message_id": str, "file_id": str } }
+channel_published: dict = {}
+
+def load_channel_published():
+    global channel_published
+    try:
+        if os.path.exists(PUBLISHED_FILE):
+            with open(PUBLISHED_FILE, "r", encoding="utf-8") as f:
+                channel_published = json.load(f)
+    except Exception:
+        channel_published = {}
+
+def save_channel_published():
+    try:
+        with open(PUBLISHED_FILE, "w", encoding="utf-8") as f:
+            json.dump(channel_published, f)
+    except Exception as e:
+        logger.error(f"保存频道发布记录失败: {e}")
 
 # ─── 存储频道管理 ───
 # 结构: { "guild_id": "channel_id" }
@@ -365,6 +388,7 @@ async def on_ready():
     load_report_counter()
     load_guide_channels()
     load_download_logs()
+    load_channel_published()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -490,235 +514,17 @@ async def back_to_top(interaction: discord.Interaction):
 
 
 # ═══════════════════════════════════════════
-#  /上传文件 - 上传文件，上传后弹出条件设置
+#  /上传文件 - 多附件上传 + 三阶段草稿/发布流程
+#  阶段1: 上传文件 → 阶段2: 设置条件 → 阶段3: 编辑内容 → 确认发布
 # ═══════════════════════════════════════════
-
-class ConditionsModal(discord.ui.Modal, title="设置获取条件"):
-    """上传后弹出的条件设置窗口"""
-
-    def __init__(self, file_id: str):
-        super().__init__()
-        self.file_id = file_id
-        self.password_input = discord.ui.TextInput(
-            label="密码（留空则不设密码）",
-            placeholder="输入密码，或留空跳过",
-            style=discord.TextStyle.short,
-            required=False,
-            max_length=50,
-        )
-        self.add_item(self.password_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        record = file_records.get(self.file_id)
-        if not record:
-            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
-            return
-
-        if record["uploader_id"] != interaction.user.id:
-            await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
-            return
-
-        password = self.password_input.value.strip() or None
-        new_conditions = {
-            "password": password,
-            "require_like_first": False,
-            "require_comment_first": False,
-            "min_comment_length": 0,
-        }
-        record["conditions"] = new_conditions
-        save_records()
-
-        cond_desc = _build_condition_description(new_conditions)
-        await interaction.response.send_message(
-            f"✅ 条件已设置：{cond_desc}",
-            ephemeral=True,
-        )
-
-
-class ConditionView(discord.ui.View):
-    """上传确认消息上的按钮"""
-
-    def __init__(self, file_id: str, uploader_id: int):
-        super().__init__(timeout=300)
-        self.file_id = file_id
-        self.uploader_id = uploader_id
-
-    @discord.ui.button(label="🔒 设置获取条件", style=discord.ButtonStyle.primary)
-    async def set_conditions_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.uploader_id:
-            await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
-            return
-        await interaction.response.send_modal(ConditionsModal(self.file_id))
-
-    @discord.ui.button(label="👍 需要点赞", style=discord.ButtonStyle.secondary, row=1)
-    async def toggle_like(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.uploader_id:
-            await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
-            return
-        record = file_records.get(self.file_id)
-        if not record:
-            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
-            return
-        record["conditions"]["require_like_first"] = not record["conditions"]["require_like_first"]
-        save_records()
-        await interaction.response.send_message(
-            f"✅ 点赞要求已{'开启' if record['conditions']['require_like_first'] else '关闭'}",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="💬 需要评论", style=discord.ButtonStyle.secondary, row=1)
-    async def toggle_comment(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.uploader_id:
-            await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
-            return
-        record = file_records.get(self.file_id)
-        if not record:
-            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
-            return
-        record["conditions"]["require_comment_first"] = not record["conditions"]["require_comment_first"]
-        record["conditions"]["min_comment_length"] = 1 if record["conditions"]["require_comment_first"] else 0
-        save_records()
-        await interaction.response.send_message(
-            f"✅ 评论要求已{'开启（至少1字）' if record['conditions']['require_comment_first'] else '关闭'}",
-            ephemeral=True,
-        )
-
-    @discord.ui.button(label="🔢 评论字数", style=discord.ButtonStyle.secondary, row=1)
-    async def set_comment_count(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.uploader_id:
-            await interaction.response.send_message("只有上传者才能设置条件。", ephemeral=True)
-            return
-        await interaction.response.send_modal(CommentLengthModal(self.file_id))
-
-    async def on_timeout(self):
-        self.disable_all_items()
-        if self.message:
-            await self.message.edit(view=self)
-
-
-class CommentLengthModal(discord.ui.Modal, title="设置评论字数"):
-    def __init__(self, file_id: str):
-        super().__init__()
-        self.file_id = file_id
-        self.count_input = discord.ui.TextInput(
-            label="评论最少需要多少字？",
-            placeholder="输入数字，如 15",
-            style=discord.TextStyle.short,
-            required=True,
-            min_length=1,
-            max_length=3,
-        )
-        self.add_item(self.count_input)
-
-    async def on_submit(self, interaction: discord.Interaction):
-        record = file_records.get(self.file_id)
-        if not record:
-            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
-            return
-        try:
-            count = int(self.count_input.value)
-            if count < 1:
-                count = 1
-            if count > 500:
-                count = 500
-        except ValueError:
-            await interaction.response.send_message("请输入有效数字。", ephemeral=True)
-            return
-        record["conditions"]["require_comment_first"] = True
-        record["conditions"]["min_comment_length"] = count
-        save_records()
-        await interaction.response.send_message(
-            f"✅ 已设置：评论首楼至少 {count} 字",
-            ephemeral=True,
-        )
-
-
-@bot.tree.command(name="上传文件", description="上传文件到当前频道")
-@app_commands.describe(
-    文件="要上传的文件（png/json/zip/txt/mp4等）",
-)
-async def upload_file(
-    interaction: discord.Interaction,
-    文件: discord.Attachment,
-):
-    await interaction.response.defer(ephemeral=True)
-
-    try:
-        # 读取文件内容
-        file_bytes = await 文件.read()
-
-        # 获取存储频道
-        storage_channel = await get_or_create_storage_channel(interaction.guild)
-
-        # 将文件发送到存储频道
-        discord_file = discord.File(
-            fp=io.BytesIO(file_bytes),
-            filename=文件.filename,
-        )
-        storage_msg = await storage_channel.send(
-            content=f"📁 {文件.filename} | 上传者: {interaction.user.display_name} (ID: {interaction.user.id})",
-            file=discord_file,
-        )
-
-        file_id = str(storage_msg.id)
-    except Exception as e:
-        logger.error(f"上传文件失败: {e}")
-        await interaction.followup.send(f"❌ 上传失败: {e}", ephemeral=True)
-        return
-
-    # 查找当前频道已有的文件，继承条件
-    channel_files = {
-        fid: rec for fid, rec in file_records.items()
-        if str(rec.get("source_channel_id")) == str(interaction.channel.id)
-    }
-
-    old_conditions = None
-    if channel_files:
-        old_conditions = next(iter(channel_files.values()))["conditions"]
-
-    conditions = old_conditions if old_conditions else {
-        "password": None,
-        "require_like_first": False,
-        "require_comment_first": False,
-        "min_comment_length": 0,
-    }
-
-    file_records[file_id] = {
-        "name": 文件.filename,
-        "uploader_id": interaction.user.id,
-        "uploader_name": interaction.user.display_name,
-        "source_channel_id": interaction.channel.id,
-        "guild_id": interaction.guild.id,
-        "storage_msg_id": str(storage_msg.id),
-        "size": 文件.size,
-        "conditions": conditions,
-        "upload_time": datetime.now().isoformat(),
-    }
-    save_records()
-
-    cond_desc = _build_condition_description(conditions)
-    embed = discord.Embed(
-        title="✅ 文件上传成功",
-        description=f"**文件名:** {文件.filename}\n"
-                    f"**大小:** {_format_size(文件.size)}\n\n"
-                    f"获取条件: {cond_desc}\n\n"
-                    f"点击下方按钮修改条件 ⬇️",
-        color=discord.Color.green(),
-        timestamp=datetime.now(),
-    )
-    embed.set_footer(text=f"上传者: {interaction.user.display_name}")
-
-    view = ConditionView(file_id, interaction.user.id)
-    view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
-
 
 def _build_condition_description(conditions: dict) -> str:
     parts = []
-    if conditions["password"]:
+    if conditions.get("password"):
         parts.append("需要密码")
-    if conditions["require_like_first"]:
+    if conditions.get("require_like_first"):
         parts.append("需要点赞首楼")
-    if conditions["require_comment_first"]:
+    if conditions.get("require_comment_first"):
         cnt = conditions.get("min_comment_length", 1)
         parts.append(f"需要评论首楼（至少{cnt}字）")
     if not parts:
@@ -735,12 +541,723 @@ def _format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
+# ─── 阶段1: 上传文件命令（支持多附件）───
+
+@bot.tree.command(name="上传文件", description="上传文件到当前频道（支持多附件）")
+@app_commands.describe(
+    文件1="要上传的文件",
+    文件2="（可选）第二个文件",
+    文件3="（可选）第三个文件",
+    文件4="（可选）第四个文件",
+    文件5="（可选）第五个文件",
+)
+async def upload_file(
+    interaction: discord.Interaction,
+    文件1: discord.Attachment,
+    文件2: discord.Attachment = None,
+    文件3: discord.Attachment = None,
+    文件4: discord.Attachment = None,
+    文件5: discord.Attachment = None,
+):
+    await interaction.response.defer(ephemeral=True)
+
+    # 收集所有附件
+    attachments = [文件1]
+    for a in [文件2, 文件3, 文件4, 文件5]:
+        if a is not None:
+            attachments.append(a)
+
+    # 上传所有文件到存储频道
+    storage_channel = await get_or_create_storage_channel(interaction.guild)
+    attachment_records = []
+    total_size = 0
+
+    for att in attachments:
+        try:
+            file_bytes = await att.read()
+            discord_file = discord.File(
+                fp=io.BytesIO(file_bytes),
+                filename=att.filename,
+            )
+            storage_msg = await storage_channel.send(
+                content=f"📁 {att.filename} | 上传者: {interaction.user.display_name} (ID: {interaction.user.id})",
+                file=discord_file,
+            )
+            attachment_records.append({
+                "original_name": att.filename,
+                "custom_name": att.filename,
+                "storage_msg_id": str(storage_msg.id),
+                "size": att.size,
+            })
+            total_size += att.size
+        except Exception as e:
+            logger.error(f"上传文件 {att.filename} 失败: {e}")
+            await interaction.followup.send(f"❌ 上传 {att.filename} 失败: {e}", ephemeral=True)
+            return
+
+    # 生成草稿 ID（使用第一个附件存储消息的 ID）
+    draft_id = attachment_records[0]["storage_msg_id"]
+
+    # 默认文件名：取第一个附件名
+    default_name = attachments[0].filename
+
+    # 继承频道已有条件
+    channel_files = {
+        fid: rec for fid, rec in file_records.items()
+        if str(rec.get("source_channel_id")) == str(interaction.channel.id)
+        and rec.get("status") == "published"
+    }
+    old_conditions = None
+    if channel_files:
+        old_conditions = next(iter(channel_files.values())).get("conditions")
+
+    conditions = old_conditions if old_conditions else {
+        "password": None,
+        "require_like_first": False,
+        "require_comment_first": False,
+        "min_comment_length": 0,
+    }
+
+    file_records[draft_id] = {
+        "name": default_name,
+        "uploader_id": interaction.user.id,
+        "uploader_name": interaction.user.display_name,
+        "source_channel_id": interaction.channel.id,
+        "guild_id": interaction.guild.id,
+        "size": total_size,
+        "conditions": conditions,
+        "description": "",
+        "status": "draft",
+        "published_msg_id": None,
+        "attachments": attachment_records,
+        "upload_time": datetime.now().isoformat(),
+    }
+    save_records()
+
+    # 显示阶段1完成 → 进入阶段2（设置条件）
+    await _show_draft_setup(interaction, draft_id)
+
+
+# ─── 阶段2: 草稿设置面板（条件 + 文件/附件名称修改）───
+
+class DraftSetupView(discord.ui.View):
+    """草稿设置面板：条件设置 + 文件/附件名称修改 + 进入阶段3"""
+
+    def __init__(self, file_id: str, uploader_id: int):
+        super().__init__(timeout=600)
+        self.file_id = file_id
+        self.uploader_id = uploader_id
+
+    def _check_owner(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.uploader_id:
+            return False
+        return True
+
+    @discord.ui.button(label="🔒 设置密码", style=discord.ButtonStyle.primary, row=0)
+    async def set_password(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_owner(interaction):
+            await interaction.response.send_message("只有上传者才能设置。", ephemeral=True)
+            return
+        await interaction.response.send_modal(PasswordModal(self.file_id))
+
+    @discord.ui.button(label="👍 需要点赞", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_like(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_owner(interaction):
+            await interaction.response.send_message("只有上传者才能设置。", ephemeral=True)
+            return
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        record["conditions"]["require_like_first"] = not record["conditions"]["require_like_first"]
+        save_records()
+        await interaction.response.send_message(
+            f"✅ 点赞要求已{'开启' if record['conditions']['require_like_first'] else '关闭'}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="💬 需要评论", style=discord.ButtonStyle.secondary, row=0)
+    async def toggle_comment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_owner(interaction):
+            await interaction.response.send_message("只有上传者才能设置。", ephemeral=True)
+            return
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        record["conditions"]["require_comment_first"] = not record["conditions"]["require_comment_first"]
+        if record["conditions"]["require_comment_first"]:
+            record["conditions"]["min_comment_length"] = 1
+        else:
+            record["conditions"]["min_comment_length"] = 0
+        save_records()
+        await interaction.response.send_message(
+            f"✅ 评论要求已{'开启（至少1字）' if record['conditions']['require_comment_first'] else '关闭'}",
+            ephemeral=True,
+        )
+
+    @discord.ui.button(label="🔢 评论字数", style=discord.ButtonStyle.secondary, row=0)
+    async def set_comment_count(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_owner(interaction):
+            await interaction.response.send_message("只有上传者才能设置。", ephemeral=True)
+            return
+        await interaction.response.send_modal(CommentLengthModal(self.file_id))
+
+    @discord.ui.button(label="✏️ 修改文件标题", style=discord.ButtonStyle.success, row=1)
+    async def rename_file(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_owner(interaction):
+            await interaction.response.send_message("只有上传者才能设置。", ephemeral=True)
+            return
+        await interaction.response.send_modal(RenameFileModal(self.file_id))
+
+    @discord.ui.button(label="📎 修改附件名", style=discord.ButtonStyle.success, row=1)
+    async def rename_attachments(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_owner(interaction):
+            await interaction.response.send_message("只有上传者才能设置。", ephemeral=True)
+            return
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        await interaction.response.send_modal(RenameAttachmentsModal(self.file_id, record["attachments"]))
+
+    @discord.ui.button(label="📝 编辑内容 →", style=discord.ButtonStyle.danger, row=2)
+    async def go_to_content(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_owner(interaction):
+            await interaction.response.send_message("只有上传者才能设置。", ephemeral=True)
+            return
+        await interaction.response.send_modal(ContentEditModal(self.file_id))
+
+    async def on_timeout(self):
+        self.disable_all_items()
+        if hasattr(self, "message") and self.message:
+            await self.message.edit(view=self)
+
+
+async def _show_draft_setup(interaction: discord.Interaction, file_id: str):
+    """显示草稿设置面板（阶段2）"""
+    record = file_records.get(file_id)
+    if not record:
+        return
+
+    cond_desc = _build_condition_description(record["conditions"])
+    attach_list = "\n".join(
+        f"📎 {a['custom_name']} ({_format_size(a['size'])})"
+        for a in record["attachments"]
+    )
+
+    embed = discord.Embed(
+        title="⚙️ 阶段2: 设置获取条件",
+        description=f"**文件标题:** {record['name']}\n"
+                    f"**附件数:** {len(record['attachments'])} 个\n\n"
+                    f"**附件列表:**\n{attach_list}\n\n"
+                    f"**当前条件:** {cond_desc}",
+        color=discord.Color.blue(),
+        timestamp=datetime.now(),
+    )
+    embed.set_footer(text="设置完成后点击「编辑内容」进入下一步")
+
+    view = DraftSetupView(file_id, interaction.user.id)
+    view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+# ─── 阶段2 辅助 Modal：密码、评论字数、文件名、附件名 ───
+
+class PasswordModal(discord.ui.Modal, title="设置密码"):
+    def __init__(self, file_id: str):
+        super().__init__()
+        self.file_id = file_id
+        self.pwd = discord.ui.TextInput(
+            label="密码（留空则清除密码）",
+            placeholder="输入密码，或留空跳过",
+            style=discord.TextStyle.short,
+            required=False,
+            max_length=50,
+        )
+        self.add_item(self.pwd)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        record["conditions"]["password"] = self.pwd.value.strip() or None
+        save_records()
+        await interaction.response.send_message(
+            f"✅ 密码已{'设置' if record['conditions']['password'] else '清除'}",
+            ephemeral=True,
+        )
+
+
+class CommentLengthModal(discord.ui.Modal, title="设置评论字数"):
+    def __init__(self, file_id: str):
+        super().__init__()
+        self.file_id = file_id
+        self.count = discord.ui.TextInput(
+            label="评论最少需要多少字？",
+            placeholder="输入数字，如 15",
+            style=discord.TextStyle.short,
+            required=True,
+            min_length=1,
+            max_length=3,
+        )
+        self.add_item(self.count)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        try:
+            count = int(self.count.value)
+            if count < 1:
+                count = 1
+            if count > 500:
+                count = 500
+        except ValueError:
+            await interaction.response.send_message("请输入有效数字。", ephemeral=True)
+            return
+        record["conditions"]["require_comment_first"] = True
+        record["conditions"]["min_comment_length"] = count
+        save_records()
+        await interaction.response.send_message(
+            f"✅ 已设置：评论首楼至少 {count} 字",
+            ephemeral=True,
+        )
+
+
+class RenameFileModal(discord.ui.Modal, title="修改文件标题"):
+    def __init__(self, file_id: str):
+        super().__init__()
+        self.file_id = file_id
+        record = file_records.get(file_id, {})
+        self.new_name = discord.ui.TextInput(
+            label="新文件标题",
+            placeholder="输入新的文件标题",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=100,
+            default=record.get("name", ""),
+        )
+        self.add_item(self.new_name)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        record["name"] = self.new_name.value.strip()
+        save_records()
+        await interaction.response.send_message(
+            f"✅ 文件标题已修改为：**{record['name']}**",
+            ephemeral=True,
+        )
+
+
+class RenameAttachmentsModal(discord.ui.Modal, title="修改附件名称"):
+    def __init__(self, file_id: str, attachments: list):
+        super().__init__()
+        self.file_id = file_id
+        self.attach_count = len(attachments)
+        # 最多支持 5 个附件改名（Discord Modal 最多 5 个 TextInput）
+        for i, att in enumerate(attachments[:5]):
+            field = discord.ui.TextInput(
+                label=f"附件{i + 1}名称",
+                placeholder=att["custom_name"],
+                style=discord.TextStyle.short,
+                required=False,
+                max_length=100,
+                default=att["custom_name"],
+            )
+            self.add_item(field)
+            setattr(self, f"attach_{i}", field)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        changed = []
+        for i in range(min(self.attach_count, 5)):
+            field = getattr(self, f"attach_{i}", None)
+            if field and field.value.strip():
+                record["attachments"][i]["custom_name"] = field.value.strip()
+                changed.append(field.value.strip())
+        save_records()
+        await interaction.response.send_message(
+            f"✅ 已更新 {len(changed)} 个附件名称",
+            ephemeral=True,
+        )
+
+
+# ─── 阶段3: 编辑内容 + 确认发布 ───
+
+class ContentEditModal(discord.ui.Modal, title="编辑内容与作者提示"):
+    def __init__(self, file_id: str):
+        super().__init__()
+        self.file_id = file_id
+        record = file_records.get(file_id, {})
+        self.content = discord.ui.TextInput(
+            label="作者提示 / 内容说明",
+            placeholder="输入文件说明、作者提示、注意事项等...",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=2000,
+            default=record.get("description", ""),
+        )
+        self.add_item(self.content)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        record["description"] = self.content.value.strip()
+        save_records()
+
+        # 显示预览 + 确认发布
+        await _show_publish_preview(interaction, self.file_id)
+
+
+async def _show_publish_preview(interaction: discord.Interaction, file_id: str):
+    """显示发布预览 + 确认发布按钮（阶段3）"""
+    record = file_records.get(file_id)
+    if not record:
+        await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+        return
+
+    cond_desc = _build_condition_description(record["conditions"])
+    attach_list = "\n".join(
+        f"📎 {a['custom_name']} ({_format_size(a['size'])})"
+        for a in record["attachments"]
+    )
+    desc = record.get("description", "") or "（无说明）"
+
+    embed = discord.Embed(
+        title="📋 阶段3: 预览确认",
+        description=f"**文件标题:** {record['name']}\n"
+                    f"**总大小:** {_format_size(record['size'])}\n\n"
+                    f"**附件:**\n{attach_list}\n\n"
+                    f"**获取条件:** {cond_desc}\n\n"
+                    f"**内容说明:**\n{desc[:500]}",
+        color=discord.Color.gold(),
+        timestamp=datetime.now(),
+    )
+    embed.set_footer(text="确认无误后点击「确认发布」")
+
+    view = PublishConfirmView(file_id, interaction.user.id)
+    view.message = await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class PublishConfirmView(discord.ui.View):
+    """确认发布按钮"""
+
+    def __init__(self, file_id: str, uploader_id: int):
+        super().__init__(timeout=300)
+        self.file_id = file_id
+        self.uploader_id = uploader_id
+
+    @discord.ui.button(label="✅ 确认发布", style=discord.ButtonStyle.success)
+    async def confirm_publish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.uploader_id:
+            await interaction.response.send_message("只有上传者才能发布。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.followup.send("文件记录已丢失。", ephemeral=True)
+            return
+
+        # 发布！
+        await _publish_file(interaction, self.file_id, record)
+
+        # 禁用按钮
+        self.disable_all_items()
+        if hasattr(self, "message") and self.message:
+            await self.message.edit(view=self)
+
+    @discord.ui.button(label="↩️ 返回修改", style=discord.ButtonStyle.secondary)
+    async def back_to_setup(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.uploader_id:
+            await interaction.response.send_message("只有上传者才能操作。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await _show_draft_setup(interaction, self.file_id)
+
+    async def on_timeout(self):
+        self.disable_all_items()
+        if hasattr(self, "message") and self.message:
+            await self.message.edit(view=self)
+
+
+async def _publish_file(interaction: discord.Interaction, file_id: str, record: dict):
+    """发布文件到频道：删除旧发布卡片，创建新卡片"""
+    channel_id = str(interaction.channel.id)
+
+    # 删除该频道之前的发布卡片
+    old_pub = channel_published.get(channel_id)
+    if old_pub:
+        try:
+            old_msg = await interaction.channel.fetch_message(int(old_pub["message_id"]))
+            await old_msg.delete()
+        except Exception:
+            pass
+
+    record["status"] = "published"
+    save_records()
+
+    # 创建公开卡片
+    embed, view = _build_published_card(record, file_id)
+
+    try:
+        pub_msg = await interaction.channel.send(embed=embed, view=view)
+        record["published_msg_id"] = str(pub_msg.id)
+        channel_published[channel_id] = {
+            "message_id": str(pub_msg.id),
+            "file_id": file_id,
+        }
+        save_records()
+        save_channel_published()
+
+        await interaction.followup.send(
+            f"✅ 文件 **{record['name']}** 已发布到频道！",
+            ephemeral=True,
+        )
+    except Exception as e:
+        logger.error(f"发布文件失败: {e}")
+        await interaction.followup.send(f"❌ 发布失败: {e}", ephemeral=True)
+
+
+# ─── 公开卡片构建 ───
+
+def _build_published_card(record: dict, file_id: str):
+    """构建公开的发布卡片（embed + 带下拉选择器的 view）"""
+    cond_desc = _build_condition_description(record["conditions"])
+    desc = record.get("description", "") or "（无说明）"
+    attach_count = len(record["attachments"])
+
+    embed = discord.Embed(
+        title=f"📁 {record['name']}",
+        description=f"{desc[:1000]}\n\n"
+                    f"**附件数:** {attach_count} 个\n"
+                    f"**总大小:** {_format_size(record['size'])}\n"
+                    f"**获取条件:** {cond_desc}",
+        color=discord.Color.purple(),
+        timestamp=datetime.fromisoformat(record["upload_time"]) if record.get("upload_time") else datetime.now(),
+    )
+    embed.set_footer(text=f"上传者: {record.get('uploader_name', '未知')} | 选择文件后点击下载")
+
+    view = PublishedFileView(file_id, record)
+    return embed, view
+
+
+class PublishedFileView(discord.ui.View):
+    """公开卡片：文件下拉选择 + 下载按钮（持久化）"""
+
+    def __init__(self, file_id: str = "", record: dict = None):
+        super().__init__(timeout=None)  # 持久化
+        self._file_id = file_id
+        self._record = record
+
+        # 构建选项（在 build 时设置）
+        options = []
+        if record:
+            for i, att in enumerate(record.get("attachments", [])):
+                options.append(discord.SelectOption(
+                    label=f"📎 {att['custom_name'][:80]}",
+                    description=f"{_format_size(att['size'])}",
+                    value=f"file_{i}",
+                ))
+            options.append(discord.SelectOption(
+                label="📋 表单信息",
+                description="下载文件说明与条件信息",
+                value="form_info",
+            ))
+
+        self.select_menu = discord.ui.Select(
+            placeholder=f"选择要下载的文件（共 {len(options)} 项）" if options else "选择文件",
+            options=options if options else [discord.SelectOption(label="—", value="none")],
+            custom_id="pub_file_select",
+            row=0,
+        )
+        self.select_menu.callback = self.on_select
+        self.add_item(self.select_menu)
+
+        self.download_btn = discord.ui.Button(
+            label="⬇️ 下载",
+            style=discord.ButtonStyle.primary,
+            custom_id="pub_file_download",
+            row=1,
+        )
+        self.download_btn.callback = self.on_download
+        self.add_item(self.download_btn)
+
+        self.selected_value = "file_0"
+
+    async def on_select(self, interaction: discord.Interaction):
+        self.selected_value = self.select_menu.values[0]
+        await interaction.response.defer()
+
+    async def on_download(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        # 从频道发布记录中查找 file_id
+        channel_id = str(interaction.channel.id)
+        pub_info = channel_published.get(channel_id)
+        if not pub_info:
+            await interaction.followup.send("❌ 发布记录已过期。", ephemeral=True)
+            return
+
+        record = file_records.get(pub_info["file_id"])
+        if not record:
+            await interaction.followup.send("❌ 文件记录已丢失。", ephemeral=True)
+            return
+
+        # 检查条件
+        conditions = record.get("conditions", {})
+        is_uploader = interaction.user.id == record.get("uploader_id")
+        failed_reasons = []
+
+        if not is_uploader:
+            if conditions.get("password"):
+                failed_reasons.append("需要密码（暂不支持公开下载密码验证）")
+            if conditions.get("require_like_first"):
+                if not await _check_user_liked_first(interaction):
+                    failed_reasons.append("需要给首楼点赞")
+            if conditions.get("require_comment_first"):
+                min_len = conditions.get("min_comment_length", 1)
+                if not await _check_user_comment_length(interaction, min_len):
+                    failed_reasons.append(f"需要评论首楼至少 {min_len} 字")
+
+        if failed_reasons:
+            await interaction.followup.send(
+                "❌ " + "，".join(failed_reasons),
+                ephemeral=True,
+            )
+            return
+
+        # 根据选择发送文件
+        if self.selected_value == "form_info":
+            await _send_form_info(interaction, record)
+        elif self.selected_value.startswith("file_"):
+            idx = int(self.selected_value.split("_")[1])
+            attachments = record.get("attachments", [])
+            if idx < len(attachments):
+                await _send_attachment_to_user(interaction, record, idx)
+            else:
+                await interaction.followup.send("❌ 附件索引无效。", ephemeral=True)
+
+
+async def _send_form_info(interaction: discord.Interaction, record: dict):
+    """发送表单信息（文本文件）"""
+    cond_desc = _build_condition_description(record.get("conditions", {}))
+    desc = record.get("description", "") or "（无说明）"
+    attach_list = "\n".join(
+        f"- {a['custom_name']} ({_format_size(a['size'])})"
+        for a in record.get("attachments", [])
+    )
+
+    form_text = (
+        f"📋 文件信息表单\n"
+        f"{'=' * 40}\n"
+        f"文件标题: {record.get('name', '未知')}\n"
+        f"上传者: {record.get('uploader_name', '未知')}\n"
+        f"上传时间: {record.get('upload_time', '未知')}\n"
+        f"总大小: {_format_size(record.get('size', 0))}\n"
+        f"获取条件: {cond_desc}\n\n"
+        f"📝 内容说明:\n{desc}\n\n"
+        f"📎 附件列表:\n{attach_list}\n"
+    )
+
+    form_bytes = io.BytesIO(form_text.encode("utf-8"))
+    discord_file = discord.File(
+        fp=form_bytes,
+        filename=f"{record.get('name', '表单')}_表单信息.txt",
+    )
+    await interaction.followup.send(
+        content=f"📋 **{record.get('name', '文件')}** 表单信息",
+        file=discord_file,
+        ephemeral=True,
+    )
+
+    # 记录下载日志
+    _log_download(interaction, record, "表单信息")
+
+
+async def _send_attachment_to_user(interaction: discord.Interaction, record: dict, idx: int):
+    """发送指定附件给用户"""
+    att = record["attachments"][idx]
+    try:
+        guild = interaction.client.get_guild(record["guild_id"])
+        if not guild:
+            await interaction.followup.send("❌ 找不到服务器。", ephemeral=True)
+            return
+
+        guild_id_str = str(record["guild_id"])
+        channel_id = storage_channels.get(guild_id_str)
+        if not channel_id:
+            await interaction.followup.send("❌ 存储频道不存在。", ephemeral=True)
+            return
+
+        channel = guild.get_channel(int(channel_id))
+        if not channel:
+            await interaction.followup.send("❌ 存储频道已删除。", ephemeral=True)
+            return
+
+        try:
+            msg = await channel.fetch_message(int(att["storage_msg_id"]))
+        except discord.NotFound:
+            await interaction.followup.send("❌ 文件已被删除。", ephemeral=True)
+            return
+
+        if not msg.attachments:
+            await interaction.followup.send("❌ 文件附件丢失。", ephemeral=True)
+            return
+
+        attachment = msg.attachments[0]
+        file_bytes = await attachment.read()
+
+        discord_file = discord.File(
+            fp=io.BytesIO(file_bytes),
+            filename=att["custom_name"],
+        )
+        await interaction.followup.send(
+            content=f"📁 **{att['custom_name']}**\n上传者: <@{record['uploader_id']}>",
+            file=discord_file,
+            ephemeral=True,
+        )
+
+        _log_download(interaction, record, att["custom_name"])
+
+    except Exception as e:
+        logger.error(f"发送附件失败: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 获取文件时出错: {e}", ephemeral=True)
+
+
+def _log_download(interaction: discord.Interaction, record: dict, file_label: str):
+    """记录下载日志"""
+    download_logs.append({
+        "file_id": record.get("published_msg_id", "?"),
+        "file_name": record.get("name", "?"),
+        "file_label": file_label,
+        "downloader_id": interaction.user.id,
+        "downloader_name": interaction.user.display_name,
+        "channel_id": interaction.channel.id,
+        "uploader_id": record.get("uploader_id", "?"),
+        "uploader_name": record.get("uploader_name", "?"),
+        "timestamp": datetime.now().isoformat(),
+    })
+    save_download_logs()
+
+
 # ═══════════════════════════════════════════
-#  /获取文件 - 查看文件列表并获取
+#  /获取文件 - 查看当前频道已发布文件列表
 # ═══════════════════════════════════════════
 
 class GetFileView(discord.ui.View):
-    """文件列表视图，每个文件一个获取按钮"""
+    """文件列表视图，每个已发布文件一个获取按钮"""
 
     def __init__(self, channel_files: dict, interaction_user_id: int, password: Optional[str]):
         super().__init__(timeout=300)
@@ -754,12 +1271,12 @@ class GetFileView(discord.ui.View):
             reverse=True,
         )
 
-        for i, (file_id, rec) in enumerate(sorted_files[:25]):  # Discord 最多 25 个按钮
+        for i, (file_id, rec) in enumerate(sorted_files[:25]):
             btn = discord.ui.Button(
                 label=f"获取 {rec['name'][:60]}",
                 style=discord.ButtonStyle.primary,
                 custom_id=file_id,
-                row=i // 5,  # 每行最多 5 个按钮
+                row=i // 5,
             )
             btn.callback = self.make_callback(file_id)
             self.add_item(btn)
@@ -777,22 +1294,22 @@ class GetFileView(discord.ui.View):
                 await interaction.followup.send("文件记录已丢失。", ephemeral=True)
                 return
 
-            conditions = record["conditions"]
+            conditions = record.get("conditions", {})
             is_uploader = interaction.user.id == record["uploader_id"]
             failed_reasons = []
 
             if not is_uploader:
-                if conditions["password"]:
+                if conditions.get("password"):
                     if not self.password:
                         failed_reasons.append("需要输入密码")
                     elif self.password != conditions["password"]:
                         failed_reasons.append("密码错误")
 
-                if conditions["require_like_first"]:
+                if conditions.get("require_like_first"):
                     if not await _check_user_liked_first(interaction):
                         failed_reasons.append("需要给首楼点赞")
 
-                if conditions["require_comment_first"]:
+                if conditions.get("require_comment_first"):
                     min_len = conditions.get("min_comment_length", 1)
                     if not await _check_user_comment_length(interaction, min_len):
                         failed_reasons.append(f"需要评论首楼至少 {min_len} 字")
@@ -804,12 +1321,17 @@ class GetFileView(discord.ui.View):
                 )
                 return
 
-            await _send_file_to_user(interaction, record, file_id)
+            # 发送第一个附件（兼容旧行为：点击获取按钮默认发送第一个文件）
+            attachments = record.get("attachments", [])
+            if attachments:
+                await _send_attachment_to_user(interaction, record, 0)
+            else:
+                await interaction.followup.send("❌ 没有可用的附件。", ephemeral=True)
 
         return callback
 
 
-@bot.tree.command(name="获取文件", description="查看当前频道文件列表并获取")
+@bot.tree.command(name="获取文件", description="查看当前频道已发布文件列表并获取")
 @app_commands.describe(
     密码="如果上传者设置了密码，请在此输入",
 )
@@ -817,16 +1339,18 @@ async def get_file(
     interaction: discord.Interaction,
     密码: Optional[str] = None,
 ):
-    """显示频道内所有文件，可点击按钮获取"""
+    """显示频道内已发布文件，可点击按钮获取"""
     await interaction.response.defer(ephemeral=True)
 
+    # 非上传者只能看到已发布文件；上传者可以看到自己所有文件（含草稿）
     channel_files = {
         fid: rec for fid, rec in file_records.items()
         if str(rec.get("source_channel_id")) == str(interaction.channel.id)
+        and (rec.get("status") == "published" or rec.get("uploader_id") == interaction.user.id)
     }
 
     if not channel_files:
-        await interaction.followup.send("📭 当前频道还没有上传过文件。", ephemeral=True)
+        await interaction.followup.send("📭 当前频道还没有已发布文件。", ephemeral=True)
         return
 
     sorted_files = sorted(
@@ -841,35 +1365,40 @@ async def get_file(
     )
 
     for file_id, rec in sorted_files:
-        cond_desc = _build_condition_description(rec["conditions"])
+        cond_desc = _build_condition_description(rec.get("conditions", {}))
         raw_time = rec.get("upload_time", "")
         try:
             dt = datetime.fromisoformat(raw_time)
             upload_time = dt.strftime("%Y-%m-%d %H:%M")
         except Exception:
             upload_time = raw_time[:16] if len(raw_time) >= 16 else "未知"
-        is_uploader = interaction.user.id == rec["uploader_id"]
+        is_uploader = interaction.user.id == rec.get("uploader_id")
+        status_label = rec.get("status", "published")
+        draft_tag = " [草稿]" if status_label == "draft" else ""
 
-        # 检查用户已满足的条件
+        attach_count = len(rec.get("attachments", []))
+        attach_info = f"附件: {attach_count} 个" if attach_count > 0 else ""
+
+        # 条件检查
         met_parts = []
         unmet_parts = []
-        conditions = rec["conditions"]
+        conditions = rec.get("conditions", {})
 
         if is_uploader:
             met_parts.append("✅ 上传者（无条件）")
         else:
-            if conditions["password"]:
+            if conditions.get("password"):
                 if 密码 and 密码 == conditions["password"]:
                     met_parts.append("✅ 密码正确")
                 else:
                     unmet_parts.append("❌ 需要密码")
-            if conditions["require_like_first"]:
+            if conditions.get("require_like_first"):
                 liked = await _check_user_liked_first(interaction)
                 if liked:
                     met_parts.append("✅ 已点赞")
                 else:
                     unmet_parts.append("❌ 未点赞")
-            if conditions["require_comment_first"]:
+            if conditions.get("require_comment_first"):
                 min_len = conditions.get("min_comment_length", 1)
                 met = await _check_user_comment_length(interaction, min_len)
                 if met:
@@ -877,21 +1406,22 @@ async def get_file(
                 else:
                     unmet_parts.append(f"❌ 评论不足{min_len}字")
 
-            if not conditions["password"] and not conditions["require_like_first"] and not conditions["require_comment_first"]:
+            if not conditions.get("password") and not conditions.get("require_like_first") and not conditions.get("require_comment_first"):
                 met_parts.append("✅ 无条件")
 
         status = "\n".join(met_parts + unmet_parts) if (met_parts or unmet_parts) else "✅ 无条件"
 
         embed.add_field(
-            name=f"📁 {rec['name']}",
-            value=f"上传者: <@{rec['uploader_id']}>\n"
-                  f"大小: {_format_size(rec['size'])}\n"
+            name=f"📁 {rec.get('name', '?')}{draft_tag}",
+            value=f"上传者: <@{rec.get('uploader_id', '?')}>\n"
+                  f"大小: {_format_size(rec.get('size', 0))}\n"
+                  f"{attach_info}\n"
                   f"时间: {upload_time}\n"
                   f"{status}",
             inline=False,
         )
 
-    embed.set_footer(text="点击下方按钮获取文件")
+    embed.set_footer(text="点击下方按钮获取文件（默认获取第一个附件）")
     view = GetFileView(channel_files, interaction.user.id, 密码)
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
@@ -918,7 +1448,6 @@ async def _check_user_comment_length(interaction: discord.Interaction, min_lengt
             async for msg in interaction.channel.history(after=first_msg, limit=200):
                 if msg.author.id != interaction.user.id:
                     continue
-                # 检查是否是回复首楼的消息
                 ref = msg.reference
                 if ref is None:
                     continue
@@ -933,81 +1462,6 @@ async def _check_user_comment_length(interaction: discord.Interaction, min_lengt
     except Exception as e:
         logger.error(f"检查评论长度失败: {e}")
         return False
-
-
-async def _send_file_to_user(interaction: discord.Interaction, record: dict, 文件id: str):
-    """从存储频道拉取文件并发送给用户"""
-    try:
-        storage_msg_id = record.get("storage_msg_id")
-        guild_id = record.get("guild_id")
-
-        if not storage_msg_id or not guild_id:
-            await interaction.followup.send("❌ 文件记录无效。", ephemeral=True)
-            return
-
-        guild = interaction.client.get_guild(guild_id)
-        if not guild:
-            await interaction.followup.send("❌ 找不到服务器。", ephemeral=True)
-            return
-
-        guild_id_str = str(guild_id)
-        channel_id = storage_channels.get(guild_id_str)
-        if not channel_id:
-            await interaction.followup.send("❌ 存储频道不存在，请重新上传文件。", ephemeral=True)
-            return
-
-        channel = guild.get_channel(int(channel_id))
-        if not channel:
-            await interaction.followup.send("❌ 存储频道已删除，请重新上传文件。", ephemeral=True)
-            return
-
-        try:
-            msg = await channel.fetch_message(int(storage_msg_id))
-        except discord.NotFound:
-            await interaction.followup.send("❌ 文件已被删除，请重新上传。", ephemeral=True)
-            return
-        except Exception as e:
-            logger.error(f"获取存储消息失败: {e}")
-            await interaction.followup.send(f"❌ 获取文件时出错: {e}", ephemeral=True)
-            return
-
-        if not msg.attachments:
-            await interaction.followup.send("❌ 文件附件丢失，请重新上传。", ephemeral=True)
-            return
-
-        attachment = msg.attachments[0]
-        file_bytes = await attachment.read()
-
-        discord_file = discord.File(
-            fp=io.BytesIO(file_bytes),
-            filename=record["name"],
-        )
-        await interaction.followup.send(
-            content=f"📁 **{record['name']}**\n"
-                    f"上传者: <@{record['uploader_id']}>",
-            file=discord_file,
-            ephemeral=True,
-        )
-        logger.info(f"文件发送成功: {record['name']}")
-
-        # 记录下载日志
-        download_logs.append({
-            "file_id": 文件id,
-            "file_name": record["name"],
-            "downloader_id": interaction.user.id,
-            "downloader_name": interaction.user.display_name,
-            "channel_id": interaction.channel.id,
-            "uploader_id": record["uploader_id"],
-            "uploader_name": record.get("uploader_name", "未知"),
-            "timestamp": datetime.now().isoformat(),
-        })
-        save_download_logs()
-    except Exception as e:
-        logger.error(f"获取文件失败: {e}", exc_info=True)
-        await interaction.followup.send(
-            f"❌ 获取文件时出错: {e}",
-            ephemeral=True,
-        )
 
 
 # ═══════════════════════════════════════════
@@ -2452,6 +2906,7 @@ if __name__ == "__main__":
         bot.add_view(PersistentCheckinView())
         bot.add_view(PersistentReportEntryView())
         bot.add_view(PersistentReportReviewView("", 0))
+        bot.add_view(PublishedFileView())
         logger.info("🚀 正在启动 Chen-Abot...")
         try:
             await bot.start(token)
