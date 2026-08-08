@@ -2008,6 +2008,64 @@ async def setup_report_channels():
 
 
 # ═══════════════════════════════════════════
+#  /清理测试数据 - 仅岛主可用，清理所有举报工单
+# ═══════════════════════════════════════════
+
+@bot.tree.command(name="清理测试数据", description="删除所有举报工单子频道、清空审核频道、重置计数器（仅岛主可用）")
+async def cleanup_reports(interaction: discord.Interaction):
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("只有岛主才能使用此命令。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+    guild = interaction.guild
+    deleted_threads = 0
+    cleared_messages = 0
+
+    # 1. 删除所有举报子频道
+    for rid, rec in list(report_data.items()):
+        if rec.get("guild_id") != str(guild.id):
+            continue
+        thread_id = rec.get("thread_id")
+        if thread_id:
+            thread = guild.get_thread(int(thread_id))
+            if thread:
+                try:
+                    await thread.delete()
+                    deleted_threads += 1
+                except Exception as e:
+                    logger.warning(f"删除子频道失败: {e}")
+
+    # 2. 清空审核频道消息
+    for channel in guild.text_channels:
+        if channel.name == REPORT_REVIEW_CHANNEL_NAME:
+            try:
+                async for msg in channel.history(limit=100):
+                    if msg.author.id == bot.user.id:
+                        try:
+                            await msg.delete()
+                            cleared_messages += 1
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.warning(f"清空审核频道失败: {e}")
+
+    # 3. 重置数据
+    report_data.clear()
+    save_reports()
+    report_counter.pop(str(guild.id), None)
+    save_report_counter()
+
+    await interaction.followup.send(
+        f"✅ 清理完成！\n"
+        f"已删除 {deleted_threads} 个举报子频道\n"
+        f"已清空审核频道 {cleared_messages} 条消息\n"
+        f"工单计数器已重置，下次从 #001 开始",
+        ephemeral=True,
+    )
+
+
+# ═══════════════════════════════════════════
 #  错误处理
 # ═══════════════════════════════════════════
 
