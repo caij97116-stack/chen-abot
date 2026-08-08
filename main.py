@@ -2039,12 +2039,27 @@ async def setup_report_channels():
 
 async def setup_guide_channels():
     """在名称包含 GUIDE_CHANNEL_KEYWORD 的频道中发布频道导航"""
+    # 排除的频道名称
+    EXCLUDED_NAMES = {"📁-文件存储", "举报审核"}
+
     for guild in bot.guilds:
-        # 收集所有文字频道，按分类分组
+        # 收集所有频道（文字、语音、论坛、舞台），按分类分组
         categories = {}
         no_category = []
 
-        for channel in guild.text_channels:
+        all_channels = list(guild.text_channels) + list(guild.voice_channels)
+        # 添加论坛频道
+        try:
+            all_channels += list(guild.forum_channels)
+        except AttributeError:
+            pass
+        # 添加舞台频道
+        try:
+            all_channels += list(guild.stage_channels)
+        except AttributeError:
+            pass
+
+        for channel in all_channels:
             if channel.category:
                 cat_name = channel.category.name
                 if cat_name not in categories:
@@ -2057,10 +2072,13 @@ async def setup_guide_channels():
             if GUIDE_CHANNEL_KEYWORD not in channel.name:
                 continue
 
-            # 构建导航（排除当前指路频道自身）
+            # 构建导航（排除指路自身、文件存储、举报审核）
             lines = []
             for cat_name, chs in categories.items():
-                filtered = [ch for ch in chs if ch.id != channel.id]
+                filtered = [ch for ch in chs
+                            if ch.id != channel.id
+                            and ch.name not in EXCLUDED_NAMES
+                            and GUIDE_CHANNEL_KEYWORD not in ch.name]
                 if not filtered:
                     continue
                 lines.append(f"**📁 {cat_name}**")
@@ -2068,7 +2086,10 @@ async def setup_guide_channels():
                     lines.append(f"　└ {ch.mention}")
                 lines.append("")
 
-            filtered_no_cat = [ch for ch in no_category if ch.id != channel.id]
+            filtered_no_cat = [ch for ch in no_category
+                               if ch.id != channel.id
+                               and ch.name not in EXCLUDED_NAMES
+                               and GUIDE_CHANNEL_KEYWORD not in ch.name]
             if filtered_no_cat:
                 lines.append("**📁 未分类**")
                 for ch in filtered_no_cat:
