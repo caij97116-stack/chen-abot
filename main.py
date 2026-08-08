@@ -2058,6 +2058,10 @@ async def setup_guide_channels():
             all_channels += list(guild.stage_channels)
         except AttributeError:
             pass
+        # 添加所有类型的频道（公告/新闻等可能不在 text_channels 中）
+        for ch in guild.channels:
+            if ch not in all_channels and not isinstance(ch, discord.CategoryChannel):
+                all_channels.append(ch)
 
         for channel in all_channels:
             if channel.category:
