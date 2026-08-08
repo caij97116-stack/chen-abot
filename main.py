@@ -3,6 +3,7 @@ import io
 import json
 import random
 import asyncio
+import zipfile
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -728,6 +729,28 @@ class DraftSetupView(discord.ui.View):
             return
         await interaction.response.send_modal(ContentEditModal(self.file_id))
 
+    @discord.ui.button(label="📦 整合为ZIP", style=discord.ButtonStyle.secondary, row=2)
+    async def pack_zip(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self._check_owner(interaction):
+            await interaction.response.send_message("只有上传者才能设置。", ephemeral=True)
+            return
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        attachments = record.get("attachments", [])
+        if len(attachments) < 2:
+            await interaction.response.send_message("至少需要 2 个附件才能整合为 ZIP。", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        try:
+            await _pack_attachments_to_zip(interaction, self.file_id, record)
+        except Exception as e:
+            logger.error(f"整合ZIP失败: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ 整合失败: {e}", ephemeral=True)
+
     async def on_timeout(self):
         self.disable_all_items()
         if hasattr(self, "message") and self.message:
@@ -759,6 +782,73 @@ async def _show_draft_setup(interaction: discord.Interaction, file_id: str):
 
     view = DraftSetupView(file_id, interaction.user.id)
     view.message = await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+async def _pack_attachments_to_zip(interaction: discord.Interaction, file_id: str, record: dict):
+    """将所有附件打包为 ZIP 并替换附件列表"""
+    attachments = record["attachments"]
+    guild = interaction.guild
+    guild_id_str = str(record["guild_id"])
+    channel_id = storage_channels.get(guild_id_str)
+    if not channel_id:
+        await interaction.followup.send("❌ 存储频道不存在。", ephemeral=True)
+        return
+
+    channel = guild.get_channel(int(channel_id))
+    if not channel:
+        await interaction.followup.send("❌ 存储频道已删除。", ephemeral=True)
+        return
+
+    # 从存储频道下载所有附件
+    zip_buffer = io.BytesIO()
+    total_zip_size = 0
+    file_map = {}  # custom_name -> bytes
+
+    for att in attachments:
+        try:
+            msg = await channel.fetch_message(int(att["storage_msg_id"]))
+        except discord.NotFound:
+            await interaction.followup.send(f"❌ 附件 {att['custom_name']} 已被删除。", ephemeral=True)
+            return
+
+        if not msg.attachments:
+            await interaction.followup.send(f"❌ 附件 {att['custom_name']} 丢失。", ephemeral=True)
+            return
+
+        data = await msg.attachments[0].read()
+        file_map[att["custom_name"]] = data
+
+    # 创建 ZIP
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+        for name, data in file_map.items():
+            zf.writestr(name, data)
+
+    zip_buffer.seek(0)
+    total_zip_size = zip_buffer.getbuffer().nbytes
+
+    # 上传 ZIP 到存储频道
+    zip_name = f"{record['name']}.zip"
+    discord_file = discord.File(fp=zip_buffer, filename=zip_name)
+    storage_channel = await get_or_create_storage_channel(guild)
+    storage_msg = await storage_channel.send(
+        content=f"📦 {zip_name} | 整合ZIP | 上传者: {interaction.user.display_name}",
+        file=discord_file,
+    )
+
+    # 替换附件列表为单个 ZIP
+    record["attachments"] = [{
+        "original_name": zip_name,
+        "custom_name": zip_name,
+        "storage_msg_id": str(storage_msg.id),
+        "size": total_zip_size,
+    }]
+    record["size"] = total_zip_size
+    save_records()
+
+    await interaction.followup.send(
+        f"✅ 已将 {len(attachments)} 个附件整合为 **{zip_name}** ({_format_size(total_zip_size)})",
+        ephemeral=True,
+    )
 
 
 # ─── 阶段2 辅助 Modal：密码、评论字数、文件名、附件名 ───
