@@ -2040,15 +2040,11 @@ async def setup_report_channels():
 async def setup_guide_channels():
     """在名称包含 GUIDE_CHANNEL_KEYWORD 的频道中发布频道导航"""
     for guild in bot.guilds:
-        # 构建频道导航内容，按分类分组
-        lines = []
+        # 收集所有文字频道，按分类分组
         categories = {}
         no_category = []
 
         for channel in guild.text_channels:
-            # 跳过机器人自己创建的隐藏频道
-            if not channel.permissions_for(guild.default_role).read_messages:
-                continue
             if channel.category:
                 cat_name = channel.category.name
                 if cat_name not in categories:
@@ -2057,30 +2053,36 @@ async def setup_guide_channels():
             else:
                 no_category.append(channel)
 
-        for cat_name, channels in categories.items():
-            lines.append(f"**📁 {cat_name}**")
-            for ch in channels:
-                lines.append(f"　└ {ch.mention}")
-            lines.append("")
-
-        if no_category:
-            lines.append("**📁 未分类**")
-            for ch in no_category:
-                lines.append(f"　└ {ch.mention}")
-
-        if not lines:
-            continue
-
-        guide_embed = discord.Embed(
-            title="🗺️ 小岛指路牌",
-            description="\n".join(lines)[:4096],
-            color=discord.Color.teal(),
-        )
-        guide_embed.set_footer(text="点击频道名即可跳转 | 自动更新")
-
         for channel in guild.text_channels:
             if GUIDE_CHANNEL_KEYWORD not in channel.name:
                 continue
+
+            # 构建导航（排除当前指路频道自身）
+            lines = []
+            for cat_name, chs in categories.items():
+                filtered = [ch for ch in chs if ch.id != channel.id]
+                if not filtered:
+                    continue
+                lines.append(f"**📁 {cat_name}**")
+                for ch in filtered:
+                    lines.append(f"　└ {ch.mention}")
+                lines.append("")
+
+            filtered_no_cat = [ch for ch in no_category if ch.id != channel.id]
+            if filtered_no_cat:
+                lines.append("**📁 未分类**")
+                for ch in filtered_no_cat:
+                    lines.append(f"　└ {ch.mention}")
+
+            if not lines:
+                continue
+
+            guide_embed = discord.Embed(
+                title="🗺️ 小岛指路牌",
+                description="\n".join(lines)[:4096],
+                color=discord.Color.teal(),
+            )
+            guide_embed.set_footer(text="点击频道名即可跳转 | 自动更新")
 
             try:
                 existing_msg_id = guide_channel_messages.get(str(channel.id))
