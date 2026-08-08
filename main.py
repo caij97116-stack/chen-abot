@@ -795,7 +795,12 @@ async def get_file(
 
     for file_id, rec in sorted_files:
         cond_desc = _build_condition_description(rec["conditions"])
-        upload_time = rec.get("upload_time", "未知")[:10]
+        raw_time = rec.get("upload_time", "")
+        try:
+            dt = datetime.fromisoformat(raw_time)
+            upload_time = dt.strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            upload_time = raw_time[:16] if len(raw_time) >= 16 else "未知"
         is_uploader = interaction.user.id == rec["uploader_id"]
 
         # 检查用户已满足的条件
