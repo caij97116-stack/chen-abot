@@ -38,6 +38,8 @@ REPORT_FILE = "report_data.json"
 REPORT_COUNTER_FILE = "report_counter.json"
 REPORT_CHANNEL_KEYWORD = "间谍"          # 举报入口频道关键词
 REPORT_REVIEW_CHANNEL_NAME = "举报审核"   # 审核工单频道名称
+GUIDE_CHANNEL_KEYWORD = "指路"           # 指路频道关键词
+GUIDE_CHANNEL_FILE = "guide_channels.json"
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "storage_msg_id": str, "conditions": { ... } } }
@@ -214,6 +216,25 @@ def save_report_channels():
     except Exception as e:
         logger.error(f"保存举报频道信息失败: {e}")
 
+# ─── 指路系统 ───
+guide_channel_messages: dict = {}  # { "channel_id": "message_id" }
+
+def load_guide_channels():
+    global guide_channel_messages
+    try:
+        if os.path.exists(GUIDE_CHANNEL_FILE):
+            with open(GUIDE_CHANNEL_FILE, "r", encoding="utf-8") as f:
+                guide_channel_messages = json.load(f)
+    except Exception:
+        guide_channel_messages = {}
+
+def save_guide_channels():
+    try:
+        with open(GUIDE_CHANNEL_FILE, "w", encoding="utf-8") as f:
+            json.dump(guide_channel_messages, f)
+    except Exception as e:
+        logger.error(f"保存指路频道信息失败: {e}")
+
 # ─── 答题系统 ───
 QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
 QUIZ_MAX_ERRORS = 2                # 最多允许错几题（超过则失败）
@@ -321,6 +342,7 @@ async def on_ready():
     load_reports()
     load_report_channels()
     load_report_counter()
+    load_guide_channels()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -337,6 +359,9 @@ async def on_ready():
 
     # 在举报频道中发布/更新举报按钮消息
     await setup_report_channels()
+
+    # 在指路频道中发布/更新频道导航
+    await setup_guide_channels()
 
 
 # ═══════════════════════════════════════════
@@ -2010,6 +2035,82 @@ async def setup_report_channels():
                 logger.warning(f"无权限在 #{channel.name} 发送消息")
             except Exception as e:
                 logger.error(f"举报频道 #{channel.name} 设置失败: {e}")
+
+
+async def setup_guide_channels():
+    """在名称包含 GUIDE_CHANNEL_KEYWORD 的频道中发布频道导航"""
+    for guild in bot.guilds:
+        # 构建频道导航内容，按分类分组
+        lines = []
+        categories = {}
+        no_category = []
+
+        for channel in guild.text_channels:
+            # 跳过机器人自己创建的隐藏频道
+            if not channel.permissions_for(guild.default_role).read_messages:
+                continue
+            if channel.category:
+                cat_name = channel.category.name
+                if cat_name not in categories:
+                    categories[cat_name] = []
+                categories[cat_name].append(channel)
+            else:
+                no_category.append(channel)
+
+        for cat_name, channels in categories.items():
+            lines.append(f"**📁 {cat_name}**")
+            for ch in channels:
+                lines.append(f"　└ {ch.mention}")
+            lines.append("")
+
+        if no_category:
+            lines.append("**📁 未分类**")
+            for ch in no_category:
+                lines.append(f"　└ {ch.mention}")
+
+        if not lines:
+            continue
+
+        guide_embed = discord.Embed(
+            title="🗺️ 小岛指路牌",
+            description="\n".join(lines)[:4096],
+            color=discord.Color.teal(),
+        )
+        guide_embed.set_footer(text="点击频道名即可跳转 | 自动更新")
+
+        for channel in guild.text_channels:
+            if GUIDE_CHANNEL_KEYWORD not in channel.name:
+                continue
+
+            try:
+                existing_msg_id = guide_channel_messages.get(str(channel.id))
+                kept = False
+
+                async for old_msg in channel.history(limit=50):
+                    if old_msg.author.id != bot.user.id:
+                        continue
+                    if existing_msg_id and str(old_msg.id) == existing_msg_id:
+                        try:
+                            await old_msg.edit(embed=guide_embed)
+                            kept = True
+                            logger.info(f"更新指路导航: #{channel.name}")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await old_msg.delete()
+                        except Exception:
+                            pass
+
+                if not kept:
+                    msg = await channel.send(embed=guide_embed)
+                    guide_channel_messages[str(channel.id)] = str(msg.id)
+                    save_guide_channels()
+                    logger.info(f"发布指路导航: #{channel.name}")
+            except discord.Forbidden:
+                logger.warning(f"无权限在 #{channel.name} 发送消息")
+            except Exception as e:
+                logger.error(f"指路频道 #{channel.name} 设置失败: {e}")
 
 
 # ═══════════════════════════════════════════
