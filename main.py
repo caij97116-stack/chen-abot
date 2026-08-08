@@ -40,6 +40,7 @@ REPORT_CHANNEL_KEYWORD = "间谍"          # 举报入口频道关键词
 REPORT_REVIEW_CHANNEL_NAME = "举报审核"   # 审核工单频道名称
 GUIDE_CHANNEL_KEYWORD = "指路"           # 指路频道关键词
 GUIDE_CHANNEL_FILE = "guide_channels.json"
+DOWNLOAD_LOGS_FILE = "download_logs.json"
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, ..., "storage_msg_id": str, "conditions": { ... } } }
@@ -235,6 +236,26 @@ def save_guide_channels():
     except Exception as e:
         logger.error(f"保存指路频道信息失败: {e}")
 
+# ─── 下载日志 ───
+# 结构: [{ "file_id": str, "file_name": str, "downloader_id": int, "downloader_name": str, "channel_id": int, "uploader_id": int, "uploader_name": str, "timestamp": "ISO datetime" }]
+download_logs: list = []
+
+def load_download_logs():
+    global download_logs
+    try:
+        if os.path.exists(DOWNLOAD_LOGS_FILE):
+            with open(DOWNLOAD_LOGS_FILE, "r", encoding="utf-8") as f:
+                download_logs = json.load(f)
+    except Exception:
+        download_logs = []
+
+def save_download_logs():
+    try:
+        with open(DOWNLOAD_LOGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(download_logs, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存下载日志失败: {e}")
+
 # ─── 答题系统 ───
 QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
 QUIZ_MAX_ERRORS = 2                # 最多允许错几题（超过则失败）
@@ -343,6 +364,7 @@ async def on_ready():
     load_report_channels()
     load_report_counter()
     load_guide_channels()
+    load_download_logs()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -967,6 +989,19 @@ async def _send_file_to_user(interaction: discord.Interaction, record: dict, 文
             ephemeral=True,
         )
         logger.info(f"文件发送成功: {record['name']}")
+
+        # 记录下载日志
+        download_logs.append({
+            "file_id": 文件id,
+            "file_name": record["name"],
+            "downloader_id": interaction.user.id,
+            "downloader_name": interaction.user.display_name,
+            "channel_id": interaction.channel.id,
+            "uploader_id": record["uploader_id"],
+            "uploader_name": record.get("uploader_name", "未知"),
+            "timestamp": datetime.now().isoformat(),
+        })
+        save_download_logs()
     except Exception as e:
         logger.error(f"获取文件失败: {e}", exc_info=True)
         await interaction.followup.send(
@@ -2196,6 +2231,155 @@ async def cleanup_reports(interaction: discord.Interaction):
         f"工单计数器已重置，下次从 #001 开始",
         ephemeral=True,
     )
+
+
+# ═══════════════════════════════════════════
+#  /查询记录 - 仅岛主可用，查看频道文件下载记录
+# ═══════════════════════════════════════════
+
+@bot.tree.command(name="查询记录", description="查看当前频道所有文件的下载记录（仅岛主可用）")
+async def query_logs(interaction: discord.Interaction):
+    if interaction.user.id != interaction.guild.owner_id:
+        await interaction.response.send_message("只有岛主才能使用此命令。", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    channel_id = interaction.channel.id
+    # 筛选当前频道的下载记录
+    channel_logs = [log for log in download_logs if log.get("channel_id") == channel_id]
+
+    if not channel_logs:
+        await interaction.followup.send("📭 当前频道还没有文件下载记录。", ephemeral=True)
+        return
+
+    # 按文件分组
+    file_groups = {}
+    for log in channel_logs:
+        fid = log.get("file_id", "?")
+        if fid not in file_groups:
+            file_groups[fid] = {
+                "file_name": log.get("file_name", "?"),
+                "uploader_id": log.get("uploader_id", "?"),
+                "uploader_name": log.get("uploader_name", "?"),
+                "downloads": [],
+            }
+        file_groups[fid]["downloads"].append(log)
+
+    # 生成报告文本
+    report_lines = [f"📋 下载记录报告 - <#{channel_id}>", "=" * 40, ""]
+    total_downloads = 0
+
+    for fid, group in file_groups.items():
+        total = len(group["downloads"])
+        total_downloads += total
+        report_lines.append(f"📁 {group['file_name']}")
+        report_lines.append(f"   上传者: {group['uploader_name']} (ID: {group['uploader_id']})")
+        report_lines.append(f"   总下载次数: {total}")
+        report_lines.append("")
+        for dl in group["downloads"]:
+            ts = dl.get("timestamp", "")
+            try:
+                dt = datetime.fromisoformat(ts)
+                time_str = dt.strftime("%Y-%m-%d %H:%M")
+            except Exception:
+                time_str = ts[:16]
+            report_lines.append(f"   └ {time_str} | {dl['downloader_name']} (ID: {dl['downloader_id']})")
+        report_lines.append("")
+
+    report_lines.append("=" * 40)
+    report_lines.append(f"📊 频道总下载: {total_downloads} 次")
+    report_lines.append(f"📁 文件数: {len(file_groups)} 个")
+    report_text = "\n".join(report_lines)
+
+    # 生成报告图片
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+        # 计算图片尺寸
+        line_height = 22
+        max_width = 0
+        img_lines = report_text.split("\n")
+        # 粗略估算宽度
+        for line in img_lines:
+            w = len(line) * 10  # 每个字符约10px宽
+            if w > max_width:
+                max_width = w
+        img_width = max(800, min(max_width + 60, 1200))
+        img_height = len(img_lines) * line_height + 40
+
+        img = Image.new("RGB", (img_width, img_height), color=(30, 30, 30))
+        draw = ImageDraw.Draw(img)
+
+        # 尝试加载中文字体
+        font = None
+        font_paths = [
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+        for fp in font_paths:
+            try:
+                font = ImageFont.truetype(fp, 16)
+                break
+            except Exception:
+                continue
+
+        if font is None:
+            font = ImageFont.load_default()
+
+        y = 10
+        for line in img_lines:
+            draw.text((10, y), line, fill=(220, 220, 220), font=font)
+            y += line_height
+
+        img_bytes = io.BytesIO()
+        img.save(img_bytes, format="PNG")
+        img_bytes.seek(0)
+        img_file = discord.File(fp=img_bytes, filename="download_report.png")
+
+        view = ReportCopyView(report_text)
+        await interaction.followup.send(
+            content=f"📋 **下载记录报告** — <#{channel_id}>\n\n"
+                    f"📊 总下载 {total_downloads} 次 | 📁 {len(file_groups)} 个文件\n\n"
+                    f"下方为报告图片，点击按钮可复制纯文本报告",
+            file=img_file,
+            view=view,
+            ephemeral=True,
+        )
+    except ImportError:
+        # 没有 Pillow，只发送文本报告
+        view = ReportCopyView(report_text)
+        await interaction.followup.send(
+            content=f"📋 **下载记录报告** — <#{channel_id}>\n\n```{report_text[:1900]}```",
+            view=view,
+            ephemeral=True,
+        )
+    except Exception as e:
+        logger.error(f"生成报告图片失败: {e}")
+        view = ReportCopyView(report_text)
+        await interaction.followup.send(
+            content=f"📋 **下载记录报告** — <#{channel_id}>\n\n```{report_text[:1900]}```",
+            view=view,
+            ephemeral=True,
+        )
+
+
+class ReportCopyView(discord.ui.View):
+    """复制报告按钮视图"""
+
+    def __init__(self, report_text: str):
+        super().__init__(timeout=300)
+        self.report_text = report_text
+
+    @discord.ui.button(label="📋 复制报告", style=discord.ButtonStyle.primary)
+    async def copy_report(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # 发送一个可复制的文本消息
+        await interaction.response.send_message(
+            f"```\n{self.report_text[:1900]}\n```",
+            ephemeral=True,
+        )
 
 
 # ═══════════════════════════════════════════
