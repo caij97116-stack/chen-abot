@@ -2040,7 +2040,7 @@ async def setup_report_channels():
 async def setup_guide_channels():
     """在名称包含 GUIDE_CHANNEL_KEYWORD 的频道中发布频道导航"""
     # 排除的频道名称
-    EXCLUDED_NAMES = {"📁-文件存储", "举报审核", "测试频道"}
+    EXCLUDED_NAMES = {"📁-文件存储", "举报审核", "测试"}
 
     for guild in bot.guilds:
         # 收集所有频道（文字、语音、论坛、舞台），按分类分组
