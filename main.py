@@ -1186,10 +1186,12 @@ class PublishedFileView(discord.ui.View):
                 ))
 
         self.select_menu = discord.ui.Select(
-            placeholder=f"选择要下载的文件（共 {len(options)} 项）" if options else "选择文件",
+            placeholder=f"选择要下载的文件（可多选，共 {len(options)} 项）" if options else "选择文件",
             options=options if options else [discord.SelectOption(label="—", value="none")],
             custom_id="pub_file_select",
             row=0,
+            min_values=1,
+            max_values=max(len(options), 1) if options else 1,
         )
         self.select_menu.callback = self.on_select
         self.add_item(self.select_menu)
@@ -1212,10 +1214,10 @@ class PublishedFileView(discord.ui.View):
         self.download_btn.callback = self.on_download
         self.add_item(self.download_btn)
 
-        self.selected_value = "file_0"
+        self.selected_values = ["file_0"]
 
     async def on_select(self, interaction: discord.Interaction):
-        self.selected_value = self.select_menu.values[0]
+        self.selected_values = self.select_menu.values
         await interaction.response.defer()
 
     async def on_password_btn(self, interaction: discord.Interaction):
@@ -1261,14 +1263,20 @@ class PublishedFileView(discord.ui.View):
             )
             return
 
-        # 根据选择发送文件
-        if self.selected_value.startswith("file_"):
-            idx = int(self.selected_value.split("_")[1])
-            attachments = record.get("attachments", [])
-            if idx < len(attachments):
-                await _send_attachment_to_user(interaction, record, idx)
-            else:
-                await interaction.followup.send("❌ 附件索引无效。", ephemeral=True)
+        # 根据选择发送多个文件
+        attachments = record.get("attachments", [])
+        success_count = 0
+        for value in self.selected_values:
+            if value.startswith("file_"):
+                idx = int(value.split("_")[1])
+                if idx < len(attachments):
+                    await _send_attachment_to_user(interaction, record, idx)
+                    success_count += 1
+
+        if success_count > 0:
+            await interaction.followup.send(f"✅ 已发送 {success_count} 个文件", ephemeral=True)
+        else:
+            await interaction.followup.send("❌ 未选择有效文件或发送失败", ephemeral=True)
 
 
 class PublicPasswordModal(discord.ui.Modal, title="输入下载密码"):
@@ -2981,7 +2989,7 @@ async def start_http_server():
 
 
 # ═══════════════════════════════════════════
-#  启动 Bot
+#  启动 Bot（含自动重启）
 # ═══════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -2993,34 +3001,83 @@ if __name__ == "__main__":
     token = token.strip()
     logger.info(f"🔑 Token 长度: {len(token)} 字符，开头: {token[:10]}...")
 
+    _http_started = False
+
     async def shutdown():
         """优雅关闭：清理 HTTP runner 和 bot 连接"""
+        global _http_started
         logger.info("🛑 正在关闭...")
         if _runner:
             await _runner.cleanup()
+            _http_started = False
         if not bot.is_closed():
             await bot.close()
         logger.info("✅ 已关闭")
 
+    async def heartbeat():
+        """定期心跳日志，用于追踪 bot 在线状态"""
+        while True:
+            await asyncio.sleep(3600)  # 每小时一次
+            if bot.is_ready():
+                guild_count = len(bot.guilds)
+                logger.info(f"💓 心跳 — 在线，服务 {guild_count} 个服务器")
+
     async def main():
-        await start_http_server()
+        global _http_started
+        if not _http_started:
+            await start_http_server()
+            _http_started = True
+
         # 注册持久化视图（必须在 bot.start() 之前）
         bot.add_view(PersistentQuizView())
         bot.add_view(PersistentCheckinView())
         bot.add_view(PersistentReportEntryView())
         bot.add_view(PersistentReportReviewView("", 0))
         bot.add_view(PublishedFileView())
+
+        # 启动心跳任务
+        bot.heartbeat_task = asyncio.create_task(heartbeat())
+
         logger.info("🚀 正在启动 Chen-Abot...")
         try:
             await bot.start(token)
         except discord.LoginFailure as e:
             logger.error(f"❌ Token 无效: {e}")
+            return False  # Token 无效，不再重试
         except Exception as e:
-            logger.error(f"❌ 启动失败: {e}")
-        finally:
+            logger.error(f"❌ Bot 异常断开: {e}")
+            return True  # 可重试的错误
+        return True  # 正常退出也允许重试
+
+    async def run_with_retry():
+        """带自动重启的启动循环，Token 无效时退出"""
+        retry_count = 0
+        max_backoff = 300  # 最大退避 5 分钟
+
+        while True:
+            try:
+                should_retry = await main()
+            except Exception as e:
+                logger.error(f"❌ 未捕获的异常: {e}")
+                should_retry = True
+
+            if not should_retry:
+                # Token 无效，不重试
+                break
+
             await shutdown()
 
+            # 指数退避
+            retry_count += 1
+            delay = min(2 ** retry_count, max_backoff)
+            logger.info(f"🔄 {delay} 秒后自动重启（第 {retry_count} 次）...")
+            await asyncio.sleep(delay)
+
     try:
-        asyncio.run(main())
+        asyncio.run(run_with_retry())
     except KeyboardInterrupt:
-        pass
+        logger.info("👋 收到中断信号，退出")
+    finally:
+        # 确保清理
+        if not bot.is_closed():
+            asyncio.run(bot.close())
