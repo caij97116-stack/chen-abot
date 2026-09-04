@@ -4012,10 +4012,52 @@ async def setup_guide_channels():
 
 
 # ═══════════════════════════════════════════
-#  /清理测试数据 - 仅岛主可用，清理所有举报工单
+#  /清理测试数据 - 仅岛主可用，工单、审核频道、黑户地带一并回到初始
 # ═══════════════════════════════════════════
 
-@bot.tree.command(name="清理测试数据", description="删除所有举报工单子频道、清空审核频道、重置计数器（仅岛主可用）")
+async def _wipe_channel_messages(channel) -> int:
+    if channel is None:
+        return 0
+    cleared = 0
+    try:
+        while True:
+            batch = []
+            async for msg in channel.history(limit=100):
+                batch.append(msg)
+            if not batch:
+                break
+            try:
+                await channel.delete_messages(batch)
+                cleared += len(batch)
+                if len(batch) < 100:
+                    break
+                continue
+            except Exception:
+                pass
+            for msg in batch:
+                try:
+                    await msg.delete()
+                    cleared += 1
+                except Exception:
+                    pass
+            if len(batch) < 100:
+                break
+    except Exception as e:
+        logger.warning(f"清空频道 #{getattr(channel, 'name', '?')} 失败: {e}")
+    return cleared
+
+
+def _purge_guild_reports(guild_id: str):
+    gid = str(guild_id)
+    for rid, rec in list(report_data.items()):
+        if rec.get("guild_id") == gid:
+            report_data.pop(rid, None)
+    save_reports()
+    report_counter.pop(gid, None)
+    save_report_counter()
+
+
+@bot.tree.command(name="清理测试数据", description="清空工单、审核频道和黑户地带公示，重置到最初状态（仅岛主）")
 async def cleanup_reports(interaction: discord.Interaction):
     if interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("只有岛主才能使用此命令。", ephemeral=True)
@@ -4023,48 +4065,45 @@ async def cleanup_reports(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
     guild = interaction.guild
+    guild_id = str(guild.id)
     deleted_threads = 0
-    cleared_messages = 0
 
-    # 1. 删除所有举报子频道
-    for rid, rec in list(report_data.items()):
-        if rec.get("guild_id") != str(guild.id):
+    for rec in list(report_data.values()):
+        if rec.get("guild_id") != guild_id:
             continue
         thread_id = rec.get("thread_id")
-        if thread_id:
-            thread = guild.get_thread(int(thread_id))
-            if thread:
-                try:
-                    await thread.delete()
-                    deleted_threads += 1
-                except Exception as e:
-                    logger.warning(f"删除子频道失败: {e}")
-
-    # 2. 清空审核频道消息
-    for channel in guild.text_channels:
-        if channel.name == REPORT_REVIEW_CHANNEL_NAME:
+        if not thread_id:
+            continue
+        thread = guild.get_thread(int(thread_id))
+        if thread is None:
             try:
-                async for msg in channel.history(limit=100):
-                    if msg.author.id == bot.user.id:
-                        try:
-                            await msg.delete()
-                            cleared_messages += 1
-                        except Exception:
-                            pass
+                thread = await guild.fetch_channel(int(thread_id))
+            except Exception:
+                thread = None
+        if thread:
+            try:
+                await thread.delete()
+                deleted_threads += 1
             except Exception as e:
-                logger.warning(f"清空审核频道失败: {e}")
+                logger.warning(f"删除子频道失败: {e}")
 
-    # 3. 重置数据
-    report_data.clear()
-    save_reports()
-    report_counter.pop(str(guild.id), None)
-    save_report_counter()
+    review_channel = discord.utils.get(guild.text_channels, name=REPORT_REVIEW_CHANNEL_NAME)
+    blacklist_channel = None
+    for channel in guild.text_channels:
+        if BLACKLIST_CHANNEL_KEYWORD in channel.name:
+            blacklist_channel = channel
+            break
+
+    cleared_review = await _wipe_channel_messages(review_channel)
+    cleared_blacklist = await _wipe_channel_messages(blacklist_channel)
+    _purge_guild_reports(guild_id)
 
     await interaction.followup.send(
-        f"✅ 清理完成！\n"
-        f"已删除 {deleted_threads} 个举报子频道\n"
-        f"已清空审核频道 {cleared_messages} 条消息\n"
-        f"工单计数器已重置，下次从 #001 开始",
+        f"清理完成，工单已回到最初状态。\n"
+        f"已关闭举报子区 {deleted_threads} 个\n"
+        f"审核频道已清空 {cleared_review} 条\n"
+        f"黑户地带公示已清空 {cleared_blacklist} 条\n"
+        f"工单计数从 #001 重新开始",
         ephemeral=True,
     )
 
