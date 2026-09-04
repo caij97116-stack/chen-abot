@@ -3,8 +3,10 @@ import io
 import json
 import random
 import secrets
+import struct
 import asyncio
 import zipfile
+import zlib
 import discord
 from discord.ext import commands
 from discord import app_commands
@@ -133,14 +135,22 @@ async def get_or_create_storage_channel(guild: discord.Guild) -> discord.TextCha
         raise
 
 
-def _new_resource_code() -> str:
-    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
-    existing = {rec.get("resource_code") for rec in file_records.values()}
+_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+_PNG_TEXT_KEY = "Comment"
+
+
+def _new_code(prefix: str, existing: set) -> str:
     for _ in range(32):
-        code = "R-" + "".join(secrets.choice(alphabet) for _ in range(8))
+        code = prefix + "".join(secrets.choice(_CODE_ALPHABET) for _ in range(8))
         if code not in existing:
             return code
-    return "R-" + secrets.token_hex(4).upper()
+    return prefix + secrets.token_hex(4).upper()
+
+
+def _new_resource_code() -> str:
+    existing = {rec.get("resource_code") for rec in file_records.values()}
+    return _new_code("R-", existing)
 
 
 def _ensure_resource_code(record: dict) -> str:
@@ -150,6 +160,135 @@ def _ensure_resource_code(record: dict) -> str:
     code = _new_resource_code()
     record["resource_code"] = code
     return code
+
+
+def _all_downloader_codes() -> set:
+    codes = set()
+    for rec in file_records.values():
+        for code in (rec.get("downloader_codes") or {}).values():
+            if code:
+                codes.add(code)
+    for log in download_logs:
+        code = log.get("downloader_code")
+        if code:
+            codes.add(code)
+    return codes
+
+
+def _new_downloader_code() -> str:
+    return _new_code("D-", _all_downloader_codes())
+
+
+def _record_id_of(record: dict):
+    for fid, rec in file_records.items():
+        if rec is record:
+            return fid
+    return None
+
+
+def _get_or_create_downloader_code(record: dict, user_id) -> str:
+    mapping = record.setdefault("downloader_codes", {})
+    key = str(user_id)
+    if mapping.get(key):
+        return mapping[key]
+    code = _new_downloader_code()
+    mapping[key] = code
+    save_records()
+    return code
+
+
+def _png_chunk(chunk_type: bytes, data: bytes) -> bytes:
+    return struct.pack(">I", len(data)) + chunk_type + data + struct.pack(">I", zlib.crc32(chunk_type + data) & 0xFFFFFFFF)
+
+
+def _iter_png_chunks(data: bytes):
+    pos = 8
+    while pos + 8 <= len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        chunk_type = data[pos + 4:pos + 8]
+        start = pos
+        pos += 12 + length
+        if pos > len(data):
+            break
+        yield start, chunk_type, data[start + 8:start + 8 + length]
+
+
+def _embed_png_text(data: bytes, keyword: str, value: str) -> bytes:
+    if not data.startswith(_PNG_SIGNATURE):
+        return data
+    payload = keyword.encode("latin-1") + b"\x00" + value.encode("latin-1", "replace")
+    text_chunk = _png_chunk(b"tEXt", payload)
+    pieces = [data[:8]]
+    inserted = False
+    for start, chunk_type, chunk_data in _iter_png_chunks(data):
+        if chunk_type == b"tEXt" and chunk_data.startswith(keyword.encode("latin-1") + b"\x00"):
+            continue
+        if chunk_type == b"IEND" and not inserted:
+            pieces.append(text_chunk)
+            inserted = True
+        length = struct.unpack(">I", data[start:start + 4])[0]
+        pieces.append(data[start:start + 12 + length])
+    if not inserted:
+        pieces.append(text_chunk)
+    return b"".join(pieces)
+
+
+def _read_png_text(data: bytes, keyword: str = _PNG_TEXT_KEY):
+    if not data.startswith(_PNG_SIGNATURE):
+        return None
+    prefix = keyword.encode("latin-1") + b"\x00"
+    for _, chunk_type, chunk_data in _iter_png_chunks(data):
+        if chunk_type == b"tEXt" and chunk_data.startswith(prefix):
+            try:
+                return chunk_data[len(prefix):].decode("latin-1")
+            except Exception:
+                return None
+    return None
+
+
+def _embed_zip_comment(data: bytes, comment: str) -> bytes:
+    if len(data) < 22 or data[:2] != b"PK":
+        return data
+    comment_bytes = comment.encode("utf-8")
+    eocd = data.rfind(b"PK\x05\x06")
+    if eocd < 0 or eocd + 22 > len(data):
+        return data
+    old_len = struct.unpack("<H", data[eocd + 20:eocd + 22])[0]
+    body = data[:eocd + 20]
+    return body + struct.pack("<H", len(comment_bytes)) + comment_bytes
+
+
+def _read_zip_comment(data: bytes):
+    if len(data) < 22 or data[:2] != b"PK":
+        return None
+    eocd = data.rfind(b"PK\x05\x06")
+    if eocd < 0 or eocd + 22 > len(data):
+        return None
+    comment_len = struct.unpack("<H", data[eocd + 20:eocd + 22])[0]
+    raw = data[eocd + 22:eocd + 22 + comment_len]
+    if not raw:
+        return None
+    try:
+        return raw.decode("utf-8")
+    except Exception:
+        return raw.decode("latin-1", "ignore")
+
+
+def _embed_downloader_code(file_bytes: bytes, filename: str, code: str) -> bytes:
+    name = (filename or "").lower()
+    if name.endswith(".png") or file_bytes.startswith(_PNG_SIGNATURE):
+        return _embed_png_text(file_bytes, _PNG_TEXT_KEY, code)
+    if name.endswith(".zip") or file_bytes[:2] == b"PK":
+        return _embed_zip_comment(file_bytes, code)
+    return file_bytes
+
+
+def _extract_downloader_code_from_bytes(file_bytes: bytes):
+    if file_bytes.startswith(_PNG_SIGNATURE):
+        return _read_png_text(file_bytes)
+    if file_bytes[:2] == b"PK":
+        return _read_zip_comment(file_bytes)
+    return None
 
 
 def _format_beijing_minute(raw) -> str:
@@ -258,10 +397,11 @@ def _build_resource_trace_embed(file_id: str, record: dict) -> discord.Embed:
     if logs:
         lines = []
         for log in logs:
+            dcode = log.get("downloader_code") or "—"
             lines.append(
                 f"{_format_beijing_minute(log.get('timestamp'))} "
                 f"<@{log.get('downloader_id', 0)}> `{log.get('downloader_id', '?')}` "
-                f"{log.get('file_label') or log.get('file_name') or '?'}"
+                f"`{dcode}` {log.get('file_label') or log.get('file_name') or '?'}"
             )
         log_text = "\n".join(lines)
     else:
@@ -1754,34 +1894,35 @@ async def _send_attachment_to_user(interaction: discord.Interaction, record: dic
 
         attachment = msg.attachments[0]
         file_bytes = await attachment.read()
+        downloader_code = _get_or_create_downloader_code(record, interaction.user.id)
+        marked = _embed_downloader_code(file_bytes, att.get("custom_name") or attachment.filename, downloader_code)
 
         discord_file = discord.File(
-            fp=io.BytesIO(file_bytes),
+            fp=io.BytesIO(marked),
             filename=att["custom_name"],
         )
         await interaction.followup.send(
-            content=f"📁 **{att['custom_name']}**\n上传者: <@{record['uploader_id']}>",
+            content=f"**{att['custom_name']}**\n上传者: <@{record['uploader_id']}>",
             file=discord_file,
             ephemeral=True,
         )
 
-        _log_download(interaction, record, att["custom_name"])
+        _log_download(interaction, record, att["custom_name"], downloader_code)
 
     except Exception as e:
         logger.error(f"发送附件失败: {e}", exc_info=True)
         await interaction.followup.send(f"❌ 获取文件时出错: {e}", ephemeral=True)
 
 
-def _log_download(interaction: discord.Interaction, record: dict, file_label: str):
-    record_id = None
-    for fid, rec in file_records.items():
-        if rec is record:
-            record_id = fid
-            break
+def _log_download(interaction: discord.Interaction, record: dict, file_label: str, downloader_code: str = ""):
+    record_id = _record_id_of(record)
+    if not downloader_code:
+        downloader_code = _get_or_create_downloader_code(record, interaction.user.id)
     download_logs.append({
         "file_id": record.get("published_msg_id", "?"),
         "record_id": record_id,
         "resource_code": record.get("resource_code"),
+        "downloader_code": downloader_code,
         "file_name": record.get("name", "?"),
         "file_label": file_label,
         "downloader_id": interaction.user.id,
@@ -1823,6 +1964,149 @@ async def get_file(interaction: discord.Interaction):
         return
     embed, view = _build_published_card(record, file_id, persistent=False)
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+
+def _find_record_by_resource_code(code: str):
+    needle = (code or "").strip().upper()
+    if not needle:
+        return None, None
+    for fid, rec in file_records.items():
+        if str(rec.get("resource_code") or "").upper() == needle:
+            return fid, rec
+    return None, None
+
+
+def _find_logs_by_downloader_code(code: str) -> list:
+    needle = (code or "").strip().upper()
+    if not needle:
+        return []
+    return [log for log in download_logs if str(log.get("downloader_code") or "").upper() == needle]
+
+
+def _find_logs_by_user_id(user_id: str) -> list:
+    needle = str(user_id or "").strip().replace("<@", "").replace(">", "")
+    if not needle:
+        return []
+    return [log for log in download_logs if str(log.get("downloader_id") or "") == needle]
+
+
+def _build_downloader_trace_embed(code: str, logs: list) -> discord.Embed:
+    if logs:
+        lines = []
+        for log in logs[-20:]:
+            lines.append(
+                f"{_format_beijing_minute(log.get('timestamp'))} "
+                f"<@{log.get('downloader_id', 0)}> `{log.get('downloader_id', '?')}` "
+                f"{log.get('file_name') or '?'} / {log.get('file_label') or '?'}"
+            )
+        body = "\n".join(lines)
+    else:
+        body = "暂无领取记录"
+    return discord.Embed(
+        title="下载人回溯",
+        description=f"**下载人码:** `{code}`\n\n**领取记录**\n{body}"[:4000],
+        color=discord.Color.orange(),
+    )
+
+
+def _build_user_trace_embed(user_id: str, logs: list) -> discord.Embed:
+    if logs:
+        lines = []
+        for log in logs[-20:]:
+            lines.append(
+                f"{_format_beijing_minute(log.get('timestamp'))} "
+                f"`{log.get('downloader_code') or '—'}` "
+                f"{log.get('file_name') or '?'} / {log.get('file_label') or '?'}"
+            )
+        body = "\n".join(lines)
+    else:
+        body = "暂无领取记录"
+    return discord.Embed(
+        title="用户回溯",
+        description=f"**用户:** <@{user_id}> `{user_id}`\n\n**领取记录**\n{body}"[:4000],
+        color=discord.Color.orange(),
+    )
+
+
+@bot.tree.command(name="回溯", description="按资源码、下载人码、用户ID或流出文件回溯（仅岛主）")
+@app_commands.describe(
+    查询="资源回溯码、下载人码或用户ID",
+    流出文件="把流出的 PNG/ZIP 丢进来抠下载人码",
+)
+async def trace_resource(
+    interaction: discord.Interaction,
+    查询: Optional[str] = None,
+    流出文件: Optional[discord.Attachment] = None,
+):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("仅岛主可回溯。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    query = (查询 or "").strip()
+    if 流出文件:
+        try:
+            file_bytes = await 流出文件.read()
+        except Exception as e:
+            await interaction.followup.send(f"读取流出文件失败: {e}", ephemeral=True)
+            return
+        extracted = _extract_downloader_code_from_bytes(file_bytes)
+        if not extracted:
+            await interaction.followup.send("这份文件里没有抠到下载人码。", ephemeral=True)
+            return
+        logs = _find_logs_by_downloader_code(extracted)
+        await interaction.followup.send(
+            content=f"从文件抠到下载人码 `{extracted}`",
+            embed=_build_downloader_trace_embed(extracted, logs),
+            ephemeral=True,
+        )
+        return
+    if not query:
+        await interaction.followup.send(
+            "请填写资源回溯码、下载人码、用户ID，或附上流出文件。",
+            ephemeral=True,
+        )
+        return
+    upper = query.upper()
+    if upper.startswith("R-"):
+        file_id, record = _find_record_by_resource_code(upper)
+        if not record:
+            await interaction.followup.send("找不到这个资源回溯码。", ephemeral=True)
+            return
+        await interaction.followup.send(
+            embed=_build_resource_trace_embed(file_id, record),
+            ephemeral=True,
+        )
+        return
+    if upper.startswith("D-"):
+        logs = _find_logs_by_downloader_code(upper)
+        await interaction.followup.send(
+            embed=_build_downloader_trace_embed(upper, logs),
+            ephemeral=True,
+        )
+        return
+    digits = query.replace("<@", "").replace(">", "").strip()
+    if digits.isdigit():
+        logs = _find_logs_by_user_id(digits)
+        await interaction.followup.send(
+            embed=_build_user_trace_embed(digits, logs),
+            ephemeral=True,
+        )
+        return
+    file_id, record = _find_record_by_resource_code(upper)
+    if record:
+        await interaction.followup.send(
+            embed=_build_resource_trace_embed(file_id, record),
+            ephemeral=True,
+        )
+        return
+    logs = _find_logs_by_downloader_code(upper)
+    if logs:
+        await interaction.followup.send(
+            embed=_build_downloader_trace_embed(upper, logs),
+            ephemeral=True,
+        )
+        return
+    await interaction.followup.send("没有匹配到资源码、下载人码或用户ID。", ephemeral=True)
 
 
 async def _check_user_liked_first(interaction: discord.Interaction) -> bool:
