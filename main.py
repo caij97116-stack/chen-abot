@@ -767,36 +767,24 @@ async def ping(interaction: discord.Interaction):
 # ═══════════════════════════════════════════
 
 class BackToTopView(discord.ui.View):
-    """仅命令使用者自己可见的跳转按钮（link 按钮，不需要 bot 处理点击事件）"""
-
     def __init__(self, jump_url: str):
         super().__init__(timeout=None)
         self.add_item(discord.ui.Button(
-            label="🔝 回到主楼",
+            label="回到首楼",
             style=discord.ButtonStyle.link,
             url=jump_url,
         ))
 
 
-@bot.tree.command(name="回顶", description="回到主楼（第1楼）")
+@bot.tree.command(name="回顶", description="生成只有自己能看到的回到首楼按钮")
 async def back_to_top(interaction: discord.Interaction):
-    """生成一个只有使用者自己能看到的按钮，点击后跳转到该频道第一条消息"""
     async for first_msg in interaction.channel.history(oldest_first=True, limit=1):
-        embed = discord.Embed(
-            title="🔝 回顶",
-            description="点击下方按钮跳转到主楼（第1楼），信息刷太多找不到首楼时用这个～",
-            color=discord.Color.blue(),
+        await interaction.response.send_message(
+            content="\u200b",
+            view=BackToTopView(first_msg.jump_url),
+            ephemeral=True,
         )
-        embed.add_field(name="楼主", value=first_msg.author.mention, inline=True)
-        embed.add_field(
-            name="发布时间",
-            value=discord.utils.format_dt(first_msg.created_at, "R"),
-            inline=True,
-        )
-        view = BackToTopView(first_msg.jump_url)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
         return
-
     await interaction.response.send_message("该频道还没有任何消息。", ephemeral=True)
 
 
