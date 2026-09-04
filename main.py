@@ -14,6 +14,7 @@ from aiohttp import web
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
+from collections import defaultdict, deque
 
 # 配置日志
 logging.basicConfig(
@@ -49,6 +50,21 @@ GUIDE_CHANNEL_KEYWORD = "指路"           # 指路频道关键词
 GUIDE_CHANNEL_FILE = "guide_channels.json"
 DOWNLOAD_LOGS_FILE = "download_logs.json"
 PUBLISHED_FILE = "channel_published.json"
+ALERT_CHANNEL_KEYWORD = "异常提醒"
+ALERT_CHANNEL_NAME = "异常提醒"
+ALERT_DOWNLOAD_WINDOW_SEC = 60
+ALERT_DOWNLOAD_COUNT = 5
+ALERT_SPAM_WINDOW_SEC = 12
+ALERT_SPAM_COUNT = 6
+ALERT_COOLDOWN_SEC = 180
+AD_KEYWORDS = (
+    "免费代充", "代充", "出号", "收号", "卖号", "倒卖", "代肝",
+    "加v", "加微", "加vx", "微信", "qq群", "QQ群", "淘宝", "咸鱼",
+    "闲鱼", "转卖", "代打", "优惠券",
+)
+_alert_download_times: dict = defaultdict(deque)
+_alert_message_times: dict = defaultdict(deque)
+_alert_last_sent: dict = {}
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, "status": "draft|published", "description": str,
@@ -309,6 +325,168 @@ def _format_beijing_minute(raw) -> str:
 def _is_island_owner(interaction: discord.Interaction) -> bool:
     guild = interaction.guild
     return bool(guild and interaction.user.id == guild.owner_id)
+
+
+def _find_alert_channel(guild: discord.Guild):
+    if not guild:
+        return None
+    for channel in guild.text_channels:
+        if ALERT_CHANNEL_KEYWORD in channel.name:
+            return channel
+    return None
+
+
+async def _place_alert_channel(channel: discord.TextChannel):
+    try:
+        if channel.position != 1:
+            await channel.edit(position=1)
+    except Exception as e:
+        logger.warning(f"调整异常提醒频道位置失败: {e}")
+
+
+async def _ensure_alert_channel_access(channel: discord.TextChannel):
+    guild = channel.guild
+    try:
+        overwrites = channel.overwrites
+        overwrites[guild.default_role] = discord.PermissionOverwrite(read_messages=False)
+        overwrites[guild.me] = discord.PermissionOverwrite(
+            read_messages=True,
+            send_messages=True,
+            read_message_history=True,
+            manage_messages=True,
+        )
+        if guild.owner:
+            overwrites[guild.owner] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
+        await channel.edit(overwrites=overwrites)
+    except Exception as e:
+        logger.warning(f"调整异常提醒频道权限失败: {e}")
+
+
+async def setup_alert_channel():
+    for guild in bot.guilds:
+        channel = _find_alert_channel(guild)
+        if not channel:
+            logger.warning(f"{guild.name} 没有「异常提醒」频道，跳过")
+            continue
+        await _ensure_alert_channel_access(channel)
+        await _place_alert_channel(channel)
+        try:
+            pins = await channel.pins()
+            if not any(m.author.id == bot.user.id for m in pins):
+                msg = await channel.send("异常提醒频道已就绪。连下、刷屏、广告会分开提醒。仅岛主可见。")
+                await msg.pin()
+        except Exception as e:
+            logger.warning(f"置顶异常提醒说明失败: {e}")
+
+
+def _alert_cooldown_ok(kind: str, guild_id, user_id) -> bool:
+    key = (kind, str(guild_id), str(user_id))
+    now = datetime.now(timezone.utc).timestamp()
+    last = _alert_last_sent.get(key, 0)
+    if now - last < ALERT_COOLDOWN_SEC:
+        return False
+    _alert_last_sent[key] = now
+    return True
+
+
+async def _send_alert(guild: discord.Guild, kind: str, title: str, description: str, color: discord.Color):
+    channel = _find_alert_channel(guild)
+    if not channel:
+        return
+    embed = discord.Embed(
+        title=title,
+        description=description[:4000],
+        color=color,
+        timestamp=_beijing_now(),
+    )
+    embed.set_footer(text=kind)
+    try:
+        await channel.send(embed=embed)
+    except Exception as e:
+        logger.warning(f"发送异常提醒失败: {e}")
+
+
+async def _maybe_alert_download(interaction: discord.Interaction, record: dict, file_label: str):
+    if not interaction.guild:
+        return
+    if interaction.user.id == interaction.guild.owner_id:
+        return
+    now = datetime.now(timezone.utc).timestamp()
+    key = (str(interaction.guild.id), str(interaction.user.id))
+    bucket = _alert_download_times[key]
+    bucket.append(now)
+    while bucket and now - bucket[0] > ALERT_DOWNLOAD_WINDOW_SEC:
+        bucket.popleft()
+    if len(bucket) < ALERT_DOWNLOAD_COUNT:
+        return
+    if not _alert_cooldown_ok("异常下载", interaction.guild.id, interaction.user.id):
+        return
+    await _send_alert(
+        interaction.guild,
+        "异常下载",
+        "异常下载",
+        (
+            f"**用户:** {interaction.user.mention} `{interaction.user.id}`\n"
+            f"**资源:** {record.get('name', '?')}\n"
+            f"**文件:** {file_label}\n"
+            f"**位置:** {interaction.channel.mention}\n"
+            f"**原因:** {ALERT_DOWNLOAD_WINDOW_SEC} 秒内领取 {len(bucket)} 次"
+        ),
+        discord.Color.orange(),
+    )
+
+
+def _looks_like_ad(text: str) -> bool:
+    lowered = (text or "").lower()
+    for word in AD_KEYWORDS:
+        if word.lower() in lowered:
+            return True
+    if "http://" in lowered or "https://" in lowered:
+        if any(x in lowered for x in ("淘宝", "闲鱼", "咸鱼", "微信", "qq", "代充", "出号")):
+            return True
+    return False
+
+
+async def _maybe_alert_message(message: discord.Message):
+    if not message.guild or message.author.bot:
+        return
+    if message.author.id == message.guild.owner_id:
+        return
+    alert_channel = _find_alert_channel(message.guild)
+    if alert_channel and message.channel.id == alert_channel.id:
+        return
+    now = datetime.now(timezone.utc).timestamp()
+    key = (str(message.guild.id), str(message.author.id))
+    bucket = _alert_message_times[key]
+    bucket.append(now)
+    while bucket and now - bucket[0] > ALERT_SPAM_WINDOW_SEC:
+        bucket.popleft()
+    if len(bucket) >= ALERT_SPAM_COUNT and _alert_cooldown_ok("刷屏", message.guild.id, message.author.id):
+        await _send_alert(
+            message.guild,
+            "刷屏",
+            "刷屏",
+            (
+                f"**用户:** {message.author.mention} `{message.author.id}`\n"
+                f"**位置:** {message.channel.mention}\n"
+                f"**原因:** {ALERT_SPAM_WINDOW_SEC} 秒内发了 {len(bucket)} 条消息\n"
+                f"**最近内容:** {(message.content or '')[:200] or '（无文字）'}"
+            ),
+            discord.Color.gold(),
+        )
+    if _looks_like_ad(message.content) and _alert_cooldown_ok("广告", message.guild.id, message.author.id):
+        await _send_alert(
+            message.guild,
+            "广告",
+            "广告",
+            (
+                f"**用户:** {message.author.mention} `{message.author.id}`\n"
+                f"**位置:** {message.channel.mention}\n"
+                f"**原因:** 消息疑似广告/买卖\n"
+                f"**内容:** {(message.content or '')[:500]}"
+            ),
+            discord.Color.red(),
+        )
 
 
 def _find_record_by_storage_card(message_id) -> tuple:
@@ -822,6 +1000,8 @@ async def on_ready():
 
     # 在指路频道中发布/更新频道导航
     await setup_guide_channels()
+
+    await setup_alert_channel()
 
 
 # ═══════════════════════════════════════════
@@ -1908,6 +2088,7 @@ async def _send_attachment_to_user(interaction: discord.Interaction, record: dic
         )
 
         _log_download(interaction, record, att["custom_name"], downloader_code)
+        await _maybe_alert_download(interaction, record, att["custom_name"])
 
     except Exception as e:
         logger.error(f"发送附件失败: {e}", exc_info=True)
@@ -2585,6 +2766,8 @@ async def on_message(message: discord.Message):
                     await message.add_reaction("📥")
                 except Exception:
                     pass
+
+    await _maybe_alert_message(message)
 
     # 检查消息中是否包含 FAQ 关键词
     content = message.content.strip().lower()
