@@ -149,7 +149,8 @@ def save_faq():
         logger.error(f"保存 FAQ 失败: {e}")
 
 # ─── 签到系统 ───
-# 积分: { "guild_id": { "user_id": {"points": int, "last_checkin": "YYYY-MM-DD"} } }
+# 积分: { "guild_id": { "user_id": {"points": int, "last_checkin": "YYYY-MM-DD",
+#          "total_days": int, "streak": int, "max_streak": int} } }
 points_data: dict = {}
 # 签到频道消息: { "channel_id": "message_id" }
 checkin_channel_messages: dict = {}
@@ -186,6 +187,56 @@ def save_checkin_channels():
             json.dump(checkin_channel_messages, f)
     except Exception as e:
         logger.error(f"保存签到频道信息失败: {e}")
+
+
+def _checkin_today() -> str:
+    return datetime.now().strftime("%Y-%m-%d")
+
+
+def _empty_checkin_record() -> dict:
+    return {
+        "points": 0,
+        "last_checkin": "",
+        "total_days": 0,
+        "streak": 0,
+        "max_streak": 0,
+    }
+
+
+def _normalize_checkin_record(user_data: dict) -> dict:
+    data = _empty_checkin_record()
+    data.update(user_data or {})
+    data["points"] = int(data.get("points") or 0)
+    data["last_checkin"] = str(data.get("last_checkin") or "")
+    data["total_days"] = int(data.get("total_days") or 0)
+    data["streak"] = int(data.get("streak") or 0)
+    data["max_streak"] = int(data.get("max_streak") or 0)
+    if data["total_days"] == 0 and data["last_checkin"]:
+        data["total_days"] = 1
+    if data["streak"] == 0 and data["last_checkin"]:
+        data["streak"] = 1
+    if data["max_streak"] < data["streak"]:
+        data["max_streak"] = data["streak"]
+    return data
+
+
+def _get_checkin_record(guild_id: str, user_id: str) -> dict:
+    guild_data = points_data.setdefault(guild_id, {})
+    record = _normalize_checkin_record(guild_data.get(user_id, {}))
+    guild_data[user_id] = record
+    return record
+
+
+def _live_streak(user_data: dict) -> int:
+    last = user_data.get("last_checkin") or ""
+    if not last:
+        return 0
+    today = _checkin_today()
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if last in (today, yesterday):
+        return int(user_data.get("streak") or 0)
+    return 0
+
 
 # ─── 举报系统 ───
 # 结构: { "report_id": { "guild_id": str, "thread_id": str, "parent_channel_id": str, "reporter_id": str, "reporter_name": str, "target_id": str, "target_name": str, "reason": str, "anonymous": bool, "status": "pending|reviewing|completed", "review_message_id": str, "created_at": str } }
@@ -2081,13 +2132,32 @@ class PersistentCheckinView(discord.ui.View):
     async def checkin_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _do_checkin(interaction)
 
+    @discord.ui.button(
+        label="查看积分",
+        style=discord.ButtonStyle.primary,
+        emoji="💰",
+        custom_id="persistent_checkin_points",
+    )
+    async def points_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_points_query(interaction)
+
+    @discord.ui.button(
+        label="签到天数",
+        style=discord.ButtonStyle.secondary,
+        emoji="📅",
+        custom_id="persistent_checkin_days",
+    )
+    async def days_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_checkin_days_query(interaction)
+
 
 async def setup_checkin_channels():
     """在名称包含 CHECKIN_CHANNEL_KEYWORD 的频道中发布签到按钮消息"""
     checkin_embed = discord.Embed(
         title="🏝️ 小岛每日签到",
         description="每天签到可获得 **1~20 随机积分**！\n\n"
-                    "点击下方按钮签到，或使用 `/签到` 命令。",
+                    "点「查看积分」看当前分数，点「签到天数」看连续和累计天数。\n"
+                    "也可以使用 `/签到`、`/积分`、`/签到天数`。",
         color=discord.Color.green(),
     )
     checkin_embed.set_footer(text="每天只能签到一次，UTC+8 零点刷新")
@@ -2132,23 +2202,26 @@ async def _do_checkin(interaction: discord.Interaction):
     """签到核心逻辑，供按钮和 /签到 命令共用"""
     guild_id = str(interaction.guild.id)
     user_id = str(interaction.user.id)
-    today = datetime.now().strftime("%Y-%m-%d")
+    today = _checkin_today()
+    user_data = _get_checkin_record(guild_id, user_id)
 
-    # 初始化 guild 数据
-    if guild_id not in points_data:
-        points_data[guild_id] = {}
-
-    user_data = points_data[guild_id].get(user_id, {"points": 0, "last_checkin": ""})
-
-    # 检查今天是否已签到
     if user_data.get("last_checkin") == today:
         await interaction.response.send_message(
-            f"⏳ 你今天已经签到过了！当前积分: **{user_data['points']}**\n明天再来吧～",
+            f"你今天已经签到过了。当前积分: **{user_data['points']}**\n"
+            f"连续签到 **{_live_streak(user_data)}** 天，累计 **{user_data['total_days']}** 天。\n明天再来吧。",
             ephemeral=True,
         )
         return
 
-    # 随机积分
+    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    if user_data.get("last_checkin") == yesterday:
+        user_data["streak"] = user_data.get("streak", 0) + 1
+    else:
+        user_data["streak"] = 1
+    user_data["total_days"] = user_data.get("total_days", 0) + 1
+    if user_data["streak"] > user_data.get("max_streak", 0):
+        user_data["max_streak"] = user_data["streak"]
+
     earned = random.randint(1, 20)
     user_data["points"] = user_data.get("points", 0) + earned
     user_data["last_checkin"] = today
@@ -2156,12 +2229,13 @@ async def _do_checkin(interaction: discord.Interaction):
     save_points()
 
     await interaction.response.send_message(
-        f"✅ 签到成功！获得 **{earned}** 积分 🎉\n"
-        f"当前总积分: **{user_data['points']}**",
+        f"签到成功！获得 **{earned}** 积分\n"
+        f"当前总积分: **{user_data['points']}**\n"
+        f"连续签到: **{user_data['streak']}** 天\n"
+        f"累计签到: **{user_data['total_days']}** 天",
         ephemeral=True,
     )
 
-    # 30秒后自动删除签到消息
     async def _auto_delete_checkin():
         await asyncio.sleep(30)
         try:
@@ -2171,9 +2245,53 @@ async def _do_checkin(interaction: discord.Interaction):
     asyncio.create_task(_auto_delete_checkin())
 
 
+async def _do_points_query(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    user_id = str(interaction.user.id)
+    user_data = _get_checkin_record(guild_id, user_id)
+    last = user_data.get("last_checkin") or "尚未签到"
+    embed = discord.Embed(
+        title="我的积分",
+        description=(
+            f"当前积分：**{user_data['points']}**\n"
+            f"最近一次签到：{last}"
+        ),
+        color=discord.Color.gold(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+async def _do_checkin_days_query(interaction: discord.Interaction):
+    guild_id = str(interaction.guild.id)
+    user_id = str(interaction.user.id)
+    user_data = _get_checkin_record(guild_id, user_id)
+    last = user_data.get("last_checkin") or "尚未签到"
+    embed = discord.Embed(
+        title="签到天数",
+        description=(
+            f"连续签到：**{_live_streak(user_data)}** 天\n"
+            f"累计签到：**{user_data['total_days']}** 天（断签也计入）\n"
+            f"最长连续：**{user_data['max_streak']}** 天\n"
+            f"最近一次签到：{last}"
+        ),
+        color=discord.Color.green(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
 @bot.tree.command(name="签到", description="每日签到领取随机积分（1~20）")
 async def checkin_command(interaction: discord.Interaction):
     await _do_checkin(interaction)
+
+
+@bot.tree.command(name="积分", description="查看自己的当前积分")
+async def points_command(interaction: discord.Interaction):
+    await _do_points_query(interaction)
+
+
+@bot.tree.command(name="签到天数", description="查看连续签到和累计签到天数")
+async def checkin_days_command(interaction: discord.Interaction):
+    await _do_checkin_days_query(interaction)
 
 
 # ═══════════════════════════════════════════
