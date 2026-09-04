@@ -744,28 +744,39 @@ async def _ingest_uploaded_files(
             await interaction.followup.send(f"上传 {att.filename} 失败: {e}", ephemeral=True)
             return
 
+    existing_id, existing = _find_channel_file_bundle(
+        interaction.channel.id, interaction.user.id
+    )
+    if existing_id and existing:
+        existing.setdefault("attachments", []).extend(attachment_records)
+        existing["size"] = int(existing.get("size") or 0) + total_size
+        if title:
+            existing["name"] = title
+        if description:
+            existing["description"] = description
+        if password:
+            existing.setdefault("conditions", {})["password"] = password
+        existing["uploader_name"] = interaction.user.display_name
+        save_records()
+        if existing.get("status") == "published":
+            await _refresh_published_card(interaction, existing_id, existing)
+            names = "、".join(a["custom_name"] for a in attachment_records)
+            await interaction.followup.send(
+                f"已追加 {len(attachment_records)} 个文件到 **{existing['name']}**：{names}\n公开卡片已更新。",
+                ephemeral=True,
+            )
+        else:
+            await _show_draft_setup(interaction, existing_id, has_previous=True)
+        return
+
     draft_id = attachment_records[0]["storage_msg_id"]
     default_name = title or attachments[0].filename
-
-    channel_files = {
-        fid: rec for fid, rec in file_records.items()
-        if str(rec.get("source_channel_id")) == str(interaction.channel.id)
-        and rec.get("status") == "published"
-    }
-    old_conditions = None
-    has_previous = bool(channel_files)
-    if has_previous:
-        old_conditions = next(iter(channel_files.values())).get("conditions")
-
-    conditions = dict(old_conditions) if old_conditions else {
-        "password": None,
+    conditions = {
+        "password": password,
         "require_like_first": False,
         "require_comment_first": False,
         "min_comment_length": 0,
     }
-    if password:
-        conditions["password"] = password
-
     file_records[draft_id] = {
         "name": default_name,
         "uploader_id": interaction.user.id,
@@ -781,7 +792,7 @@ async def _ingest_uploaded_files(
         "upload_time": _beijing_now().isoformat(),
     }
     save_records()
-    await _show_draft_setup(interaction, draft_id, has_previous)
+    await _show_draft_setup(interaction, draft_id, has_previous=False)
 
 
 # ─── 阶段2: 草稿设置面板（条件 + 文件/附件名称修改）───
@@ -1247,6 +1258,61 @@ class PublishConfirmView(discord.ui.View):
         self.disable_all_items()
         if hasattr(self, "message") and self.message:
             await self.message.edit(view=self)
+
+
+def _find_channel_file_bundle(channel_id, uploader_id):
+    channel_key = str(channel_id)
+    pub = channel_published.get(channel_key)
+    if pub:
+        rec = file_records.get(pub.get("file_id"))
+        if rec and rec.get("uploader_id") == uploader_id:
+            return pub.get("file_id"), rec
+    drafts = [
+        (fid, rec) for fid, rec in file_records.items()
+        if str(rec.get("source_channel_id")) == channel_key
+        and rec.get("uploader_id") == uploader_id
+        and rec.get("status") == "draft"
+    ]
+    if drafts:
+        drafts.sort(key=lambda x: x[1].get("upload_time", ""), reverse=True)
+        return drafts[0]
+    published = [
+        (fid, rec) for fid, rec in file_records.items()
+        if str(rec.get("source_channel_id")) == channel_key
+        and rec.get("uploader_id") == uploader_id
+        and rec.get("status") == "published"
+    ]
+    if published:
+        published.sort(key=lambda x: x[1].get("upload_time", ""), reverse=True)
+        return published[0]
+    return None, None
+
+
+async def _refresh_published_card(interaction: discord.Interaction, file_id: str, record: dict):
+    channel_id = str(interaction.channel.id)
+    embed, view = _build_published_card(record, file_id)
+    pub = channel_published.get(channel_id)
+    if pub:
+        try:
+            old_msg = await interaction.channel.fetch_message(int(pub["message_id"]))
+            await old_msg.edit(embed=embed, view=view)
+            record["published_msg_id"] = str(old_msg.id)
+            save_records()
+            return
+        except Exception:
+            try:
+                old_msg = await interaction.channel.fetch_message(int(pub["message_id"]))
+                await old_msg.delete()
+            except Exception:
+                pass
+    pub_msg = await interaction.channel.send(embed=embed, view=view)
+    record["published_msg_id"] = str(pub_msg.id)
+    channel_published[channel_id] = {
+        "message_id": str(pub_msg.id),
+        "file_id": file_id,
+    }
+    save_records()
+    save_channel_published()
 
 
 async def _publish_file(interaction: discord.Interaction, file_id: str, record: dict):
