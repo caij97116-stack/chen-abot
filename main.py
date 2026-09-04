@@ -39,6 +39,9 @@ REPORT_FILE = "report_data.json"
 REPORT_COUNTER_FILE = "report_counter.json"
 REPORT_CHANNEL_KEYWORD = "间谍"          # 举报入口频道关键词
 REPORT_REVIEW_CHANNEL_NAME = "举报审核"   # 审核工单频道名称
+BLACKLIST_CHANNEL_KEYWORD = "黑户"       # 结案公示频道关键词
+BLACKLIST_CHANNEL_NAME = "黑户地带"
+OPEN_REPORT_STATUSES = {"draft", "pending", "reviewing"}
 GUIDE_CHANNEL_KEYWORD = "指路"           # 指路频道关键词
 GUIDE_CHANNEL_FILE = "guide_channels.json"
 DOWNLOAD_LOGS_FILE = "download_logs.json"
@@ -239,7 +242,10 @@ def _live_streak(user_data: dict) -> int:
 
 
 # ─── 举报系统 ───
-# 结构: { "report_id": { "guild_id": str, "thread_id": str, "parent_channel_id": str, "reporter_id": str, "reporter_name": str, "target_id": str, "target_name": str, "reason": str, "anonymous": bool, "status": "pending|reviewing|completed", "review_message_id": str, "created_at": str } }
+# 结构: { "report_id": { "guild_id": str, "thread_id": str, "parent_channel_id": str, "reporter_id": str,
+#   "reporter_name": str, "target_id": str, "target_name": str, "category": str, "location": str,
+#   "reason": str, "anonymous": bool, "status": "draft|pending|reviewing|completed",
+#   "review_message_id": str, "public_message_id": str, "created_at": str } }
 report_data: dict = {}
 report_channel_messages: dict = {}  # 举报入口频道消息: { "channel_id": "message_id" }
 report_counter: dict = {}  # 工单计数器: { "guild_id": int }
@@ -291,6 +297,40 @@ def save_report_channels():
             json.dump(report_channel_messages, f)
     except Exception as e:
         logger.error(f"保存举报频道信息失败: {e}")
+
+
+def _find_open_report(guild_id: str, user_id: str):
+    for rec in report_data.values():
+        if rec.get("guild_id") == str(guild_id) and rec.get("reporter_id") == str(user_id):
+            if rec.get("status") in OPEN_REPORT_STATUSES:
+                return rec
+    return None
+
+
+def _find_report_by_thread(thread_id: str):
+    tid = str(thread_id)
+    for rid, rec in report_data.items():
+        if rec.get("thread_id") == tid:
+            return rid, rec
+    return None, None
+
+
+def _find_report_by_review_message(message_id: str):
+    mid = str(message_id)
+    for rid, rec in report_data.items():
+        if rec.get("review_message_id") == mid:
+            return rid, rec
+    return None, None
+
+
+def _report_status_label(status: str) -> str:
+    return {
+        "draft": "草稿",
+        "pending": "待审理",
+        "reviewing": "审理中",
+        "completed": "已结案",
+    }.get(status, status or "未知")
+
 
 # ─── 指路系统 ───
 guide_channel_messages: dict = {}  # { "channel_id": "message_id" }
@@ -2039,35 +2079,31 @@ async def on_message(message: discord.Message):
     if not message.guild:
         return
 
-    # 检查是否是举报线程中的消息（报告人补充证据）
     if isinstance(message.channel, discord.Thread):
-        thread_id = str(message.channel.id)
-        # 查找对应的举报记录
-        for rid, rec in report_data.items():
-            if rec.get("thread_id") == thread_id and rec.get("status") != "completed":
-                # 补充证据
-                evidence_entry = {
+        rid, rec = _find_report_by_thread(str(message.channel.id))
+        if rec and rec.get("status") == "reviewing" and str(message.author.id) == str(rec.get("reporter_id")):
+            pending = rec.setdefault("pending_evidence", [])
+            if message.attachments:
+                for att in message.attachments:
+                    pending.append({
+                        "type": "image",
+                        "content": att.url,
+                        "author": message.author.display_name,
+                        "time": datetime.now().isoformat(),
+                    })
+            if message.content.strip():
+                pending.append({
                     "type": "text",
-                    "content": message.content[:500] if message.content else "",
+                    "content": message.content[:500],
                     "author": message.author.display_name,
                     "time": datetime.now().isoformat(),
-                }
-                # 如果有图片附件
-                if message.attachments:
-                    for att in message.attachments:
-                        img_entry = {
-                            "type": "image",
-                            "content": att.url,
-                            "author": message.author.display_name,
-                            "time": datetime.now().isoformat(),
-                        }
-                        rec.setdefault("evidence", []).append(img_entry)
-                if message.content.strip():
-                    rec.setdefault("evidence", []).append(evidence_entry)
+                })
+            if pending:
                 save_reports()
-                # 更新审核卡片
-                await _update_review_card(rid, message.guild)
-                break
+                try:
+                    await message.add_reaction("📥")
+                except Exception:
+                    pass
 
     # 检查消息中是否包含 FAQ 关键词
     content = message.content.strip().lower()
@@ -2333,6 +2369,31 @@ async def get_or_create_report_review_channel(guild: discord.Guild) -> discord.T
         raise
 
 
+async def get_or_create_blacklist_channel(guild: discord.Guild) -> discord.TextChannel:
+    for channel in guild.text_channels:
+        if BLACKLIST_CHANNEL_KEYWORD in channel.name:
+            return channel
+    try:
+        channel = await guild.create_text_channel(
+            name=BLACKLIST_CHANNEL_NAME,
+            reason="Chen-Abot 结案公示频道",
+        )
+        logger.info(f"已创建黑户地带频道: #{channel.name} in {guild.name}")
+        return channel
+    except Exception as e:
+        logger.error(f"创建黑户地带频道失败: {e}")
+        raise
+
+
+def _flush_pending_evidence(rec: dict) -> int:
+    pending = rec.get("pending_evidence") or []
+    if not pending:
+        return 0
+    rec.setdefault("evidence", []).extend(pending)
+    rec["pending_evidence"] = []
+    return len(pending)
+
+
 # ─── 举报入口：持久化按钮（直接创建子频道）───
 
 class PersistentReportEntryView(discord.ui.View):
@@ -2351,51 +2412,115 @@ class PersistentReportEntryView(discord.ui.View):
 
         reporter = interaction.user
         guild = interaction.guild
-
-        # 生成工单号
         guild_id = str(guild.id)
+
+        existing = _find_open_report(guild_id, reporter.id)
+        if existing:
+            status = existing.get("status")
+            if status == "draft":
+                created = existing.get("created_at") or ""
+                expired = False
+                try:
+                    created_dt = datetime.fromisoformat(created)
+                    expired = (datetime.now() - created_dt).total_seconds() > 2 * 3600
+                except Exception:
+                    expired = True
+                if not expired:
+                    thread_id = existing.get("thread_id")
+                    await interaction.followup.send(
+                        f"你已有未完成的举报工单 **{existing.get('ticket_no', '')}**。\n"
+                        f"请先到 <#{thread_id}> 填完资料。同一时间只能有一个工单。",
+                        ephemeral=True,
+                    )
+                    return
+                existing["status"] = "abandoned"
+                save_reports()
+            else:
+                thread_id = existing.get("thread_id")
+                await interaction.followup.send(
+                    f"你已有进行中的工单 **{existing.get('ticket_no', '')}**（{_report_status_label(status)}）。\n"
+                    f"私人子区：<#{thread_id}>\n"
+                    "岛主结案并关闭该工单后，才能再开新单。",
+                    ephemeral=True,
+                )
+                return
+
         counter = report_counter.get(guild_id, 0) + 1
         report_counter[guild_id] = counter
         save_report_counter()
         ticket_no = f"#{counter:03d}"
 
         try:
-            # 直接创建子频道（线程）
             report_thread = await interaction.channel.create_thread(
                 name=f"举报{ticket_no}-{reporter.display_name[:15]}",
-                type=discord.ChannelType.private_thread if isinstance(interaction.channel, discord.TextChannel) else discord.ChannelType.public_thread,
-                reason="举报工单子频道",
+                type=discord.ChannelType.private_thread,
+                invitable=False,
+                reason="举报工单私人子区",
             )
             await report_thread.add_user(reporter)
+            if guild.owner and guild.owner.id != reporter.id:
+                try:
+                    await report_thread.add_user(guild.owner)
+                except Exception:
+                    pass
         except Exception as e:
             logger.error(f"创建举报子频道失败: {e}")
             await interaction.followup.send(
-                f"❌ 创建举报子频道失败: {e}\n请确认服务器已开启线程功能。",
+                f"创建私人子区失败: {e}\n请确认服务器已开启私人线程。",
                 ephemeral=True,
             )
             return
 
-        # 在子频道中发送欢迎消息 + 填写表单按钮
+        report_id = str(report_thread.id)
+        report_data[report_id] = {
+            "guild_id": guild_id,
+            "thread_id": str(report_thread.id),
+            "parent_channel_id": str(interaction.channel.id),
+            "reporter_id": str(reporter.id),
+            "reporter_name": reporter.display_name,
+            "target_id": "",
+            "target_name": "",
+            "category": "",
+            "location": "",
+            "reason": "",
+            "anonymous": False,
+            "ticket_no": ticket_no,
+            "status": "draft",
+            "review_message_id": "",
+            "review_channel_id": "",
+            "public_message_id": "",
+            "public_channel_id": "",
+            "evidence": [],
+            "pending_evidence": [],
+            "verdict": {},
+            "followups": [],
+            "created_at": datetime.now().isoformat(),
+        }
+        save_reports()
+
         thread_embed = discord.Embed(
-            title=f"📋 举报工单 {ticket_no}",
+            title=f"举报工单 {ticket_no}",
             description=(
+                "**这是仅你与岛主可见的私人子区。**\n\n"
                 "**举报须知：**\n"
-                "1. 请如实举报，恶意举报将被处罚\n"
-                "2. 举报内容需包含被举报人ID、违规简述\n"
-                "3. 可匿名举报，举报人信息仅岛主可见\n"
-                "4. 填写完表单后可在本频道补充图片和详细说明\n"
-                "5. 岛主审理完毕后会通知你\n\n"
-                "点击下方按钮开始填写举报信息 ⬇️"
+                "1. 如实举报。恶意、伪造证据会被反处理。\n"
+                "2. 同一时间只能有一个工单；本单结案前不能再开新单。\n"
+                "3. 请写清被举报人 ID、名称、违规类型、发生位置和经过。\n"
+                "4. 可匿名。你的身份只有岛主看得到。\n"
+                "5. 提交后先排队。岛主点「正在审理」后，本子区会出现长期「补充资料」按钮。\n"
+                "6. 补充截图请发在本子区，再点「确认上传」，审核频道才会看到最新资料。\n"
+                "7. 结案后岛主会填写最终结果，公示到黑户地带；本子区会立刻关闭。\n"
+                "8. 若结果有误，岛主可在审核频道「追加审核结果」，公示会跟在原案下面。\n\n"
+                "点下方按钮填写举报信息。"
             ),
             color=discord.Color.orange(),
         )
-        thread_embed.set_footer(text=f"工单号: {ticket_no}")
+        thread_embed.set_footer(text=f"工单号: {ticket_no} | 仅举报人与岛主可见")
 
-        view = ThreadReportStartView(reporter, ticket_no, guild_id, report_thread.id)
-        await report_thread.send(embed=thread_embed, view=view)
+        await report_thread.send(embed=thread_embed, view=ThreadReportStartView())
 
         await interaction.followup.send(
-            f"✅ 举报子频道已创建：{report_thread.mention}\n请在子频道中填写举报信息。",
+            f"私人举报子区已创建：{report_thread.mention}\n请在子区里填写举报信息。其他人看不到这个子区。",
             ephemeral=True,
         )
 
@@ -2403,22 +2528,32 @@ class PersistentReportEntryView(discord.ui.View):
 # ─── 子频道内：开始填写表单按钮 ───
 
 class ThreadReportStartView(discord.ui.View):
-    """子频道中开始填写举报信息的按钮"""
+    def __init__(self):
+        super().__init__(timeout=None)
 
-    def __init__(self, reporter: discord.Member, ticket_no: str, guild_id: str, thread_id: int):
-        super().__init__(timeout=600)
-        self.reporter = reporter
-        self.ticket_no = ticket_no
-        self.guild_id = guild_id
-        self.thread_id = thread_id
-
-    @discord.ui.button(label="📝 填写举报信息", style=discord.ButtonStyle.danger)
+    @discord.ui.button(
+        label="填写举报信息",
+        style=discord.ButtonStyle.danger,
+        custom_id="report_start_form",
+    )
     async def start_form(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.reporter.id:
+        rid, rec = _find_report_by_thread(str(interaction.channel.id))
+        if rec is None:
+            await interaction.response.send_message("找不到对应工单。", ephemeral=True)
+            return
+        if str(interaction.user.id) != str(rec.get("reporter_id")):
             await interaction.response.send_message("只有举报人才能填写。", ephemeral=True)
             return
+        if rec.get("status") not in ("draft",):
+            await interaction.response.send_message("这份工单已经提交过了。", ephemeral=True)
+            return
         await interaction.response.send_modal(
-            ReportFormModal(self.reporter, self.ticket_no, self.guild_id, self.thread_id)
+            ReportFormModal(
+                interaction.user,
+                rec.get("ticket_no", ""),
+                rec.get("guild_id", str(interaction.guild.id)),
+                interaction.channel.id,
+            )
         )
 
 
@@ -2434,7 +2569,7 @@ class ReportFormModal(discord.ui.Modal, title="提交举报"):
 
         self.target_id = discord.ui.TextInput(
             label="被举报人 ID（数字ID）",
-            placeholder="请输入被举报人的 Discord 用户 ID",
+            placeholder="对方 Discord 用户 ID，可右键复制",
             style=discord.TextStyle.short,
             required=True,
             min_length=5,
@@ -2444,19 +2579,37 @@ class ReportFormModal(discord.ui.Modal, title="提交举报"):
 
         self.target_name = discord.ui.TextInput(
             label="被举报人名称",
-            placeholder="请输入被举报人的显示名称",
+            placeholder="对方显示名或用户名",
             style=discord.TextStyle.short,
             required=True,
             max_length=100,
         )
         self.add_item(self.target_name)
 
+        self.category = discord.ui.TextInput(
+            label="违规类型",
+            placeholder="买卖/代充/发密钥/伸手/骚扰/转载侵权/其他",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=50,
+        )
+        self.add_item(self.category)
+
+        self.location = discord.ui.TextInput(
+            label="发生位置",
+            placeholder="频道名或消息链接",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=200,
+        )
+        self.add_item(self.location)
+
         self.reason = discord.ui.TextInput(
-            label="违规简述",
-            placeholder="简要描述违规行为",
+            label="经过与证据说明",
+            placeholder="时间、做了什么、你已有的证据。截图等岛主开始审理后再补。",
             style=discord.TextStyle.paragraph,
             required=True,
-            max_length=500,
+            max_length=800,
         )
         self.add_item(self.reason)
 
@@ -2465,13 +2618,16 @@ class ReportFormModal(discord.ui.Modal, title="提交举报"):
 
         target_id = self.target_id.value.strip()
         target_name = self.target_name.value.strip()
+        category = self.category.value.strip()
+        location = self.location.value.strip()
         reason = self.reason.value.strip()
 
-        # 询问是否匿名
         view = AnonymousChoiceView(
             self.reporter,
             target_id,
             target_name,
+            category,
+            location,
             reason,
             self.ticket_no,
             self.guild_id,
@@ -2487,35 +2643,37 @@ class ReportFormModal(discord.ui.Modal, title="提交举报"):
 # ─── 匿名选择视图 ───
 
 class AnonymousChoiceView(discord.ui.View):
-    def __init__(self, reporter: discord.Member, target_id: str, target_name: str, reason: str, ticket_no: str, guild_id: str, thread_id: int):
+    def __init__(self, reporter: discord.Member, target_id: str, target_name: str, category: str, location: str, reason: str, ticket_no: str, guild_id: str, thread_id: int):
         super().__init__(timeout=120)
         self.reporter = reporter
         self.target_id = target_id
         self.target_name = target_name
+        self.category = category
+        self.location = location
         self.reason = reason
         self.ticket_no = ticket_no
         self.guild_id = guild_id
         self.thread_id = thread_id
 
-    @discord.ui.button(label="🔒 匿名举报", style=discord.ButtonStyle.secondary)
+    @discord.ui.button(label="匿名举报", style=discord.ButtonStyle.secondary)
     async def anonymous(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.reporter.id:
             await interaction.response.send_message("这不是你的操作。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         await _create_report(
-            interaction, self.reporter, self.target_id, self.target_name, self.reason,
+            interaction, self.reporter, self.target_id, self.target_name, self.category, self.location, self.reason,
             anonymous=True, ticket_no=self.ticket_no, guild_id=self.guild_id, thread_id=self.thread_id,
         )
 
-    @discord.ui.button(label="👤 实名举报", style=discord.ButtonStyle.primary)
+    @discord.ui.button(label="实名举报", style=discord.ButtonStyle.primary)
     async def named(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.reporter.id:
             await interaction.response.send_message("这不是你的操作。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
         await _create_report(
-            interaction, self.reporter, self.target_id, self.target_name, self.reason,
+            interaction, self.reporter, self.target_id, self.target_name, self.category, self.location, self.reason,
             anonymous=False, ticket_no=self.ticket_no, guild_id=self.guild_id, thread_id=self.thread_id,
         )
 
@@ -2525,268 +2683,509 @@ async def _create_report(
     reporter: discord.Member,
     target_id: str,
     target_name: str,
+    category: str,
+    location: str,
     reason: str,
     anonymous: bool,
     ticket_no: str = "",
     guild_id: str = "",
     thread_id: int = 0,
 ):
-    """创建举报工单：使用已有子频道，创建审核工单卡片"""
     guild = interaction.guild
     guild_id = guild_id or str(guild.id)
-    report_id = str(interaction.id)
+    report_id = str(thread_id)
 
-    # 获取已有的子频道
     report_thread = guild.get_thread(thread_id) if thread_id else None
     if not report_thread:
-        await interaction.followup.send("❌ 子频道已丢失，请重新举报。", ephemeral=True)
+        await interaction.followup.send("子区已丢失，请重新举报。", ephemeral=True)
         return
 
-    # 在子频道中发送汇总信息
+    rec = report_data.get(report_id)
+    if rec is None:
+        rec = {"thread_id": str(thread_id), "created_at": datetime.now().isoformat()}
+        report_data[report_id] = rec
+
+    rec.update({
+        "guild_id": guild_id,
+        "thread_id": str(report_thread.id),
+        "parent_channel_id": rec.get("parent_channel_id") or str(getattr(interaction.channel, "parent_id", interaction.channel.id)),
+        "reporter_id": str(reporter.id),
+        "reporter_name": reporter.display_name,
+        "target_id": target_id,
+        "target_name": target_name,
+        "category": category,
+        "location": location,
+        "reason": reason,
+        "anonymous": anonymous,
+        "ticket_no": ticket_no,
+        "status": "pending",
+        "evidence": rec.get("evidence") or [],
+        "pending_evidence": rec.get("pending_evidence") or [],
+        "verdict": rec.get("verdict") or {},
+        "followups": rec.get("followups") or [],
+        "public_message_id": rec.get("public_message_id") or "",
+        "public_channel_id": rec.get("public_channel_id") or "",
+    })
+
     reporter_label = "匿名用户" if anonymous else f"{reporter.mention} ({reporter.display_name})"
     thread_embed = discord.Embed(
-        title=f"📋 举报工单 {ticket_no}",
+        title=f"举报工单 {ticket_no}",
         description=(
             f"**举报人:** {reporter_label}\n"
-            f"**被举报人ID:** {target_id}\n"
+            f"**被举报人ID:** `{target_id}`\n"
             f"**被举报人名称:** {target_name}\n"
-            f"**违规简述:** {reason}\n\n"
-            "📎 **请在下方补充图片、链接等更多证据**\n"
-            "岛主审理完毕后会通知你。"
+            f"**违规类型:** {category}\n"
+            f"**发生位置:** {location}\n"
+            f"**经过:** {reason}\n\n"
+            "已提交，正在排队。岛主点「正在审理」后，本子区会出现「补充资料」按钮。\n"
+            "那时再发截图，并点确认上传，审核频道才会看到。"
         ),
         color=discord.Color.orange(),
         timestamp=datetime.now(),
     )
-    thread_embed.set_footer(text=f"工单号: {ticket_no}")
+    thread_embed.set_footer(text=f"工单号: {ticket_no} | 状态: 待审理")
     await report_thread.send(embed=thread_embed)
-
-    # 构建审核工单卡片
-    evidence_text = "📝 **举报表单**\n"
-    evidence_text += f"> 被举报人ID: {target_id}\n"
-    evidence_text += f"> 被举报人名称: {target_name}\n"
-    evidence_text += f"> 违规简述: {reason}\n"
-    evidence_text += "\n📎 **补充证据**\n_（举报人添加的内容将自动显示在此处）_\n"
-
-    review_embed = discord.Embed(
-        title=f"📋 工单 {ticket_no}",
-        description=evidence_text[:4096],
-        color=discord.Color.orange(),
-        timestamp=datetime.now(),
-    )
-    review_embed.add_field(name="举报人", value=f"{'匿名用户' if anonymous else reporter.display_name} (ID: {reporter.id})", inline=True)
-    review_embed.add_field(name="状态", value="⏳ 待审理", inline=True)
-    review_embed.add_field(name="子频道", value=report_thread.mention, inline=True)
-    review_embed.set_footer(text=f"工单号: {ticket_no} | 点击按钮审理")
 
     try:
         review_channel = await get_or_create_report_review_channel(guild)
-        view = PersistentReportReviewView(report_id, report_thread.id, ticket_no)
-        review_msg = await review_channel.send(embed=review_embed, view=view)
-
-        report_data[report_id] = {
-            "guild_id": guild_id,
-            "thread_id": str(report_thread.id),
-            "parent_channel_id": str(interaction.channel.id),
-            "reporter_id": str(reporter.id),
-            "reporter_name": reporter.display_name,
-            "target_id": target_id,
-            "target_name": target_name,
-            "reason": reason,
-            "anonymous": anonymous,
-            "ticket_no": ticket_no,
-            "status": "pending",
-            "review_message_id": str(review_msg.id),
-            "review_channel_id": str(review_channel.id),
-            "evidence": [],
-            "created_at": datetime.now().isoformat(),
-        }
+        view = PersistentReportReviewView()
+        review_msg = await review_channel.send(embed=_build_review_embed(rec), view=view)
+        rec["review_message_id"] = str(review_msg.id)
+        rec["review_channel_id"] = str(review_channel.id)
         save_reports()
-
         await interaction.followup.send(
-            f"✅ 举报已提交！工单号: **{ticket_no}**\n"
-            f"你可以在子频道 {report_thread.mention} 中补充更多证据。",
+            f"举报已提交。工单号: **{ticket_no}**\n"
+            f"请等岛主开始审理。开始后才能在 {report_thread.mention} 补充截图。",
             ephemeral=True,
         )
     except Exception as e:
         logger.error(f"创建审核工单失败: {e}")
+        save_reports()
         await interaction.followup.send(
-            f"举报子频道 {report_thread.mention} 已创建，但审核工单创建失败: {e}",
+            f"私人子区 {report_thread.mention} 已创建，但审核工单创建失败: {e}",
             ephemeral=True,
         )
 
 
-async def _update_review_card(report_id: str, guild: discord.Guild):
-    """根据最新证据更新审核工单卡片"""
-    rec = report_data.get(report_id)
-    if not rec:
-        return
+def _format_evidence_block(rec: dict) -> str:
+    evidence_list = rec.get("evidence") or []
+    pending = rec.get("pending_evidence") or []
+    lines = []
+    if evidence_list:
+        lines.append("**已确认补充资料**")
+        for i, ev in enumerate(evidence_list, 1):
+            if ev.get("type") == "image":
+                lines.append(f"{i}. [图片] {ev.get('content', '')}")
+            else:
+                lines.append(f"{i}. {str(ev.get('content', ''))[:300]}")
+    else:
+        lines.append("**已确认补充资料**")
+        lines.append("暂无")
+    if rec.get("status") == "reviewing" and pending:
+        lines.append("")
+        lines.append(f"**待确认上传:** {len(pending)} 条（举报人尚未点确认）")
+    return "\n".join(lines)
 
-    try:
-        review_channel_id = rec.get("review_channel_id")
-        review_msg_id = rec.get("review_message_id")
-        if not review_channel_id or not review_msg_id:
-            return
 
-        review_channel = guild.get_channel(int(review_channel_id))
-        if not review_channel:
-            return
-
-        review_msg = await review_channel.fetch_message(int(review_msg_id))
-    except Exception:
-        return
-
+def _build_review_embed(rec: dict) -> discord.Embed:
     ticket_no = rec.get("ticket_no", "???")
+    status = rec.get("status", "pending")
     anonymous = rec.get("anonymous", False)
     reporter_name = rec.get("reporter_name", "未知")
     reporter_id = rec.get("reporter_id", "?")
     target_id = rec.get("target_id", "?")
     target_name = rec.get("target_name", "?")
-    reason = rec.get("reason", "?")
+    category = rec.get("category") or "未填"
+    location = rec.get("location") or "未填"
+    reason = rec.get("reason") or "?"
     thread_id = rec.get("thread_id", "0")
-    status = rec.get("status", "pending")
-
-    status_label = {"pending": "⏳ 待审理", "reviewing": "🔍 审理中", "completed": "✅ 已处理"}.get(status, status)
-
-    # 构建证据文本
-    evidence_text = "📝 **举报表单**\n"
-    evidence_text += f"> 被举报人ID: {target_id}\n"
-    evidence_text += f"> 被举报人名称: {target_name}\n"
-    evidence_text += f"> 违规简述: {reason}\n"
-
-    evidence_list = rec.get("evidence", [])
-    if evidence_list:
-        evidence_text += "\n📎 **补充证据**\n"
-        for i, ev in enumerate(evidence_list, 1):
-            if ev["type"] == "text":
-                evidence_text += f"> {i}. {ev['content'][:300]}\n"
-            elif ev["type"] == "image":
-                evidence_text += f"> {i}. [图片证据] {ev['content']}\n"
+    color_map = {
+        "draft": discord.Color.light_grey(),
+        "pending": discord.Color.orange(),
+        "reviewing": discord.Color.blue(),
+        "completed": discord.Color.dark_grey(),
+    }
+    body = (
+        f"**被举报人ID:** `{target_id}`\n"
+        f"**被举报人名称:** {target_name}\n"
+        f"**违规类型:** {category}\n"
+        f"**发生位置:** {location}\n"
+        f"**经过:** {reason}\n\n"
+        f"{_format_evidence_block(rec)}"
+    )
+    verdict = rec.get("verdict") or {}
+    if verdict:
+        body += (
+            f"\n\n**结案结果:** {verdict.get('conclusion', '')}\n"
+            f"**处理对象:** {verdict.get('punished', '')}\n"
+            f"**处罚:** {verdict.get('penalty', '')}\n"
+            f"**说明:** {verdict.get('note', '')}"
+        )
+    followups = rec.get("followups") or []
+    if followups:
+        body += f"\n\n已追加审核 **{len(followups)}** 次，详见黑户地带原案下方。"
+    embed = discord.Embed(
+        title=f"工单 {ticket_no}",
+        description=body[:4096],
+        color=color_map.get(status, discord.Color.orange()),
+        timestamp=datetime.now(),
+    )
+    embed.add_field(
+        name="举报人",
+        value=f"{'匿名用户' if anonymous else reporter_name} (ID: {reporter_id})",
+        inline=True,
+    )
+    embed.add_field(name="状态", value=_report_status_label(status), inline=True)
+    if status == "completed":
+        embed.add_field(name="子区", value="已关闭", inline=True)
     else:
-        evidence_text += "\n📎 **补充证据**\n_（暂无补充证据）_\n"
+        embed.add_field(name="子区", value=f"<#{thread_id}>", inline=True)
+    embed.set_footer(text=f"工单号: {ticket_no}")
+    return embed
 
-    review_embed = review_msg.embeds[0] if review_msg.embeds else discord.Embed()
-    review_embed.title = f"📋 工单 {ticket_no}"
-    review_embed.description = evidence_text[:4096]
-    review_embed.clear_fields()
-    review_embed.add_field(name="举报人", value=f"{'匿名用户' if anonymous else reporter_name} (ID: {reporter_id})", inline=True)
-    review_embed.add_field(name="状态", value=status_label, inline=True)
-    review_embed.add_field(name="子频道", value=f"<#{thread_id}>", inline=True)
-    review_embed.set_footer(text=f"工单号: {ticket_no} | 点击按钮审理")
 
-    color_map = {"pending": discord.Color.orange(), "reviewing": discord.Color.blue(), "completed": discord.Color.green()}
-    review_embed.color = color_map.get(status, discord.Color.orange())
-
+async def _update_review_card(report_id: str, guild: discord.Guild, view: discord.ui.View = None):
+    rec = report_data.get(report_id)
+    if not rec:
+        return
     try:
-        await review_msg.edit(embed=review_embed)
+        review_channel_id = rec.get("review_channel_id")
+        review_msg_id = rec.get("review_message_id")
+        if not review_channel_id or not review_msg_id:
+            return
+        review_channel = guild.get_channel(int(review_channel_id))
+        if not review_channel:
+            return
+        review_msg = await review_channel.fetch_message(int(review_msg_id))
+        kwargs = {"embed": _build_review_embed(rec)}
+        if view is not None:
+            kwargs["view"] = view
+        await review_msg.edit(**kwargs)
     except Exception as e:
         logger.error(f"更新审核卡片失败: {e}")
+
+
+def _build_public_verdict_embed(rec: dict) -> discord.Embed:
+    ticket_no = rec.get("ticket_no", "???")
+    verdict = rec.get("verdict") or {}
+    conclusion = verdict.get("conclusion") or "未填写"
+    embed = discord.Embed(
+        title=f"工单 {ticket_no} 审理结果",
+        description=(
+            f"**结论:** {conclusion}\n"
+            f"**被处理人:** {verdict.get('punished') or rec.get('target_name') or '未填写'}\n"
+            f"**被处理人ID:** `{verdict.get('punished_id') or rec.get('target_id') or '未填写'}`\n"
+            f"**处罚:** {verdict.get('penalty') or '未填写'}\n"
+            f"**说明:** {verdict.get('note') or '无'}\n"
+            f"**违规类型:** {rec.get('category') or '未填'}"
+        ),
+        color=discord.Color.dark_red() if "成立" in conclusion and "不成立" not in conclusion else discord.Color.dark_grey(),
+        timestamp=datetime.now(),
+    )
+    embed.set_footer(text=f"工单号: {ticket_no} | 结案公示")
+    return embed
+
+
+def _build_followup_embed(rec: dict, followup: dict) -> discord.Embed:
+    ticket_no = rec.get("ticket_no", "???")
+    embed = discord.Embed(
+        title=f"工单 {ticket_no} 追加审核",
+        description=(
+            f"**追加结论:** {followup.get('conclusion') or '未填写'}\n"
+            f"**被处理人:** {followup.get('punished') or '未填写'}\n"
+            f"**被处理人ID:** `{followup.get('punished_id') or '未填写'}`\n"
+            f"**处罚/更正:** {followup.get('penalty') or '未填写'}\n"
+            f"**说明:** {followup.get('note') or '无'}"
+        ),
+        color=discord.Color.gold(),
+        timestamp=datetime.now(),
+    )
+    embed.set_footer(text=f"工单号: {ticket_no} | 追加在原案下方")
+    return embed
+
+
+async def _close_report_thread(guild: discord.Guild, rec: dict):
+    thread_id = rec.get("thread_id")
+    if not thread_id:
+        return
+    thread = guild.get_thread(int(thread_id))
+    if thread is None:
+        try:
+            thread = await guild.fetch_channel(int(thread_id))
+        except Exception:
+            return
+    try:
+        await thread.delete()
+        logger.info(f"举报子区已关闭: {getattr(thread, 'name', thread_id)}")
+    except Exception as e:
+        logger.error(f"关闭举报子区失败: {e}")
+
+
+async def _publish_verdict(guild: discord.Guild, rec: dict):
+    channel = await get_or_create_blacklist_channel(guild)
+    msg = await channel.send(embed=_build_public_verdict_embed(rec))
+    rec["public_message_id"] = str(msg.id)
+    rec["public_channel_id"] = str(channel.id)
+    save_reports()
+    return msg
+
+
+async def _publish_followup(guild: discord.Guild, rec: dict, followup: dict):
+    channel_id = rec.get("public_channel_id")
+    channel = guild.get_channel(int(channel_id)) if channel_id else None
+    if channel is None:
+        channel = await get_or_create_blacklist_channel(guild)
+    ref = None
+    if rec.get("public_message_id"):
+        try:
+            ref = await channel.fetch_message(int(rec["public_message_id"]))
+        except Exception:
+            ref = None
+    kwargs = {"embed": _build_followup_embed(rec, followup)}
+    if ref:
+        kwargs["reference"] = ref
+    await channel.send(**kwargs)
 
 
 # ─── 审核工单按钮视图 ───
 
 class PersistentReportReviewView(discord.ui.View):
-    """审核工单持久化按钮视图"""
-
-    def __init__(self, report_id: str, thread_id: int, ticket_no: str = ""):
+    def __init__(self):
         super().__init__(timeout=None)
-        self.report_id = report_id
-        self.thread_id = thread_id
-        self.ticket_no = ticket_no
+
+    def _resolve(self, interaction: discord.Interaction):
+        return _find_report_by_review_message(str(interaction.message.id))
 
     @discord.ui.button(
-        label="🔍 正在审理",
+        label="正在审理",
         style=discord.ButtonStyle.primary,
         custom_id="report_reviewing",
     )
     async def reviewing(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 只有最高权限者能操作
         if interaction.user.id != interaction.guild.owner_id:
             await interaction.response.send_message("只有岛主才能审理举报。", ephemeral=True)
             return
-
-        rec = report_data.get(self.report_id)
-        if not rec:
+        report_id, rec = self._resolve(interaction)
+        if rec is None:
             await interaction.response.send_message("工单数据丢失。", ephemeral=True)
             return
+        if rec.get("status") == "completed":
+            await interaction.response.send_message("此工单已结案。如需更正，请用「追加审核结果」。", ephemeral=True)
+            return
+        if rec.get("status") == "reviewing":
+            await interaction.response.send_message("已经在审理中。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
 
         rec["status"] = "reviewing"
         save_reports()
 
-        # 通知举报人子频道
         guild = interaction.guild
-        thread = guild.get_thread(self.thread_id)
+        thread = guild.get_thread(int(rec.get("thread_id") or 0))
         if thread:
             try:
                 notify_embed = discord.Embed(
-                    title="🔍 岛主正在审理你的举报",
-                    description="感谢你的举报，岛主已开始审理此工单，请耐心等待。",
+                    title="岛主正在审理你的举报",
+                    description=(
+                        "本工单已进入审理中。现在可以补充截图和说明。\n"
+                        "请把资料发在这个子区，再点下方「确认上传」。\n"
+                        "确认后，审核频道会立刻看到最新资料。\n"
+                        "结案后这个子区会关闭，按钮也会消失。"
+                    ),
                     color=discord.Color.blue(),
                 )
-                await thread.send(embed=notify_embed)
-            except Exception:
-                pass
+                await thread.send(embed=notify_embed, view=PersistentEvidenceView())
+            except Exception as e:
+                logger.error(f"通知举报人失败: {e}")
 
-        await _update_review_card(self.report_id, guild)
-        await interaction.response.send_message("✅ 已标记为审理中，举报人已收到通知。", ephemeral=True)
+        await _update_review_card(report_id, guild)
+        await interaction.followup.send("已标为审理中。举报人子区已出现长期「补充资料」按钮。", ephemeral=True)
 
     @discord.ui.button(
-        label="✅ 审理完毕",
+        label="审理完毕",
         style=discord.ButtonStyle.success,
         custom_id="report_completed",
     )
     async def completed(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # 只有最高权限者能操作
         if interaction.user.id != interaction.guild.owner_id:
             await interaction.response.send_message("只有岛主才能审理举报。", ephemeral=True)
             return
-
-        await interaction.response.defer(ephemeral=True)
-
-        rec = report_data.get(self.report_id)
-        if not rec:
-            await interaction.followup.send("工单数据丢失。", ephemeral=True)
+        report_id, rec = self._resolve(interaction)
+        if rec is None:
+            await interaction.response.send_message("工单数据丢失。", ephemeral=True)
             return
+        if rec.get("status") == "completed":
+            await interaction.response.send_message("此工单已结案。如需更正，请用「追加审核结果」。", ephemeral=True)
+            return
+        await interaction.response.send_modal(VerdictModal(report_id, is_followup=False))
 
-        rec["status"] = "completed"
+    @discord.ui.button(
+        label="追加审核结果",
+        style=discord.ButtonStyle.secondary,
+        custom_id="report_followup",
+    )
+    async def followup_btn(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != interaction.guild.owner_id:
+            await interaction.response.send_message("只有岛主才能追加审核。", ephemeral=True)
+            return
+        report_id, rec = self._resolve(interaction)
+        if rec is None:
+            await interaction.response.send_message("工单数据丢失。", ephemeral=True)
+            return
+        if rec.get("status") != "completed":
+            await interaction.response.send_message("先结案，才能追加审核结果。", ephemeral=True)
+            return
+        await interaction.response.send_modal(VerdictModal(report_id, is_followup=True))
+
+
+class PersistentEvidenceView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="确认上传补充资料",
+        style=discord.ButtonStyle.primary,
+        custom_id="report_confirm_evidence",
+    )
+    async def confirm_evidence(self, interaction: discord.Interaction, button: discord.ui.Button):
+        report_id, rec = _find_report_by_thread(str(interaction.channel.id))
+        if rec is None:
+            await interaction.response.send_message("找不到对应工单。", ephemeral=True)
+            return
+        if str(interaction.user.id) != str(rec.get("reporter_id")):
+            await interaction.response.send_message("只有本单举报人可以确认上传。", ephemeral=True)
+            return
+        if rec.get("status") != "reviewing":
+            await interaction.response.send_message("只有审理中才能补充资料。", ephemeral=True)
+            return
+        count = _flush_pending_evidence(rec)
+        if count == 0:
+            await interaction.response.send_message(
+                "没有待确认资料。请先在本子区发截图或文字，再点这个按钮。",
+                ephemeral=True,
+            )
+            return
         save_reports()
-
-        # 通知举报人子频道
-        guild = interaction.guild
-        thread = guild.get_thread(self.thread_id)
-        if thread:
-            try:
-                done_embed = discord.Embed(
-                    title="✅ 你的举报已处理完毕",
-                    description="岛主已审理完毕此工单，感谢你的举报。\n\n此子频道将在 10 秒后自动删除。",
-                    color=discord.Color.green(),
-                )
-                await thread.send(embed=done_embed)
-
-                # 10秒后删除子频道
-                async def _delete_thread():
-                    await asyncio.sleep(10)
-                    try:
-                        await thread.delete()
-                        logger.info(f"举报子频道已删除: {thread.name}")
-                    except Exception as e:
-                        logger.error(f"删除举报子频道失败: {e}")
-
-                asyncio.create_task(_delete_thread())
-            except Exception:
-                pass
-
-        # 更新审核卡片
-        await _update_review_card(self.report_id, guild)
-
-        # 禁用按钮
-        for child in self.children:
-            child.disabled = True
+        await _update_review_card(report_id, interaction.guild)
+        await interaction.response.send_message(
+            f"已确认上传 {count} 条资料，审核频道已更新。",
+            ephemeral=True,
+        )
         try:
-            await interaction.message.edit(view=self)
+            await interaction.channel.send(f"举报人已确认上传 {count} 条补充资料。")
         except Exception:
             pass
 
-        await interaction.followup.send("✅ 工单已处理完毕，举报子频道将被删除。", ephemeral=True)
+
+class VerdictModal(discord.ui.Modal):
+    def __init__(self, report_id: str, is_followup: bool = False):
+        super().__init__(title="追加审核结果" if is_followup else "填写结案结果")
+        self.report_id = report_id
+        self.is_followup = is_followup
+        rec = report_data.get(report_id) or {}
+        default_name = rec.get("target_name") or ""
+        default_id = rec.get("target_id") or ""
+
+        self.conclusion = discord.ui.TextInput(
+            label="结论",
+            placeholder="成立 / 不成立 / 部分成立",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=50,
+        )
+        self.add_item(self.conclusion)
+
+        self.punished = discord.ui.TextInput(
+            label="被处理人名称",
+            placeholder="公示里显示的处理对象",
+            default=default_name,
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=100,
+        )
+        self.add_item(self.punished)
+
+        self.punished_id = discord.ui.TextInput(
+            label="被处理人 ID",
+            placeholder="Discord 用户 ID",
+            default=default_id,
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=30,
+        )
+        self.add_item(self.punished_id)
+
+        self.penalty = discord.ui.TextInput(
+            label="处罚或更正",
+            placeholder="警告 / 禁言 / 封禁 / 无处罚 / 撤销原处罚",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=100,
+        )
+        self.add_item(self.penalty)
+
+        self.note = discord.ui.TextInput(
+            label="说明（可附图片链接）",
+            placeholder="审理依据。有图可先发到审核频道，再把链接贴这里。",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=800,
+        )
+        self.add_item(self.note)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        rec = report_data.get(self.report_id)
+        if rec is None:
+            await interaction.followup.send("工单数据丢失。", ephemeral=True)
+            return
+        payload = {
+            "conclusion": self.conclusion.value.strip(),
+            "punished": self.punished.value.strip(),
+            "punished_id": self.punished_id.value.strip(),
+            "penalty": self.penalty.value.strip(),
+            "note": self.note.value.strip(),
+            "by": str(interaction.user.id),
+            "at": datetime.now().isoformat(),
+        }
+        guild = interaction.guild
+        if self.is_followup:
+            rec.setdefault("followups", []).append(payload)
+            save_reports()
+            try:
+                await _publish_followup(guild, rec, payload)
+            except Exception as e:
+                logger.error(f"追加公示失败: {e}")
+                await interaction.followup.send(f"追加结果已记下，但公示失败: {e}", ephemeral=True)
+                return
+            await _update_review_card(self.report_id, guild, view=PersistentReportReviewView())
+            await interaction.followup.send("追加审核结果已发到黑户地带，跟在原案下面。", ephemeral=True)
+            return
+
+        rec["verdict"] = payload
+        rec["status"] = "completed"
+        save_reports()
+        try:
+            await _publish_verdict(guild, rec)
+        except Exception as e:
+            logger.error(f"结案公示失败: {e}")
+            await interaction.followup.send(f"结果已记下，但黑户地带公示失败: {e}", ephemeral=True)
+            return
+
+        thread = guild.get_thread(int(rec.get("thread_id") or 0))
+        if thread:
+            try:
+                done_embed = discord.Embed(
+                    title="你的举报已结案",
+                    description="岛主已填写最终结果，并公示到黑户地带。本子区即将关闭。",
+                    color=discord.Color.green(),
+                )
+                await thread.send(embed=done_embed)
+            except Exception:
+                pass
+        await _close_report_thread(guild, rec)
+        await _update_review_card(self.report_id, guild, view=PersistentReportReviewView())
+        await interaction.followup.send("已结案，结果已发到黑户地带，私人子区已关闭。", ephemeral=True)
 
 
 async def setup_report_channels():
@@ -2794,12 +3193,16 @@ async def setup_report_channels():
     report_embed = discord.Embed(
         title="🚨 报告！有间谍！",
         description=(
-            "发现违规行为？点击下方按钮提交举报工单。\n\n"
-            "举报流程：\n"
-            "1. 点击按钮阅读举报规则\n"
-            "2. 等待 10 秒后开始填写举报信息\n"
-            "3. 在专属子频道中补充证据\n"
-            "4. 岛主审理完毕后通知你"
+            "发现违规行为？点下方按钮开私人工单。\n\n"
+            "**规则：**\n"
+            "同一时间只能有一个未结案工单。\n"
+            "子区仅你和岛主可见。恶意举报会被反处理。\n\n"
+            "**流程：**\n"
+            "1. 开私人子区，填被举报人、类型、位置、经过\n"
+            "2. 岛主点「正在审理」后，子区出现「补充资料」\n"
+            "3. 发截图后点确认上传，审核频道才会看到\n"
+            "4. 结案必填结果，公示到黑户地带，子区立刻关闭\n"
+            "5. 结果有误可追加审核，公示跟在原案下面"
         ),
         color=discord.Color.red(),
     )
@@ -2844,7 +3247,7 @@ async def setup_report_channels():
 async def setup_guide_channels():
     """在名称包含 GUIDE_CHANNEL_KEYWORD 的频道中发布频道导航"""
     # 排除的频道名称
-    EXCLUDED_NAMES = {"📁-文件存储", "举报审核", "测试"}
+    EXCLUDED_NAMES = {"📁-文件存储", "举报审核", "测试", "黑户地带"}
 
     for guild in bot.guilds:
         # 收集所有频道（文字、语音、论坛、舞台），按分类分组
@@ -3236,7 +3639,9 @@ if __name__ == "__main__":
         bot.add_view(PersistentQuizView())
         bot.add_view(PersistentCheckinView())
         bot.add_view(PersistentReportEntryView())
-        bot.add_view(PersistentReportReviewView("", 0))
+        bot.add_view(ThreadReportStartView())
+        bot.add_view(PersistentReportReviewView())
+        bot.add_view(PersistentEvidenceView())
         bot.add_view(PublishedFileView())
 
         # 启动心跳任务
