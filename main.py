@@ -282,7 +282,7 @@ def save_download_logs():
 
 # ─── 答题系统 ───
 QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
-QUIZ_MAX_ERRORS = 2                # 最多允许错几题（超过则失败）
+QUIZ_MAX_ERRORS = 0                # 最多允许错几题（0 = 必须全对）
 QUIZ_COOLDOWN_MINUTES = 25         # 每次失败后增加的冷却时间（分钟）
 QUIZ_QUESTION_TIMEOUT = 300        # 每道题限时（秒），默认 5 分钟
 QUIZ_VERIFIED_ROLE = "你过关！小岛居民"        # 答题通过后赋予的身份组
@@ -1718,7 +1718,7 @@ async def _show_results(interaction: discord.Interaction, session: dict):
         title = "❌ 答题未通过"
         wrong_list = "、".join(f"第{n}题" for n in wrong_nums)
         description = (
-            f"正确 {correct}/{total} 题，错了 {errors} 题（超过 {QUIZ_MAX_ERRORS} 题需重考）\n\n"
+            f"正确 {correct}/{total} 题，错了 {errors} 题（必须全部答对才能通过）\n\n"
             f"答错的题目：{wrong_list}\n\n"
             f"📖 建议去查看社区规则和公告，了解清楚后再来答题哦～"
         )
