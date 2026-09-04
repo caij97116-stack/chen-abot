@@ -2,6 +2,7 @@ import os
 import io
 import json
 import random
+import secrets
 import asyncio
 import zipfile
 import discord
@@ -50,7 +51,8 @@ PUBLISHED_FILE = "channel_published.json"
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, "status": "draft|published", "description": str,
 #                      "attachments": [{ "original_name": str, "custom_name": str, "storage_msg_id": str, "size": int }],
-#                      "conditions": { ... }, "published_msg_id": str, "source_channel_id": int, "guild_id": int, "upload_time": str } }
+#                      "conditions": { ... }, "published_msg_id": str, "source_channel_id": int, "guild_id": int,
+#                      "upload_time": str, "resource_code": str, "updates": list, "storage_card_msg_id": str } }
 file_records: dict = {}
 
 # ─── 频道已发布消息追踪 ───
@@ -129,6 +131,177 @@ async def get_or_create_storage_channel(guild: discord.Guild) -> discord.TextCha
     except Exception as e:
         logger.error(f"创建存储频道失败: {e}")
         raise
+
+
+def _new_resource_code() -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    existing = {rec.get("resource_code") for rec in file_records.values()}
+    for _ in range(32):
+        code = "R-" + "".join(secrets.choice(alphabet) for _ in range(8))
+        if code not in existing:
+            return code
+    return "R-" + secrets.token_hex(4).upper()
+
+
+def _ensure_resource_code(record: dict) -> str:
+    code = record.get("resource_code")
+    if code:
+        return code
+    code = _new_resource_code()
+    record["resource_code"] = code
+    return code
+
+
+def _format_beijing_minute(raw) -> str:
+    if not raw:
+        return "未知"
+    try:
+        dt = raw if isinstance(raw, datetime) else datetime.fromisoformat(str(raw))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=BEIJING_TZ)
+        else:
+            dt = dt.astimezone(BEIJING_TZ)
+        return dt.strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        text = str(raw)
+        return text[:16] if len(text) >= 16 else text
+
+
+def _is_island_owner(interaction: discord.Interaction) -> bool:
+    guild = interaction.guild
+    return bool(guild and interaction.user.id == guild.owner_id)
+
+
+def _find_record_by_storage_card(message_id) -> tuple:
+    target = str(message_id)
+    for fid, rec in file_records.items():
+        if str(rec.get("storage_card_msg_id") or "") == target:
+            return fid, rec
+    return None, None
+
+
+def _build_storage_card_embed(file_id: str, record: dict) -> discord.Embed:
+    code = _ensure_resource_code(record)
+    attachments = record.get("attachments") or []
+    files_lines = []
+    for i, att in enumerate(attachments[:30], 1):
+        files_lines.append(f"{i}. {att.get('custom_name', '?')} ({_format_size(att.get('size', 0))})")
+    if len(attachments) > 30:
+        files_lines.append(f"... 另有 {len(attachments) - 30} 个文件")
+    files_text = "\n".join(files_lines) if files_lines else "（无文件）"
+    updates = record.get("updates") or []
+    update_lines = []
+    for item in updates[-8:]:
+        names = "、".join(item.get("files") or [])
+        update_lines.append(f"{_format_beijing_minute(item.get('time'))} 追加 {names}")
+    updates_text = "\n".join(update_lines) if update_lines else "暂无追加"
+    status = "已发布" if record.get("status") == "published" else "草稿"
+    source = record.get("source_channel_id")
+    source_txt = f"<#{source}>" if source else "未知"
+    desc = (
+        f"**资源回溯码:** `{code}`\n"
+        f"**标题:** {record.get('name', '?')}\n"
+        f"**作者:** <@{record.get('uploader_id', 0)}> `{record.get('uploader_id', '?')}`\n"
+        f"**来源:** {source_txt}\n"
+        f"**上传时间:** {_format_beijing_minute(record.get('upload_time'))}\n"
+        f"**状态:** {status} | **总大小:** {_format_size(record.get('size', 0))}\n\n"
+        f"**文件清单**\n{files_text}\n\n"
+        f"**追加更新**\n{updates_text}"
+    )
+    embed = discord.Embed(
+        title="存储记录卡",
+        description=desc[:4000],
+        color=discord.Color.dark_gold(),
+    )
+    embed.set_footer(text="仅岛主可见 | 点回溯查看领取记录")
+    return embed
+
+
+async def _upsert_storage_card(guild: discord.Guild, file_id: str, record: dict):
+    if not guild:
+        return
+    channel = await get_or_create_storage_channel(guild)
+    embed = _build_storage_card_embed(file_id, record)
+    view = PersistentStorageCardView()
+    msg_id = record.get("storage_card_msg_id")
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(int(msg_id))
+            await msg.edit(embed=embed, view=view)
+            return
+        except Exception:
+            pass
+    msg = await channel.send(embed=embed, view=view)
+    record["storage_card_msg_id"] = str(msg.id)
+    save_records()
+
+
+def _resource_download_logs(file_id: str, record: dict) -> list:
+    code = record.get("resource_code")
+    name = record.get("name")
+    hits = []
+    for log in download_logs:
+        if str(log.get("record_id") or "") == str(file_id):
+            hits.append(log)
+            continue
+        if code and log.get("resource_code") == code:
+            hits.append(log)
+            continue
+        if name and log.get("file_name") == name and str(log.get("uploader_id")) == str(record.get("uploader_id")):
+            hits.append(log)
+    return hits[-20:]
+
+
+def _build_resource_trace_embed(file_id: str, record: dict) -> discord.Embed:
+    code = _ensure_resource_code(record)
+    logs = _resource_download_logs(file_id, record)
+    if logs:
+        lines = []
+        for log in logs:
+            lines.append(
+                f"{_format_beijing_minute(log.get('timestamp'))} "
+                f"<@{log.get('downloader_id', 0)}> `{log.get('downloader_id', '?')}` "
+                f"{log.get('file_label') or log.get('file_name') or '?'}"
+            )
+        log_text = "\n".join(lines)
+    else:
+        log_text = "暂无领取记录"
+    embed = discord.Embed(
+        title="资源回溯",
+        description=(
+            f"**资源回溯码:** `{code}`\n"
+            f"**标题:** {record.get('name', '?')}\n"
+            f"**作者:** <@{record.get('uploader_id', 0)}>\n"
+            f"**上传时间:** {_format_beijing_minute(record.get('upload_time'))}\n\n"
+            f"**最近领取**\n{log_text}"
+        )[:4000],
+        color=discord.Color.orange(),
+    )
+    return embed
+
+
+class PersistentStorageCardView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="回溯",
+        style=discord.ButtonStyle.primary,
+        custom_id="storage_card_trace",
+    )
+    async def trace_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_island_owner(interaction):
+            await interaction.response.send_message("仅岛主可回溯。", ephemeral=True)
+            return
+        file_id, record = _find_record_by_storage_card(interaction.message.id)
+        if not record:
+            await interaction.response.send_message("找不到对应资源。", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            embed=_build_resource_trace_embed(file_id, record),
+            ephemeral=True,
+        )
+
 
 # ─── FAQ 常见问题 ───
 # 结构: { "keyword": "answer", ... }
@@ -729,7 +902,7 @@ async def _ingest_uploaded_files(
                 filename=att.filename,
             )
             storage_msg = await storage_channel.send(
-                content=f"📁 {att.filename} | 上传者: {interaction.user.display_name} (ID: {interaction.user.id})",
+                content=f"{att.filename} | 上传者: {interaction.user.display_name} (ID: {interaction.user.id})",
                 file=discord_file,
             )
             attachment_records.append({
@@ -757,7 +930,13 @@ async def _ingest_uploaded_files(
         if password:
             existing.setdefault("conditions", {})["password"] = password
         existing["uploader_name"] = interaction.user.display_name
+        existing.setdefault("updates", []).append({
+            "time": _beijing_now().isoformat(),
+            "files": [a["custom_name"] for a in attachment_records],
+        })
+        _ensure_resource_code(existing)
         save_records()
+        await _upsert_storage_card(interaction.guild, existing_id, existing)
         if existing.get("status") == "published":
             await _refresh_published_card(interaction, existing_id, existing)
             names = "、".join(a["custom_name"] for a in attachment_records)
@@ -790,8 +969,12 @@ async def _ingest_uploaded_files(
         "published_msg_id": None,
         "attachments": attachment_records,
         "upload_time": _beijing_now().isoformat(),
+        "resource_code": _new_resource_code(),
+        "updates": [],
+        "storage_card_msg_id": None,
     }
     save_records()
+    await _upsert_storage_card(interaction.guild, draft_id, file_records[draft_id])
     await _show_draft_setup(interaction, draft_id, has_previous=False)
 
 
@@ -1009,7 +1192,7 @@ async def _pack_attachments_to_zip(interaction: discord.Interaction, file_id: st
     discord_file = discord.File(fp=zip_buffer, filename=zip_name)
     storage_channel = await get_or_create_storage_channel(guild)
     storage_msg = await storage_channel.send(
-        content=f"📦 {zip_name} | 整合ZIP | 上传者: {interaction.user.display_name}",
+        content=f"{zip_name} | 整合ZIP | 上传者: {interaction.user.display_name}",
         file=discord_file,
     )
 
@@ -1021,10 +1204,12 @@ async def _pack_attachments_to_zip(interaction: discord.Interaction, file_id: st
         "size": total_zip_size,
     }]
     record["size"] = total_zip_size
+    _ensure_resource_code(record)
     save_records()
+    await _upsert_storage_card(interaction.guild, file_id, record)
 
     await interaction.followup.send(
-        f"✅ 已将 {len(attachments)} 个附件整合为 **{zip_name}** ({_format_size(total_zip_size)})",
+        f"已将 {len(attachments)} 个附件整合为 **{zip_name}** ({_format_size(total_zip_size)})",
         ephemeral=True,
     )
 
@@ -1116,8 +1301,9 @@ class RenameFileModal(discord.ui.Modal, title="修改文件标题"):
             return
         record["name"] = self.new_name.value.strip()
         save_records()
+        await _upsert_storage_card(interaction.guild, self.file_id, record)
         await interaction.response.send_message(
-            f"✅ 文件标题已修改为：**{record['name']}**",
+            f"文件标题已修改为：**{record['name']}**",
             ephemeral=True,
         )
 
@@ -1152,8 +1338,9 @@ class RenameAttachmentsModal(discord.ui.Modal, title="修改附件名称"):
                 record["attachments"][i]["custom_name"] = field.value.strip()
                 changed.append(field.value.strip())
         save_records()
+        await _upsert_storage_card(interaction.guild, self.file_id, record)
         await interaction.response.send_message(
-            f"✅ 已更新 {len(changed)} 个附件名称",
+            f"已更新 {len(changed)} 个附件名称",
             ephemeral=True,
         )
 
@@ -1343,9 +1530,10 @@ async def _publish_file(interaction: discord.Interaction, file_id: str, record: 
         }
         save_records()
         save_channel_published()
+        await _upsert_storage_card(interaction.guild, file_id, record)
 
         await interaction.followup.send(
-            f"✅ 文件 **{record['name']}** 已发布到频道！",
+            f"文件 **{record['name']}** 已发布到频道！",
             ephemeral=True,
         )
     except Exception as e:
@@ -1585,9 +1773,15 @@ async def _send_attachment_to_user(interaction: discord.Interaction, record: dic
 
 
 def _log_download(interaction: discord.Interaction, record: dict, file_label: str):
-    """记录下载日志"""
+    record_id = None
+    for fid, rec in file_records.items():
+        if rec is record:
+            record_id = fid
+            break
     download_logs.append({
         "file_id": record.get("published_msg_id", "?"),
+        "record_id": record_id,
+        "resource_code": record.get("resource_code"),
         "file_name": record.get("name", "?"),
         "file_label": file_label,
         "downloader_id": interaction.user.id,
@@ -1595,7 +1789,7 @@ def _log_download(interaction: discord.Interaction, record: dict, file_label: st
         "channel_id": interaction.channel.id,
         "uploader_id": record.get("uploader_id", "?"),
         "uploader_name": record.get("uploader_name", "?"),
-        "timestamp": datetime.now().isoformat(),
+        "timestamp": _beijing_now().isoformat(),
     })
     save_download_logs()
 
@@ -3646,6 +3840,7 @@ if __name__ == "__main__":
         bot.add_view(PersistentReportReviewView())
         bot.add_view(PersistentEvidenceView())
         bot.add_view(PublishedFileView())
+        bot.add_view(PersistentStorageCardView())
 
         # 启动心跳任务
         bot.heartbeat_task = asyncio.create_task(heartbeat())
