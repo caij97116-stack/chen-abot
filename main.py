@@ -9,7 +9,7 @@ from discord.ext import commands
 from discord import app_commands
 from aiohttp import web
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 # 配置日志
@@ -158,6 +158,12 @@ points_data: dict = {}
 # 签到频道消息: { "channel_id": "message_id" }
 checkin_channel_messages: dict = {}
 CHECKIN_CHANNEL_KEYWORD = "签到"  # 签到频道名称关键词
+BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _beijing_now() -> datetime:
+    return datetime.now(BEIJING_TZ)
+
 
 def load_points():
     global points_data
@@ -193,7 +199,11 @@ def save_checkin_channels():
 
 
 def _checkin_today() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    return _beijing_now().strftime("%Y-%m-%d")
+
+
+def _checkin_yesterday() -> str:
+    return (_beijing_now() - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
 def _empty_checkin_record() -> dict:
@@ -235,7 +245,7 @@ def _live_streak(user_data: dict) -> int:
     if not last:
         return 0
     today = _checkin_today()
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = _checkin_yesterday()
     if last in (today, yesterday):
         return int(user_data.get("streak") or 0)
     return 0
@@ -2196,7 +2206,7 @@ async def setup_checkin_channels():
                     "也可以使用 `/签到`、`/积分`、`/签到天数`。",
         color=discord.Color.green(),
     )
-    checkin_embed.set_footer(text="每天只能签到一次，UTC+8 零点刷新")
+    checkin_embed.set_footer(text="每天只能签到一次，北京时间 0 点刷新")
 
     for guild in bot.guilds:
         for channel in guild.text_channels:
@@ -2249,7 +2259,7 @@ async def _do_checkin(interaction: discord.Interaction):
         )
         return
 
-    yesterday = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    yesterday = _checkin_yesterday()
     if user_data.get("last_checkin") == yesterday:
         user_data["streak"] = user_data.get("streak", 0) + 1
     else:
