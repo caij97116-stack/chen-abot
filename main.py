@@ -1355,12 +1355,10 @@ async def _publish_file(interaction: discord.Interaction, file_id: str, record: 
 
 # ─── 公开卡片构建 ───
 
-def _build_published_card(record: dict, file_id: str):
-    """构建公开的发布卡片（embed + 带下拉选择器的 view）"""
-    cond_desc = _build_condition_description(record["conditions"])
+def _build_published_card(record: dict, file_id: str, persistent: bool = True):
+    cond_desc = _build_condition_description(record.get("conditions") or {})
     desc = record.get("description", "") or "（无说明）"
-    attach_count = len(record["attachments"])
-
+    attach_count = len(record.get("attachments") or [])
     embed = discord.Embed(
         title=f"📁 {record['name']}",
         description=f"{desc[:1000]}\n\n"
@@ -1370,134 +1368,154 @@ def _build_published_card(record: dict, file_id: str):
         color=discord.Color.purple(),
         timestamp=datetime.fromisoformat(record["upload_time"]) if record.get("upload_time") else datetime.now(),
     )
-    embed.set_footer(text=f"上传者: {record.get('uploader_name', '未知')} | 选择文件后点击下载")
-
-    view = PublishedFileView(file_id, record)
+    embed.set_footer(text=f"上传者: {record.get('uploader_name', '未知')} | 先满足条件，再选择文件后下载")
+    view = PublishedFileView(file_id, record, persistent=persistent)
     return embed, view
 
 
+_download_selections: dict = {}
+
+
+def _selection_key(interaction: discord.Interaction, file_id: str = "") -> tuple:
+    return (interaction.user.id, str(interaction.channel.id), file_id or "")
+
+
+def _resolve_published_record(interaction: discord.Interaction, file_id: str = ""):
+    if file_id and file_id in file_records:
+        return file_id, file_records[file_id]
+    channel_id = str(interaction.channel.id)
+    pub_info = channel_published.get(channel_id)
+    if pub_info:
+        rec = file_records.get(pub_info.get("file_id"))
+        if rec:
+            return pub_info["file_id"], rec
+    return None, None
+
+
+async def _check_download_prereqs(interaction: discord.Interaction, record: dict) -> list:
+    conditions = record.get("conditions") or {}
+    failed = []
+    if conditions.get("require_like_first"):
+        if not await _check_user_liked_first(interaction):
+            failed.append("需要给首楼点赞")
+    if conditions.get("require_comment_first"):
+        min_len = conditions.get("min_comment_length", 1)
+        if not await _check_user_comment_length(interaction, min_len):
+            failed.append(f"需要评论首楼至少 {min_len} 字")
+    return failed
+
+
+def _selected_indices(interaction: discord.Interaction, record: dict, file_id: str = "") -> list:
+    values = _download_selections.get(_selection_key(interaction, file_id), ["file_0"])
+    attachments = record.get("attachments") or []
+    indices = []
+    for value in values:
+        if isinstance(value, str) and value.startswith("file_"):
+            try:
+                idx = int(value.split("_")[1])
+            except ValueError:
+                continue
+            if 0 <= idx < len(attachments) and idx not in indices:
+                indices.append(idx)
+    if not indices and attachments:
+        indices = [0]
+    return indices
+
+
+async def _deliver_selected_files(interaction: discord.Interaction, record: dict, indices: list):
+    success = 0
+    for idx in indices:
+        await _send_attachment_to_user(interaction, record, idx)
+        success += 1
+    if success > 0:
+        await interaction.followup.send(f"已发送 {success} 个文件", ephemeral=True)
+    else:
+        await interaction.followup.send("未选择有效文件或发送失败", ephemeral=True)
+
+
+async def _start_download_flow(interaction: discord.Interaction, file_id: str, record: dict, already_deferred: bool = False):
+    failed = await _check_download_prereqs(interaction, record)
+    if failed:
+        text = "前置条件未满足：" + "，".join(failed)
+        if already_deferred:
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
+        return
+    indices = _selected_indices(interaction, record, file_id)
+    password = (record.get("conditions") or {}).get("password")
+    if password:
+        if already_deferred:
+            await interaction.followup.send("前置条件已通过。请再点一次下载以填写密码。", ephemeral=True)
+            return
+        await interaction.response.send_modal(DownloadPasswordModal(file_id, indices, password))
+        return
+    if not already_deferred:
+        await interaction.response.defer(ephemeral=True)
+    await _deliver_selected_files(interaction, record, indices)
+
+
 class PublishedFileView(discord.ui.View):
-    """公开卡片：文件下拉选择 + 密码输入 + 下载按钮（持久化）"""
-
-    def __init__(self, file_id: str = "", record: dict = None):
-        super().__init__(timeout=None)  # 持久化
+    def __init__(self, file_id: str = "", record: dict = None, persistent: bool = True):
+        super().__init__(timeout=None if persistent else 300)
         self._file_id = file_id
-        self._record = record
-        self._password = None  # 用户输入的密码（仅当前会话有效）
-
-        # 构建选项（在 build 时设置）
         options = []
         if record:
-            for i, att in enumerate(record.get("attachments", [])):
+            for i, att in enumerate(record.get("attachments", [])[:25]):
                 options.append(discord.SelectOption(
-                    label=f"📎 {att['custom_name'][:80]}",
-                    description=f"{_format_size(att['size'])}",
+                    label=att["custom_name"][:80],
+                    description=_format_size(att["size"]),
                     value=f"file_{i}",
                 ))
-
-        self.select_menu = discord.ui.Select(
-            placeholder=f"选择要下载的文件（可多选，共 {len(options)} 项）" if options else "选择文件",
-            options=options if options else [discord.SelectOption(label="—", value="none")],
-            custom_id="pub_file_select",
-            row=0,
-            min_values=1,
-            max_values=max(len(options), 1) if options else 1,
-        )
+        select_kwargs = {
+            "placeholder": f"选择要下载的文件（可多选，共 {len(options)} 项）" if options else "选择文件",
+            "options": options if options else [discord.SelectOption(label="—", value="none")],
+            "row": 0,
+            "min_values": 1,
+            "max_values": max(len(options), 1) if options else 1,
+        }
+        if persistent:
+            select_kwargs["custom_id"] = "pub_file_select"
+        self.select_menu = discord.ui.Select(**select_kwargs)
         self.select_menu.callback = self.on_select
         self.add_item(self.select_menu)
-
-        self.password_btn = discord.ui.Button(
-            label="🔒 输入密码",
-            style=discord.ButtonStyle.secondary,
-            custom_id="pub_file_password",
-            row=1,
-        )
-        self.password_btn.callback = self.on_password_btn
-        self.add_item(self.password_btn)
-
-        self.download_btn = discord.ui.Button(
-            label="⬇️ 下载",
-            style=discord.ButtonStyle.primary,
-            custom_id="pub_file_download",
-            row=1,
-        )
+        button_kwargs = {
+            "label": "下载",
+            "style": discord.ButtonStyle.primary,
+            "row": 1,
+        }
+        if persistent:
+            button_kwargs["custom_id"] = "pub_file_download"
+        self.download_btn = discord.ui.Button(**button_kwargs)
         self.download_btn.callback = self.on_download
         self.add_item(self.download_btn)
 
-        self.selected_values = ["file_0"]
-
     async def on_select(self, interaction: discord.Interaction):
-        self.selected_values = self.select_menu.values
+        values = []
+        if hasattr(interaction, "data") and interaction.data:
+            values = list(interaction.data.get("values") or [])
+        if not values:
+            values = list(self.select_menu.values or [])
+        _download_selections[_selection_key(interaction, self._file_id)] = values
         await interaction.response.defer()
 
-    async def on_password_btn(self, interaction: discord.Interaction):
-        """打开密码输入框"""
-        await interaction.response.send_modal(PublicPasswordModal(self))
-
     async def on_download(self, interaction: discord.Interaction):
-        await interaction.response.defer(ephemeral=True)
-
-        # 从频道发布记录中查找 file_id
-        channel_id = str(interaction.channel.id)
-        pub_info = channel_published.get(channel_id)
-        if not pub_info:
-            await interaction.followup.send("❌ 发布记录已过期。", ephemeral=True)
-            return
-
-        record = file_records.get(pub_info["file_id"])
+        file_id, record = _resolve_published_record(interaction, self._file_id)
         if not record:
-            await interaction.followup.send("❌ 文件记录已丢失。", ephemeral=True)
+            await interaction.response.send_message("发布记录已过期。", ephemeral=True)
             return
-
-        # 检查条件 — 对所有人（含上传者）强制执行
-        conditions = record.get("conditions", {})
-        failed_reasons = []
-
-        if conditions.get("password"):
-            if not self._password:
-                failed_reasons.append("需要输入密码（点击 🔒输入密码 按钮）")
-            elif self._password != conditions["password"]:
-                failed_reasons.append("密码错误")
-        if conditions.get("require_like_first"):
-            if not await _check_user_liked_first(interaction):
-                failed_reasons.append("需要给首楼点赞")
-        if conditions.get("require_comment_first"):
-            min_len = conditions.get("min_comment_length", 1)
-            if not await _check_user_comment_length(interaction, min_len):
-                failed_reasons.append(f"需要评论首楼至少 {min_len} 字")
-
-        if failed_reasons:
-            await interaction.followup.send(
-                "❌ " + "，".join(failed_reasons),
-                ephemeral=True,
-            )
-            return
-
-        # 根据选择发送多个文件
-        attachments = record.get("attachments", [])
-        success_count = 0
-        for value in self.selected_values:
-            if value.startswith("file_"):
-                idx = int(value.split("_")[1])
-                if idx < len(attachments):
-                    await _send_attachment_to_user(interaction, record, idx)
-                    success_count += 1
-
-        if success_count > 0:
-            await interaction.followup.send(f"✅ 已发送 {success_count} 个文件", ephemeral=True)
-        else:
-            await interaction.followup.send("❌ 未选择有效文件或发送失败", ephemeral=True)
+        await _start_download_flow(interaction, file_id, record)
 
 
-class PublicPasswordModal(discord.ui.Modal, title="输入下载密码"):
-    """公开卡片上的密码输入框"""
-
-    def __init__(self, view: PublishedFileView):
+class DownloadPasswordModal(discord.ui.Modal, title="填写下载密码"):
+    def __init__(self, file_id: str, indices: list, expected: str):
         super().__init__()
-        self._view = view
+        self.file_id = file_id
+        self.indices = indices
+        self.expected = expected
         self.pwd = discord.ui.TextInput(
-            label="请输入下载密码",
-            placeholder="输入上传者设置的密码",
+            label="下载密码",
+            placeholder="前置已通过，请填写密码",
             style=discord.TextStyle.short,
             required=True,
             max_length=50,
@@ -1505,8 +1523,15 @@ class PublicPasswordModal(discord.ui.Modal, title="输入下载密码"):
         self.add_item(self.pwd)
 
     async def on_submit(self, interaction: discord.Interaction):
-        self._view._password = self.pwd.value.strip()
-        await interaction.response.send_message("✅ 密码已记录，现在可以点击下载了", ephemeral=True)
+        if self.pwd.value.strip() != self.expected:
+            await interaction.response.send_message("密码不正确。", ephemeral=True)
+            return
+        record = file_records.get(self.file_id)
+        if not record:
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        await _deliver_selected_files(interaction, record, self.indices)
 
 
 async def _send_attachment_to_user(interaction: discord.Interaction, record: dict, idx: int):
@@ -1576,174 +1601,33 @@ def _log_download(interaction: discord.Interaction, record: dict, file_label: st
 
 
 # ═══════════════════════════════════════════
-#  /获取文件 - 查看当前频道已发布文件列表
+#  /获取文件 - 与公开卡片同一套获取界面
 # ═══════════════════════════════════════════
 
-class GetFileView(discord.ui.View):
-    """文件列表视图，每个已发布文件一个获取按钮"""
-
-    def __init__(self, channel_files: dict, interaction_user_id: int, password: Optional[str]):
-        super().__init__(timeout=300)
-        self.channel_files = channel_files
-        self.interaction_user_id = interaction_user_id
-        self.password = password
-
-        sorted_files = sorted(
-            channel_files.items(),
-            key=lambda x: x[1].get("upload_time", ""),
-            reverse=True,
-        )
-
-        for i, (file_id, rec) in enumerate(sorted_files[:25]):
-            btn = discord.ui.Button(
-                label=f"获取 {rec['name'][:60]}",
-                style=discord.ButtonStyle.primary,
-                custom_id=file_id,
-                row=i // 5,
-            )
-            btn.callback = self.make_callback(file_id)
-            self.add_item(btn)
-
-    def make_callback(self, file_id: str):
-        async def callback(interaction: discord.Interaction):
-            await interaction.response.defer(ephemeral=True)
-
-            if interaction.user.id != self.interaction_user_id:
-                await interaction.followup.send("这不是你的操作。", ephemeral=True)
-                return
-
-            record = self.channel_files.get(file_id)
-            if not record:
-                await interaction.followup.send("文件记录已丢失。", ephemeral=True)
-                return
-
-            conditions = record.get("conditions", {})
-            failed_reasons = []
-
-            if conditions.get("password"):
-                if not self.password:
-                    failed_reasons.append("需要输入密码（使用 /获取文件 密码:xxx）")
-                elif self.password != conditions["password"]:
-                    failed_reasons.append("密码错误")
-
-            if conditions.get("require_like_first"):
-                if not await _check_user_liked_first(interaction):
-                    failed_reasons.append("需要给首楼点赞")
-
-            if conditions.get("require_comment_first"):
-                min_len = conditions.get("min_comment_length", 1)
-                if not await _check_user_comment_length(interaction, min_len):
-                    failed_reasons.append(f"需要评论首楼至少 {min_len} 字")
-
-            if failed_reasons:
-                await interaction.followup.send(
-                    "❌ " + "，".join(failed_reasons),
-                    ephemeral=True,
-                )
-                return
-
-            # 发送第一个附件（兼容旧行为：点击获取按钮默认发送第一个文件）
-            attachments = record.get("attachments", [])
-            if attachments:
-                await _send_attachment_to_user(interaction, record, 0)
-            else:
-                await interaction.followup.send("❌ 没有可用的附件。", ephemeral=True)
-
-        return callback
-
-
-@bot.tree.command(name="获取文件", description="查看当前频道已发布文件列表并获取")
-@app_commands.describe(
-    密码="如果上传者设置了密码，请在此输入",
-)
-async def get_file(
-    interaction: discord.Interaction,
-    密码: Optional[str] = None,
-):
-    """显示频道内已发布文件，可点击按钮获取"""
+@bot.tree.command(name="获取文件", description="用与公开卡片相同的界面获取当前帖的文件")
+async def get_file(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-
-    # 非上传者只能看到已发布文件；上传者可以看到自己所有文件（含草稿）
-    channel_files = {
-        fid: rec for fid, rec in file_records.items()
-        if str(rec.get("source_channel_id")) == str(interaction.channel.id)
-        and (rec.get("status") == "published" or rec.get("uploader_id") == interaction.user.id)
-    }
-
-    if not channel_files:
-        await interaction.followup.send("📭 当前频道还没有已发布文件。", ephemeral=True)
+    channel_id = str(interaction.channel.id)
+    file_id = None
+    record = None
+    pub = channel_published.get(channel_id)
+    if pub:
+        rec = file_records.get(pub.get("file_id"))
+        if rec and rec.get("status") == "published":
+            file_id, record = pub["file_id"], rec
+    if not record:
+        published = [
+            (fid, rec) for fid, rec in file_records.items()
+            if str(rec.get("source_channel_id")) == channel_id
+            and rec.get("status") == "published"
+        ]
+        if published:
+            published.sort(key=lambda x: x[1].get("upload_time", ""), reverse=True)
+            file_id, record = published[0]
+    if not record:
+        await interaction.followup.send("当前频道还没有已发布文件。", ephemeral=True)
         return
-
-    sorted_files = sorted(
-        channel_files.items(),
-        key=lambda x: x[1].get("upload_time", ""),
-        reverse=True,
-    )
-
-    embed = discord.Embed(
-        title=f"📋 文件列表（共 {len(sorted_files)} 个）",
-        color=discord.Color.blue(),
-    )
-
-    for file_id, rec in sorted_files:
-        cond_desc = _build_condition_description(rec.get("conditions", {}))
-        raw_time = rec.get("upload_time", "")
-        try:
-            dt = datetime.fromisoformat(raw_time)
-            upload_time = dt.strftime("%Y-%m-%d %H:%M")
-        except Exception:
-            upload_time = raw_time[:16] if len(raw_time) >= 16 else "未知"
-        is_uploader = interaction.user.id == rec.get("uploader_id")
-        status_label = rec.get("status", "published")
-        draft_tag = " [草稿]" if status_label == "draft" else ""
-
-        attach_count = len(rec.get("attachments", []))
-        attach_info = f"附件: {attach_count} 个" if attach_count > 0 else ""
-
-        # 条件检查
-        met_parts = []
-        unmet_parts = []
-        conditions = rec.get("conditions", {})
-
-        if is_uploader:
-            met_parts.append("✅ 上传者（无条件）")
-        else:
-            if conditions.get("password"):
-                if 密码 and 密码 == conditions["password"]:
-                    met_parts.append("✅ 密码正确")
-                else:
-                    unmet_parts.append("❌ 需要密码")
-            if conditions.get("require_like_first"):
-                liked = await _check_user_liked_first(interaction)
-                if liked:
-                    met_parts.append("✅ 已点赞")
-                else:
-                    unmet_parts.append("❌ 未点赞")
-            if conditions.get("require_comment_first"):
-                min_len = conditions.get("min_comment_length", 1)
-                met = await _check_user_comment_length(interaction, min_len)
-                if met:
-                    met_parts.append(f"✅ 已评论（≥{min_len}字）")
-                else:
-                    unmet_parts.append(f"❌ 评论不足{min_len}字")
-
-            if not conditions.get("password") and not conditions.get("require_like_first") and not conditions.get("require_comment_first"):
-                met_parts.append("✅ 无条件")
-
-        status = "\n".join(met_parts + unmet_parts) if (met_parts or unmet_parts) else "✅ 无条件"
-
-        embed.add_field(
-            name=f"📁 {rec.get('name', '?')}{draft_tag}",
-            value=f"上传者: <@{rec.get('uploader_id', '?')}>\n"
-                  f"大小: {_format_size(rec.get('size', 0))}\n"
-                  f"{attach_info}\n"
-                  f"时间: {upload_time}\n"
-                  f"{status}",
-            inline=False,
-        )
-
-    embed.set_footer(text="点击下方按钮获取文件（默认获取第一个附件）")
-    view = GetFileView(channel_files, interaction.user.id, 密码)
+    embed, view = _build_published_card(record, file_id, persistent=False)
     await interaction.followup.send(embed=embed, view=view, ephemeral=True)
 
 
