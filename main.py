@@ -433,7 +433,8 @@ async def setup_quiz_channels():
     quiz_embed = discord.Embed(
         title="📝 入群审核答题",
         description="点击下方按钮开始答题，需要 **答完题库全部题目且全部答对** 才能通过审核。\n\n"
-                    "如果按钮无法使用，请使用 `/答题` 命令。",
+                    "点「查询冷却」可查看自己还要等多久。\n"
+                    "如果按钮无法使用，请使用 `/答题` 或 `/冷却` 命令。",
         color=discord.Color.blue(),
     )
     quiz_embed.set_footer(text="答题消息仅自己可见")
@@ -1593,6 +1594,15 @@ class PersistentQuizView(discord.ui.View):
     async def quiz_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _do_quiz(interaction)
 
+    @discord.ui.button(
+        label="查询冷却",
+        style=discord.ButtonStyle.secondary,
+        emoji="⏳",
+        custom_id="persistent_quiz_cooldown",
+    )
+    async def cooldown_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_cooldown_check(interaction)
+
 
 def _build_question_embed(q: dict, idx: int, total: int) -> discord.Embed:
     """构建单题 embed"""
@@ -1723,7 +1733,8 @@ async def _show_results(interaction: discord.Interaction, session: dict):
         )
         if cooldown_minutes > 0:
             description += (
-                f"\n\n⏳ 第 {cooldown['fail_count']} 次失败，需要等待 **{cooldown_minutes} 分钟** 后才能重新答题"
+                f"\n\n⏳ 第 {cooldown['fail_count']} 次失败，需要等待 **{cooldown_minutes} 分钟** 后才能重新答题\n"
+                f"可点下方「查询冷却」随时查看剩余时间。"
             )
         else:
             description += "\n\n你可以立即重新答题"
@@ -1735,17 +1746,19 @@ async def _show_results(interaction: discord.Interaction, session: dict):
         color=color,
     )
 
-    msg = await interaction.response.edit_message(embed=embed, view=None)
+    result_view = None if passed else PersistentQuizView()
+    msg = await interaction.response.edit_message(embed=embed, view=result_view)
 
-    # 结果消息一定时间后自动删除（仅答题者可见，超时消失）
-    async def _auto_delete():
-        await asyncio.sleep(30)
-        try:
-            await msg.delete()
-        except Exception:
-            pass
+    # 通过结果一段时间后自动删除；失败结果保留按钮供查询冷却
+    if passed:
+        async def _auto_delete():
+            await asyncio.sleep(30)
+            try:
+                await msg.delete()
+            except Exception:
+                pass
 
-    asyncio.create_task(_auto_delete())
+        asyncio.create_task(_auto_delete())
 
     # 通过后分配身份组
     if passed:
@@ -1761,6 +1774,59 @@ async def _show_results(interaction: discord.Interaction, session: dict):
 
     # 清理 session
     quiz_sessions.pop(user_id, None)
+
+
+def _get_quiz_cooldown_status(user_id: int) -> tuple[bool, int, int]:
+    """返回 (是否在冷却中, 剩余分钟, 失败次数)"""
+    cooldown = quiz_cooldowns.get(str(user_id))
+    if not cooldown:
+        return False, 0, 0
+    fail_count = int(cooldown.get("fail_count") or 0)
+    until_raw = cooldown.get("cooldown_until")
+    if not until_raw:
+        return False, 0, fail_count
+    try:
+        until = datetime.fromisoformat(until_raw)
+    except ValueError:
+        return False, 0, fail_count
+    remaining = until - datetime.now()
+    if remaining.total_seconds() <= 0:
+        return False, 0, fail_count
+    minutes = int(remaining.total_seconds() // 60) + 1
+    return True, minutes, fail_count
+
+
+async def _do_cooldown_check(interaction: discord.Interaction):
+    """查询答题冷却，供按钮和 /冷却 命令共用"""
+    role = discord.utils.get(interaction.user.roles, name=QUIZ_VERIFIED_ROLE)
+    if role:
+        await interaction.response.send_message(
+            f"✅ 你已经通过了入群审核，拥有「{QUIZ_VERIFIED_ROLE}」身份组，没有冷却。",
+            ephemeral=True,
+        )
+        return
+
+    in_cooldown, minutes, fail_count = _get_quiz_cooldown_status(interaction.user.id)
+    if in_cooldown:
+        await interaction.response.send_message(
+            f"⏳ 你还在冷却中。\n\n"
+            f"失败次数：**{fail_count}**\n"
+            f"还需等待约 **{minutes} 分钟** 才能重新答题。",
+            ephemeral=True,
+        )
+        return
+
+    if fail_count > 0:
+        await interaction.response.send_message(
+            f"✅ 当前没有冷却，可以重新答题。\n\n累计失败次数：**{fail_count}**",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(
+        "✅ 当前没有冷却，可以直接开始答题。",
+        ephemeral=True,
+    )
 
 
 async def _do_quiz(interaction: discord.Interaction):
@@ -1785,20 +1851,14 @@ async def _do_quiz(interaction: discord.Interaction):
         return
 
     # 检查冷却时间
-    cooldown = quiz_cooldowns.get(str(user_id))
-    if cooldown and cooldown.get("cooldown_until"):
-        try:
-            until = datetime.fromisoformat(cooldown["cooldown_until"])
-            if until > datetime.now():
-                remaining = until - datetime.now()
-                minutes = int(remaining.total_seconds() // 60) + 1
-                await interaction.response.send_message(
-                    f"⏳ 你还需要等待约 **{minutes} 分钟** 才能重新答题。",
-                    ephemeral=True,
-                )
-                return
-        except ValueError:
-            pass
+    in_cooldown, minutes, fail_count = _get_quiz_cooldown_status(user_id)
+    if in_cooldown:
+        await interaction.response.send_message(
+            f"⏳ 你还需要等待约 **{minutes} 分钟** 才能重新答题。\n"
+            f"失败次数：**{fail_count}**。可点「查询冷却」或使用 `/冷却` 随时查看。",
+            ephemeral=True,
+        )
+        return
 
     # 检查题库
     if not quiz_questions:
@@ -1832,6 +1892,31 @@ async def _do_quiz(interaction: discord.Interaction):
 @bot.tree.command(name="答题", description="开始入群审核答题，须答完全部题目且全部答对（备用命令）")
 async def start_quiz(interaction: discord.Interaction):
     await _do_quiz(interaction)
+
+
+@bot.tree.command(name="冷却", description="查询自己的答题冷却剩余时间")
+async def cooldown_command(interaction: discord.Interaction):
+    await _do_cooldown_check(interaction)
+
+
+MASK_REMINDER_TEXT = (
+    "截图或发日志前，先把这些打码：\n"
+    "- API Key / Token / Cookie / 密码\n"
+    "- 服务器 IP、端口、面板登录地址\n"
+    "- 邮箱、手机号、真实姓名等个人信息\n\n"
+    "可以留：系统环境、启动方式、模型名、预设名、报错原文、自己试过的步骤。\n"
+    "密钥一旦进公屏，立刻撤回并告诉管理。"
+)
+
+
+@bot.tree.command(name="提醒遮挡", description="提醒截图前遮挡密钥、Token 和服务器地址")
+async def mask_reminder(interaction: discord.Interaction):
+    embed = discord.Embed(
+        title="截图前先遮挡",
+        description=MASK_REMINDER_TEXT,
+        color=discord.Color.orange(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ═══════════════════════════════════════════
