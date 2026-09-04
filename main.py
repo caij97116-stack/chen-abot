@@ -643,33 +643,80 @@ def _format_size(size_bytes: int) -> str:
     return f"{size_bytes:.1f} TB"
 
 
-# ─── 阶段1: 上传文件命令（支持多附件）───
+# ─── 阶段1: 上传文件（表单内选文件）───
 
-@bot.tree.command(name="上传文件", description="上传文件到当前频道（支持多附件）")
-@app_commands.describe(
-    文件1="要上传的文件",
-    文件2="（可选）第二个文件",
-    文件3="（可选）第三个文件",
-    文件4="（可选）第四个文件",
-    文件5="（可选）第五个文件",
-)
-async def upload_file(
+def _supports_modal_file_upload() -> bool:
+    return hasattr(discord.ui, "FileUpload") and hasattr(discord.ui, "Label")
+
+
+class UploadFileModal(discord.ui.Modal, title="上传文件"):
+    def __init__(self):
+        super().__init__()
+        self.file_upload = discord.ui.FileUpload(
+            min_values=1,
+            max_values=10,
+            required=True,
+        )
+        self.add_item(discord.ui.Label(
+            text="选择文件",
+            description="一次最多 10 个",
+            component=self.file_upload,
+        ))
+        self.file_title = discord.ui.TextInput(
+            label="标题",
+            placeholder="不填则用第一个文件名",
+            style=discord.TextStyle.short,
+            required=False,
+            max_length=100,
+        )
+        self.add_item(self.file_title)
+        self.file_desc = discord.ui.TextInput(
+            label="说明",
+            placeholder="作者提示、注意事项，可不填",
+            style=discord.TextStyle.paragraph,
+            required=False,
+            max_length=1000,
+        )
+        self.add_item(self.file_desc)
+        self.file_password = discord.ui.TextInput(
+            label="密码",
+            placeholder="不填则无需密码",
+            style=discord.TextStyle.short,
+            required=False,
+            max_length=50,
+        )
+        self.add_item(self.file_password)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        attachments = list(self.file_upload.values or [])
+        if not attachments:
+            await interaction.response.send_message("请至少选择一个文件。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        title = (self.file_title.value or "").strip()
+        description = (self.file_desc.value or "").strip()
+        password = (self.file_password.value or "").strip() or None
+        await _ingest_uploaded_files(interaction, attachments, title, description, password)
+
+
+@bot.tree.command(name="上传文件", description="打开表单上传文件（标题、说明、密码都在表单里填）")
+async def upload_file(interaction: discord.Interaction):
+    if not _supports_modal_file_upload():
+        await interaction.response.send_message(
+            "当前 discord.py 不支持在表单里选文件，请升级到 2.7 或以上。",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_modal(UploadFileModal())
+
+
+async def _ingest_uploaded_files(
     interaction: discord.Interaction,
-    文件1: discord.Attachment,
-    文件2: discord.Attachment = None,
-    文件3: discord.Attachment = None,
-    文件4: discord.Attachment = None,
-    文件5: discord.Attachment = None,
+    attachments: list,
+    title: str = "",
+    description: str = "",
+    password: Optional[str] = None,
 ):
-    await interaction.response.defer(ephemeral=True)
-
-    # 收集所有附件
-    attachments = [文件1]
-    for a in [文件2, 文件3, 文件4, 文件5]:
-        if a is not None:
-            attachments.append(a)
-
-    # 上传所有文件到存储频道
     storage_channel = await get_or_create_storage_channel(interaction.guild)
     attachment_records = []
     total_size = 0
@@ -694,16 +741,12 @@ async def upload_file(
             total_size += att.size
         except Exception as e:
             logger.error(f"上传文件 {att.filename} 失败: {e}")
-            await interaction.followup.send(f"❌ 上传 {att.filename} 失败: {e}", ephemeral=True)
+            await interaction.followup.send(f"上传 {att.filename} 失败: {e}", ephemeral=True)
             return
 
-    # 生成草稿 ID（使用第一个附件存储消息的 ID）
     draft_id = attachment_records[0]["storage_msg_id"]
+    default_name = title or attachments[0].filename
 
-    # 默认文件名：取第一个附件名
-    default_name = attachments[0].filename
-
-    # 继承频道已有条件
     channel_files = {
         fid: rec for fid, rec in file_records.items()
         if str(rec.get("source_channel_id")) == str(interaction.channel.id)
@@ -714,12 +757,14 @@ async def upload_file(
     if has_previous:
         old_conditions = next(iter(channel_files.values())).get("conditions")
 
-    conditions = old_conditions if old_conditions else {
+    conditions = dict(old_conditions) if old_conditions else {
         "password": None,
         "require_like_first": False,
         "require_comment_first": False,
         "min_comment_length": 0,
     }
+    if password:
+        conditions["password"] = password
 
     file_records[draft_id] = {
         "name": default_name,
@@ -729,15 +774,13 @@ async def upload_file(
         "guild_id": interaction.guild.id,
         "size": total_size,
         "conditions": conditions,
-        "description": "",
+        "description": description,
         "status": "draft",
         "published_msg_id": None,
         "attachments": attachment_records,
-        "upload_time": datetime.now().isoformat(),
+        "upload_time": _beijing_now().isoformat(),
     }
     save_records()
-
-    # 显示阶段1完成 → 进入阶段2（设置条件）
     await _show_draft_setup(interaction, draft_id, has_previous)
 
 
