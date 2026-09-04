@@ -281,8 +281,7 @@ def save_download_logs():
         logger.error(f"保存下载日志失败: {e}")
 
 # ─── 答题系统 ───
-QUIZ_QUESTIONS_PER_ROUND = 5       # 每次答题出几道题
-QUIZ_MAX_ERRORS = 0                # 最多允许错几题（0 = 必须全对）
+QUIZ_MAX_ERRORS = 0                # 最多允许错几题（0 = 必须全对，且须答完全部题目）
 QUIZ_COOLDOWN_MINUTES = 25         # 每次失败后增加的冷却时间（分钟）
 QUIZ_QUESTION_TIMEOUT = 300        # 每道题限时（秒），默认 5 分钟
 QUIZ_VERIFIED_ROLE = "你过关！小岛居民"        # 答题通过后赋予的身份组
@@ -433,7 +432,7 @@ async def setup_quiz_channels():
     """在名称包含 QUIZ_CHANNEL_KEYWORD 的频道中发布答题按钮消息"""
     quiz_embed = discord.Embed(
         title="📝 入群审核答题",
-        description="点击下方按钮开始答题，需要 **全部答对** 才能通过审核。\n\n"
+        description="点击下方按钮开始答题，需要 **答完题库全部题目且全部答对** 才能通过审核。\n\n"
                     "如果按钮无法使用，请使用 `/答题` 命令。",
         color=discord.Color.blue(),
     )
@@ -1685,7 +1684,7 @@ async def _show_results(interaction: discord.Interaction, session: dict):
             wrong_nums.append(i + 1)
 
     errors = total - correct
-    passed = errors <= QUIZ_MAX_ERRORS
+    passed = errors <= QUIZ_MAX_ERRORS and len(answers) >= total
 
     # ── 冷却处理 ──
     cooldown = quiz_cooldowns.get(str(user_id), {"fail_count": 0, "cooldown_until": None})
@@ -1802,15 +1801,17 @@ async def _do_quiz(interaction: discord.Interaction):
             pass
 
     # 检查题库
-    if len(quiz_questions) < QUIZ_QUESTIONS_PER_ROUND:
+    if not quiz_questions:
         await interaction.response.send_message(
-            f"题库中题目不足 {QUIZ_QUESTIONS_PER_ROUND} 道，请联系管理员添加题目。",
+            "题库中没有题目，请联系管理员添加题目。",
             ephemeral=True,
         )
         return
 
-    # 随机抽题，开始答题
-    selected = random.sample(quiz_questions, QUIZ_QUESTIONS_PER_ROUND)
+    # 打乱全部题目后开始答题
+    selected = quiz_questions[:]
+    random.shuffle(selected)
+    total = len(selected)
     quiz_sessions[user_id] = {
         "questions": selected,
         "current_index": 0,
@@ -1819,8 +1820,8 @@ async def _do_quiz(interaction: discord.Interaction):
     }
 
     q = selected[0]
-    embed = _build_question_embed(q, 0, QUIZ_QUESTIONS_PER_ROUND)
-    view = QuizQuestionView(user_id, 0, QUIZ_QUESTIONS_PER_ROUND, interaction)
+    embed = _build_question_embed(q, 0, total)
+    view = QuizQuestionView(user_id, 0, total, interaction)
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
@@ -1828,7 +1829,7 @@ async def _do_quiz(interaction: discord.Interaction):
 #  /答题 - 备用命令（答题频道按钮失效时使用）
 # ═══════════════════════════════════════════
 
-@bot.tree.command(name="答题", description="开始入群审核答题（备用命令）")
+@bot.tree.command(name="答题", description="开始入群审核答题，须答完全部题目且全部答对（备用命令）")
 async def start_quiz(interaction: discord.Interaction):
     await _do_quiz(interaction)
 
