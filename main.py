@@ -1192,7 +1192,7 @@ class UploadFileModal(discord.ui.Modal, title="上传文件"):
         await _ingest_uploaded_files(interaction, attachments, title, description, password)
 
 
-@bot.tree.command(name="上传文件", description="打开表单上传文件（标题、说明、密码都在表单里填）")
+@bot.tree.command(name="上传文件", description="表单选文件，再设置条件、改名、打包后发布")
 async def upload_file(interaction: discord.Interaction):
     if not _supports_modal_file_upload():
         await interaction.response.send_message(
@@ -1257,15 +1257,7 @@ async def _ingest_uploaded_files(
         _ensure_resource_code(existing)
         save_records()
         await _upsert_storage_card(interaction.guild, existing_id, existing)
-        if existing.get("status") == "published":
-            await _refresh_published_card(interaction, existing_id, existing)
-            names = "、".join(a["custom_name"] for a in attachment_records)
-            await interaction.followup.send(
-                f"已追加 {len(attachment_records)} 个文件到 **{existing['name']}**：{names}\n公开卡片已更新。",
-                ephemeral=True,
-            )
-        else:
-            await _show_draft_setup(interaction, existing_id, has_previous=True)
+        await _show_draft_setup(interaction, existing_id, has_previous=True)
         return
 
     draft_id = attachment_records[0]["storage_msg_id"]
@@ -1448,7 +1440,7 @@ async def _show_draft_setup(interaction: discord.Interaction, file_id: str, has_
 
     hint = ""
     if has_previous:
-        hint = "\n💡 已继承频道上次的条件，可直接点击「⚡ 快速发布」"
+        hint = "\n已并入本帖资源。可继续改条件、打包或快速发布；发布后公开卡片才会更新。"
 
     embed = discord.Embed(
         title="⚙️ 阶段2: 设置获取条件",
@@ -1944,7 +1936,7 @@ async def _deliver_selected_files(interaction: discord.Interaction, record: dict
 async def _start_download_flow(interaction: discord.Interaction, file_id: str, record: dict, already_deferred: bool = False):
     failed = await _check_download_prereqs(interaction, record)
     if failed:
-        text = "前置条件未满足：" + "，".join(failed)
+        text = "未达到上传者设置的获取条件：" + "，".join(failed)
         if already_deferred:
             await interaction.followup.send(text, ephemeral=True)
         else:
@@ -2290,38 +2282,60 @@ async def trace_resource(
     await interaction.followup.send("没有匹配到资源码、下载人码或用户ID。", ephemeral=True)
 
 
-async def _check_user_liked_first(interaction: discord.Interaction) -> bool:
-    """检查用户是否给频道第一条消息点了赞（任意表情）"""
+async def _get_first_floor(channel) -> Optional[discord.Message]:
+    if channel is None:
+        return None
+    if isinstance(channel, discord.Thread):
+        starter = getattr(channel, "starter_message", None)
+        if starter:
+            return starter
+        try:
+            return await channel.fetch_message(channel.id)
+        except Exception:
+            pass
     try:
-        async for first_msg in interaction.channel.history(oldest_first=True, limit=1):
-            for reaction in first_msg.reactions:
-                async for user in reaction.users():
+        async for first_msg in channel.history(oldest_first=True, limit=1):
+            return first_msg
+    except Exception:
+        return None
+    return None
+
+
+async def _check_user_liked_first(interaction: discord.Interaction) -> bool:
+    try:
+        first_msg = await _get_first_floor(interaction.channel)
+        if not first_msg:
+            return False
+        if not first_msg.reactions:
+            try:
+                first_msg = await interaction.channel.fetch_message(first_msg.id)
+            except Exception:
+                pass
+        for reaction in first_msg.reactions:
+            try:
+                async for user in reaction.users(limit=None):
                     if user.id == interaction.user.id:
                         return True
-            return False
+            except Exception:
+                continue
         return False
-    except Exception:
+    except Exception as e:
+        logger.error(f"检查首楼点赞失败: {e}")
         return False
 
 
 async def _check_user_comment_length(interaction: discord.Interaction, min_length: int) -> bool:
-    """检查用户是否在首楼下发过至少 min_length 字的评论"""
     try:
-        async for first_msg in interaction.channel.history(oldest_first=True, limit=1):
-            first_msg_id = first_msg.id
-            async for msg in interaction.channel.history(after=first_msg, limit=200):
-                if msg.author.id != interaction.user.id:
-                    continue
-                ref = msg.reference
-                if ref is None:
-                    continue
-                ref_msg_id = getattr(ref, "message_id", None)
-                if ref_msg_id is None:
-                    continue
-                if ref_msg_id == first_msg_id:
-                    if len(msg.content) >= min_length:
-                        return True
+        first_msg = await _get_first_floor(interaction.channel)
+        if not first_msg:
             return False
+        need = max(int(min_length or 1), 1)
+        async for msg in interaction.channel.history(after=first_msg, limit=300):
+            if msg.author.id != interaction.user.id or msg.author.bot:
+                continue
+            text = (msg.content or "").strip()
+            if len(text) >= need:
+                return True
         return False
     except Exception as e:
         logger.error(f"检查评论长度失败: {e}")
@@ -4057,7 +4071,28 @@ def _purge_guild_reports(guild_id: str):
     save_report_counter()
 
 
-@bot.tree.command(name="清理测试数据", description="清空工单、审核频道和黑户地带公示，重置到最初状态（仅岛主）")
+def _purge_guild_files(guild_id: str, extra_channel_ids=None):
+    gid = str(guild_id)
+    removed_ids = set()
+    for fid, rec in list(file_records.items()):
+        if str(rec.get("guild_id")) == gid:
+            file_records.pop(fid, None)
+            removed_ids.add(str(fid))
+    extra = {str(cid) for cid in (extra_channel_ids or [])}
+    for cid in list(channel_published.keys()):
+        pub = channel_published.get(cid) or {}
+        if str(cid) in extra or str(pub.get("file_id") or "") in removed_ids:
+            channel_published.pop(cid, None)
+    download_logs[:] = [
+        log for log in download_logs
+        if str(log.get("record_id") or "") not in removed_ids
+    ]
+    save_records()
+    save_channel_published()
+    save_download_logs()
+
+
+@bot.tree.command(name="清理测试数据", description="清空工单、黑户地带、存储文件和帖子公开卡片（仅岛主）")
 async def cleanup_reports(interaction: discord.Interaction):
     if interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("只有岛主才能使用此命令。", ephemeral=True)
@@ -4067,6 +4102,8 @@ async def cleanup_reports(interaction: discord.Interaction):
     guild = interaction.guild
     guild_id = str(guild.id)
     deleted_threads = 0
+    deleted_cards = 0
+    card_channel_ids = set()
 
     for rec in list(report_data.values()):
         if rec.get("guild_id") != guild_id:
@@ -4087,23 +4124,74 @@ async def cleanup_reports(interaction: discord.Interaction):
             except Exception as e:
                 logger.warning(f"删除子频道失败: {e}")
 
+    seen_cards = set()
+    for rec in list(file_records.values()):
+        if str(rec.get("guild_id")) != guild_id:
+            continue
+        msg_id = rec.get("published_msg_id")
+        channel_id = rec.get("source_channel_id")
+        if not msg_id or not channel_id:
+            continue
+        key = (str(channel_id), str(msg_id))
+        if key in seen_cards:
+            continue
+        seen_cards.add(key)
+        channel = guild.get_channel(int(channel_id))
+        if channel is None:
+            continue
+        card_channel_ids.add(str(channel_id))
+        try:
+            msg = await channel.fetch_message(int(msg_id))
+            await msg.delete()
+            deleted_cards += 1
+        except Exception:
+            pass
+    for cid, pub in list(channel_published.items()):
+        msg_id = (pub or {}).get("message_id")
+        if not msg_id:
+            continue
+        key = (str(cid), str(msg_id))
+        if key in seen_cards:
+            continue
+        channel = guild.get_channel(int(cid)) if str(cid).isdigit() else None
+        if channel is None or channel.guild.id != guild.id:
+            continue
+        seen_cards.add(key)
+        card_channel_ids.add(str(cid))
+        try:
+            msg = await channel.fetch_message(int(msg_id))
+            await msg.delete()
+            deleted_cards += 1
+        except Exception:
+            pass
+
     review_channel = discord.utils.get(guild.text_channels, name=REPORT_REVIEW_CHANNEL_NAME)
     blacklist_channel = None
     for channel in guild.text_channels:
         if BLACKLIST_CHANNEL_KEYWORD in channel.name:
             blacklist_channel = channel
             break
+    storage_channel = None
+    storage_id = storage_channels.get(guild_id)
+    if storage_id:
+        storage_channel = guild.get_channel(int(storage_id))
+    if storage_channel is None:
+        storage_channel = discord.utils.get(guild.text_channels, name="📁-文件存储")
 
     cleared_review = await _wipe_channel_messages(review_channel)
     cleared_blacklist = await _wipe_channel_messages(blacklist_channel)
+    cleared_storage = await _wipe_channel_messages(storage_channel)
     _purge_guild_reports(guild_id)
+    _purge_guild_files(guild_id, extra_channel_ids=card_channel_ids)
 
     await interaction.followup.send(
-        f"清理完成，工单已回到最初状态。\n"
+        f"清理完成，工单和文件都回到最初状态。\n"
         f"已关闭举报子区 {deleted_threads} 个\n"
         f"审核频道已清空 {cleared_review} 条\n"
         f"黑户地带公示已清空 {cleared_blacklist} 条\n"
-        f"工单计数从 #001 重新开始",
+        f"存储频道文件已清空 {cleared_storage} 条\n"
+        f"帖子公开卡片已删除 {deleted_cards} 张\n"
+        f"工单从 #001、资源码从空重新开始",
         ephemeral=True,
     )
 
