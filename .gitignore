@@ -28,8 +28,13 @@ quiz_cooldowns.json
 faq.json
 points.json
 checkin_channels.json
+gamble_data.json
+gamble_channels.json
 report_data.json
 report_channels.json
 report_counter.json
 guide_channels.json
 download_logs.json
+file_records.json
+channel_published.json
+file_store/

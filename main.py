@@ -15,6 +15,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from collections import defaultdict, deque
+from urllib.parse import quote
 
 # 配置日志
 logging.basicConfig(
@@ -39,6 +40,11 @@ STORAGE_CHANNEL_FILE = "storage_channel.json"
 FAQ_FILE = "faq.json"
 POINTS_FILE = "points.json"
 CHECKIN_CHANNEL_FILE = "checkin_channels.json"
+GAMBLE_FILE = "gamble_data.json"
+GAMBLE_CHANNEL_FILE = "gamble_channels.json"
+GAMBLE_CHANNEL_KEYWORD = "赌王来一下"
+GAMBLE_DRAW_COST_POINTS = 10
+GAMBLE_FRAGMENT_PER_TICKET = 5
 REPORT_FILE = "report_data.json"
 REPORT_COUNTER_FILE = "report_counter.json"
 REPORT_CHANNEL_KEYWORD = "间谍"          # 举报入口频道关键词
@@ -50,6 +56,7 @@ GUIDE_CHANNEL_KEYWORD = "指路"           # 指路频道关键词
 GUIDE_CHANNEL_FILE = "guide_channels.json"
 DOWNLOAD_LOGS_FILE = "download_logs.json"
 PUBLISHED_FILE = "channel_published.json"
+FILE_STORE_DIR = "file_store"
 ALERT_CHANNEL_KEYWORD = "异常提醒"
 ALERT_CHANNEL_NAME = "异常提醒"
 ALERT_DOWNLOAD_WINDOW_SEC = 60
@@ -57,6 +64,8 @@ ALERT_DOWNLOAD_COUNT = 5
 ALERT_SPAM_WINDOW_SEC = 12
 ALERT_SPAM_COUNT = 6
 ALERT_COOLDOWN_SEC = 180
+DOWNLOAD_COOLDOWN_SEC = 30
+CLAIM_TTL_SEC = 600
 AD_KEYWORDS = (
     "免费代充", "代充", "出号", "收号", "卖号", "倒卖", "代肝",
     "加v", "加微", "加vx", "微信", "qq群", "QQ群", "淘宝", "咸鱼",
@@ -65,10 +74,12 @@ AD_KEYWORDS = (
 _alert_download_times: dict = defaultdict(deque)
 _alert_message_times: dict = defaultdict(deque)
 _alert_last_sent: dict = {}
+_download_cooldowns: dict = {}
+_claim_tokens: dict = {}
 
 # ─── 文件记录存储 ───
 # 结构: { "file_id": { "name": str, "uploader_id": int, "status": "draft|published", "description": str,
-#                      "attachments": [{ "original_name": str, "custom_name": str, "storage_msg_id": str, "size": int }],
+#                      "attachments": [{ "original_name": str, "custom_name": str, "storage_path": str, "size": int }],
 #                      "conditions": { ... }, "published_msg_id": str, "source_channel_id": int, "guild_id": int,
 #                      "upload_time": str, "resource_code": str, "updates": list, "storage_card_msg_id": str } }
 file_records: dict = {}
@@ -154,6 +165,95 @@ async def get_or_create_storage_channel(guild: discord.Guild) -> discord.TextCha
 _CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 _PNG_TEXT_KEY = "Comment"
+_PNG_LSB_MAGIC = b"CABOTD"
+_ZIP_EXTRA_ID = 0x4342  # 'CB'
+
+
+def _ensure_file_store():
+    os.makedirs(FILE_STORE_DIR, exist_ok=True)
+
+
+def _safe_filename(name: str) -> str:
+    base = os.path.basename(name or "file")
+    cleaned = "".join(ch if ch.isalnum() or ch in "._- " else "_" for ch in base).strip()
+    return cleaned[:80] or "file"
+
+
+def _new_file_id() -> str:
+    for _ in range(32):
+        fid = secrets.token_hex(8)
+        if fid not in file_records:
+            return fid
+    return secrets.token_hex(16)
+
+
+def _new_storage_path(filename: str) -> str:
+    _ensure_file_store()
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    return os.path.join(FILE_STORE_DIR, f"{stamp}_{secrets.token_hex(6)}_{_safe_filename(filename)}")
+
+
+def _save_bytes_to_store(file_bytes: bytes, filename: str) -> str:
+    path = _new_storage_path(filename)
+    with open(path, "wb") as f:
+        f.write(file_bytes)
+    return path
+
+
+def _read_stored_bytes(att: dict):
+    path = att.get("storage_path")
+    if path and os.path.isfile(path):
+        with open(path, "rb") as f:
+            return f.read()
+    return None
+
+
+async def _read_attachment_bytes(record: dict, att: dict):
+    data = _read_stored_bytes(att)
+    if data is not None:
+        return data
+    msg_id = att.get("storage_msg_id")
+    if not msg_id:
+        return None
+    guild = bot.get_guild(record.get("guild_id")) if record.get("guild_id") else None
+    if not guild:
+        return None
+    channel_id = storage_channels.get(str(record.get("guild_id")))
+    if not channel_id:
+        return None
+    channel = guild.get_channel(int(channel_id))
+    if not channel:
+        return None
+    try:
+        msg = await channel.fetch_message(int(msg_id))
+    except Exception:
+        return None
+    if not msg.attachments:
+        return None
+    try:
+        data = await msg.attachments[0].read()
+    except Exception:
+        return None
+    try:
+        att["storage_path"] = _save_bytes_to_store(data, att.get("custom_name") or msg.attachments[0].filename)
+        save_records()
+    except Exception:
+        pass
+    return data
+
+
+def _delete_stored_file(att: dict):
+    path = att.get("storage_path")
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+def _delete_record_files(record: dict):
+    for att in record.get("attachments") or []:
+        _delete_stored_file(att)
 
 
 def _new_code(prefix: str, existing: set) -> str:
@@ -262,6 +362,145 @@ def _read_png_text(data: bytes, keyword: str = _PNG_TEXT_KEY):
     return None
 
 
+def _png_parse_ihdr(data: bytes):
+    for _, chunk_type, chunk_data in _iter_png_chunks(data):
+        if chunk_type == b"IHDR" and len(chunk_data) >= 13:
+            width, height = struct.unpack(">II", chunk_data[:8])
+            return width, height, chunk_data[8], chunk_data[9], chunk_data[12]
+    return None
+
+
+def _png_row_bytes(width: int, bit_depth: int, color_type: int):
+    channels = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}.get(color_type)
+    if not channels or width <= 0:
+        return None
+    if bit_depth == 8:
+        return width * channels
+    if bit_depth == 16:
+        return width * channels * 2
+    bits = width * channels * bit_depth
+    return (bits + 7) // 8
+
+
+def _png_collect_idat(data: bytes) -> bytes:
+    return b"".join(chunk_data for _, chunk_type, chunk_data in _iter_png_chunks(data) if chunk_type == b"IDAT")
+
+
+def _png_rebuild_with_idat(data: bytes, new_idat: bytes) -> bytes:
+    pieces = [data[:8]]
+    wrote = False
+    for start, chunk_type, chunk_data in _iter_png_chunks(data):
+        if chunk_type == b"IDAT":
+            if not wrote:
+                for i in range(0, len(new_idat), 32768):
+                    pieces.append(_png_chunk(b"IDAT", new_idat[i:i + 32768]))
+                wrote = True
+            continue
+        length = struct.unpack(">I", data[start:start + 4])[0]
+        pieces.append(data[start:start + 12 + length])
+    return b"".join(pieces)
+
+
+def _bits_to_bytes(bits: list) -> bytes:
+    out = bytearray()
+    for i in range(0, len(bits) - 7, 8):
+        value = 0
+        for j in range(8):
+            value = (value << 1) | bits[i + j]
+        out.append(value)
+    return bytes(out)
+
+
+def _payload_to_bits(payload: bytes) -> list:
+    bits = []
+    for byte in payload:
+        for i in range(8):
+            bits.append((byte >> (7 - i)) & 1)
+    return bits
+
+
+def _embed_png_lsb(data: bytes, code: str) -> bytes:
+    if not data.startswith(_PNG_SIGNATURE):
+        return data
+    info = _png_parse_ihdr(data)
+    if not info:
+        return data
+    width, height, bit_depth, color_type, interlace = info
+    if interlace or bit_depth not in (8, 16):
+        return data
+    row = _png_row_bytes(width, bit_depth, color_type)
+    if not row:
+        return data
+    try:
+        raw = zlib.decompress(_png_collect_idat(data))
+    except Exception:
+        return data
+    expected = (row + 1) * height
+    if len(raw) < expected:
+        return data
+    payload = _PNG_LSB_MAGIC + bytes([min(len(code), 255)]) + code.encode("latin-1", "replace")[:255]
+    bits = _payload_to_bits(payload)
+    if row * height < len(bits):
+        return data
+    buf = bytearray(raw)
+    bit_i = 0
+    for y in range(height):
+        start = y * (row + 1) + 1
+        for x in range(row):
+            if bit_i >= len(bits):
+                break
+            buf[start + x] = (buf[start + x] & 0xFE) | bits[bit_i]
+            bit_i += 1
+        if bit_i >= len(bits):
+            break
+    try:
+        new_idat = zlib.compress(bytes(buf), 9)
+    except Exception:
+        return data
+    return _png_rebuild_with_idat(data, new_idat)
+
+
+def _read_png_lsb(data: bytes):
+    if not data.startswith(_PNG_SIGNATURE):
+        return None
+    info = _png_parse_ihdr(data)
+    if not info:
+        return None
+    width, height, bit_depth, color_type, interlace = info
+    if interlace or bit_depth not in (8, 16):
+        return None
+    row = _png_row_bytes(width, bit_depth, color_type)
+    if not row:
+        return None
+    try:
+        raw = zlib.decompress(_png_collect_idat(data))
+    except Exception:
+        return None
+    need_bits = (len(_PNG_LSB_MAGIC) + 1 + 32) * 8
+    bits = []
+    for y in range(height):
+        start = y * (row + 1) + 1
+        if start + row > len(raw):
+            break
+        for x in range(row):
+            bits.append(raw[start + x] & 1)
+            if len(bits) >= need_bits:
+                break
+        if len(bits) >= need_bits:
+            break
+    payload = _bits_to_bytes(bits)
+    if not payload.startswith(_PNG_LSB_MAGIC):
+        return None
+    n = payload[len(_PNG_LSB_MAGIC)]
+    start = len(_PNG_LSB_MAGIC) + 1
+    if start + n > len(payload):
+        return None
+    try:
+        return payload[start:start + n].decode("latin-1")
+    except Exception:
+        return None
+
+
 def _embed_zip_comment(data: bytes, comment: str) -> bytes:
     if len(data) < 22 or data[:2] != b"PK":
         return data
@@ -269,7 +508,6 @@ def _embed_zip_comment(data: bytes, comment: str) -> bytes:
     eocd = data.rfind(b"PK\x05\x06")
     if eocd < 0 or eocd + 22 > len(data):
         return data
-    old_len = struct.unpack("<H", data[eocd + 20:eocd + 22])[0]
     body = data[:eocd + 20]
     return body + struct.pack("<H", len(comment_bytes)) + comment_bytes
 
@@ -290,20 +528,120 @@ def _read_zip_comment(data: bytes):
         return raw.decode("latin-1", "ignore")
 
 
+def _zip_upsert_extra(extra: bytes, new_field: bytes) -> bytes:
+    pos = 0
+    parts = []
+    replaced = False
+    extra = extra or b""
+    while pos + 4 <= len(extra):
+        hid, size = struct.unpack("<HH", extra[pos:pos + 4])
+        end = pos + 4 + size
+        if end > len(extra):
+            break
+        if hid == _ZIP_EXTRA_ID:
+            if not replaced:
+                parts.append(new_field)
+                replaced = True
+        else:
+            parts.append(extra[pos:end])
+        pos = end
+    if pos < len(extra):
+        parts.append(extra[pos:])
+    if not replaced:
+        parts.append(new_field)
+    return b"".join(parts)
+
+
+def _embed_zip_extra_and_comment(data: bytes, code: str) -> bytes:
+    if len(data) < 22 or data[:2] != b"PK":
+        return data
+    payload = code.encode("utf-8")
+    extra_field = struct.pack("<HH", _ZIP_EXTRA_ID, len(payload)) + payload
+    try:
+        in_buf = io.BytesIO(data)
+        out_buf = io.BytesIO()
+        with zipfile.ZipFile(in_buf, "r") as zin:
+            with zipfile.ZipFile(out_buf, "w", compression=zipfile.ZIP_DEFLATED) as zout:
+                for item in zin.infolist():
+                    raw = zin.read(item.filename)
+                    info = zipfile.ZipInfo(filename=item.filename, date_time=item.date_time)
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.comment = item.comment
+                    info.extra = _zip_upsert_extra(item.extra or b"", extra_field)
+                    info.create_system = item.create_system
+                    zout.writestr(info, raw)
+                zout.comment = payload
+        return out_buf.getvalue()
+    except Exception:
+        return _embed_zip_comment(data, code)
+
+
+def _read_zip_extra(data: bytes):
+    if len(data) < 22 or data[:2] != b"PK":
+        return None
+    try:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
+            for info in zf.infolist():
+                extra = info.extra or b""
+                pos = 0
+                while pos + 4 <= len(extra):
+                    hid, size = struct.unpack("<HH", extra[pos:pos + 4])
+                    end = pos + 4 + size
+                    if end > len(extra):
+                        break
+                    if hid == _ZIP_EXTRA_ID:
+                        raw = extra[pos + 4:end]
+                        try:
+                            return raw.decode("utf-8")
+                        except Exception:
+                            return raw.decode("latin-1", "ignore")
+                    pos = end
+    except Exception:
+        return None
+    return None
+
+
+def _normalize_downloader_code(value):
+    if not value:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    upper = text.upper()
+    if "D-" in upper:
+        start = upper.find("D-")
+        token = "".join(ch for ch in upper[start:] if ch.isalnum() or ch == "-")
+        return token or upper
+    return text
+
+
+def _first_downloader_code(*values):
+    normalized = []
+    for value in values:
+        code = _normalize_downloader_code(value)
+        if code:
+            normalized.append(code)
+    for code in normalized:
+        if code.startswith("D-"):
+            return code
+    return normalized[0] if normalized else None
+
+
 def _embed_downloader_code(file_bytes: bytes, filename: str, code: str) -> bytes:
     name = (filename or "").lower()
     if name.endswith(".png") or file_bytes.startswith(_PNG_SIGNATURE):
-        return _embed_png_text(file_bytes, _PNG_TEXT_KEY, code)
+        marked = _embed_png_text(file_bytes, _PNG_TEXT_KEY, code)
+        return _embed_png_lsb(marked, code)
     if name.endswith(".zip") or file_bytes[:2] == b"PK":
-        return _embed_zip_comment(file_bytes, code)
+        return _embed_zip_extra_and_comment(file_bytes, code)
     return file_bytes
 
 
 def _extract_downloader_code_from_bytes(file_bytes: bytes):
     if file_bytes.startswith(_PNG_SIGNATURE):
-        return _read_png_text(file_bytes)
+        return _first_downloader_code(_read_png_text(file_bytes), _read_png_lsb(file_bytes))
     if file_bytes[:2] == b"PK":
-        return _read_zip_comment(file_bytes)
+        return _first_downloader_code(_read_zip_comment(file_bytes), _read_zip_extra(file_bytes))
     return None
 
 
@@ -530,7 +868,7 @@ def _build_storage_card_embed(file_id: str, record: dict) -> discord.Embed:
         description=desc[:4000],
         color=discord.Color.dark_gold(),
     )
-    embed.set_footer(text="仅岛主可见 | 点回溯查看领取记录")
+    embed.set_footer(text="仅岛主可见 | 原文件不在频道内 | 点回溯查看领取记录")
     return embed
 
 
@@ -620,6 +958,23 @@ class PersistentStorageCardView(discord.ui.View):
             ephemeral=True,
         )
 
+    @discord.ui.button(
+        label="领取",
+        style=discord.ButtonStyle.secondary,
+        custom_id="storage_card_claim",
+    )
+    async def claim_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_island_owner(interaction):
+            await interaction.response.send_message("仅岛主可从存储频道领取。", ephemeral=True)
+            return
+        file_id, record = _find_record_by_storage_card(interaction.message.id)
+        if not record:
+            await interaction.response.send_message("找不到对应资源。", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        attachments = record.get("attachments") or []
+        await _deliver_selected_files(interaction, record, list(range(len(attachments))))
+
 
 # ─── FAQ 常见问题 ───
 # 结构: { "keyword": "answer", ... }
@@ -687,6 +1042,46 @@ def save_checkin_channels():
             json.dump(checkin_channel_messages, f)
     except Exception as e:
         logger.error(f"保存签到频道信息失败: {e}")
+
+
+gamble_data: dict = {}
+gamble_channel_messages: dict = {}
+
+
+def load_gamble():
+    global gamble_data
+    try:
+        if os.path.exists(GAMBLE_FILE):
+            with open(GAMBLE_FILE, "r", encoding="utf-8") as f:
+                gamble_data = json.load(f)
+    except Exception:
+        gamble_data = {}
+
+
+def save_gamble():
+    try:
+        with open(GAMBLE_FILE, "w", encoding="utf-8") as f:
+            json.dump(gamble_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存赌王数据失败: {e}")
+
+
+def load_gamble_channels():
+    global gamble_channel_messages
+    try:
+        if os.path.exists(GAMBLE_CHANNEL_FILE):
+            with open(GAMBLE_CHANNEL_FILE, "r", encoding="utf-8") as f:
+                gamble_channel_messages = json.load(f)
+    except Exception:
+        gamble_channel_messages = {}
+
+
+def save_gamble_channels():
+    try:
+        with open(GAMBLE_CHANNEL_FILE, "w", encoding="utf-8") as f:
+            json.dump(gamble_channel_messages, f)
+    except Exception as e:
+        logger.error(f"保存赌王频道信息失败: {e}")
 
 
 def _checkin_today() -> str:
@@ -975,12 +1370,15 @@ async def on_ready():
     load_faq()
     load_points()
     load_checkin_channels()
+    load_gamble()
+    load_gamble_channels()
     load_reports()
     load_report_channels()
     load_report_counter()
     load_guide_channels()
     load_download_logs()
     load_channel_published()
+    _ensure_file_store()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -994,6 +1392,8 @@ async def on_ready():
 
     # 在签到频道中发布/更新签到按钮消息
     await setup_checkin_channels()
+
+    await setup_gamble_channels()
 
     # 在举报频道中发布/更新举报按钮消息
     await setup_report_channels()
@@ -1210,28 +1610,21 @@ async def _ingest_uploaded_files(
     description: str = "",
     password: Optional[str] = None,
 ):
-    storage_channel = await get_or_create_storage_channel(interaction.guild)
+    await get_or_create_storage_channel(interaction.guild)
     attachment_records = []
     total_size = 0
 
     for att in attachments:
         try:
             file_bytes = await att.read()
-            discord_file = discord.File(
-                fp=io.BytesIO(file_bytes),
-                filename=att.filename,
-            )
-            storage_msg = await storage_channel.send(
-                content=f"{att.filename} | 上传者: {interaction.user.display_name} (ID: {interaction.user.id})",
-                file=discord_file,
-            )
+            storage_path = _save_bytes_to_store(file_bytes, att.filename)
             attachment_records.append({
                 "original_name": att.filename,
                 "custom_name": att.filename,
-                "storage_msg_id": str(storage_msg.id),
-                "size": att.size,
+                "storage_path": storage_path,
+                "size": att.size or len(file_bytes),
             })
-            total_size += att.size
+            total_size += att.size or len(file_bytes)
         except Exception as e:
             logger.error(f"上传文件 {att.filename} 失败: {e}")
             await interaction.followup.send(f"上传 {att.filename} 失败: {e}", ephemeral=True)
@@ -1260,7 +1653,7 @@ async def _ingest_uploaded_files(
         await _show_draft_setup(interaction, existing_id, has_previous=True)
         return
 
-    draft_id = attachment_records[0]["storage_msg_id"]
+    draft_id = _new_file_id()
     default_name = title or attachments[0].filename
     conditions = {
         "password": password,
@@ -1460,59 +1853,32 @@ async def _show_draft_setup(interaction: discord.Interaction, file_id: str, has_
 async def _pack_attachments_to_zip(interaction: discord.Interaction, file_id: str, record: dict):
     """将所有附件打包为 ZIP 并替换附件列表"""
     attachments = record["attachments"]
-    guild = interaction.guild
-    guild_id_str = str(record["guild_id"])
-    channel_id = storage_channels.get(guild_id_str)
-    if not channel_id:
-        await interaction.followup.send("❌ 存储频道不存在。", ephemeral=True)
-        return
-
-    channel = guild.get_channel(int(channel_id))
-    if not channel:
-        await interaction.followup.send("❌ 存储频道已删除。", ephemeral=True)
-        return
-
-    # 从存储频道下载所有附件
     zip_buffer = io.BytesIO()
-    total_zip_size = 0
-    file_map = {}  # custom_name -> bytes
+    file_map = {}
 
     for att in attachments:
-        try:
-            msg = await channel.fetch_message(int(att["storage_msg_id"]))
-        except discord.NotFound:
-            await interaction.followup.send(f"❌ 附件 {att['custom_name']} 已被删除。", ephemeral=True)
-            return
-
-        if not msg.attachments:
+        data = await _read_attachment_bytes(record, att)
+        if data is None:
             await interaction.followup.send(f"❌ 附件 {att['custom_name']} 丢失。", ephemeral=True)
             return
-
-        data = await msg.attachments[0].read()
         file_map[att["custom_name"]] = data
 
-    # 创建 ZIP
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
         for name, data in file_map.items():
             zf.writestr(name, data)
 
     zip_buffer.seek(0)
-    total_zip_size = zip_buffer.getbuffer().nbytes
-
-    # 上传 ZIP 到存储频道
+    zip_bytes = zip_buffer.getvalue()
+    total_zip_size = len(zip_bytes)
     zip_name = f"{record['name']}.zip"
-    discord_file = discord.File(fp=zip_buffer, filename=zip_name)
-    storage_channel = await get_or_create_storage_channel(guild)
-    storage_msg = await storage_channel.send(
-        content=f"{zip_name} | 整合ZIP | 上传者: {interaction.user.display_name}",
-        file=discord_file,
-    )
+    storage_path = _save_bytes_to_store(zip_bytes, zip_name)
+    for att in attachments:
+        _delete_stored_file(att)
 
-    # 替换附件列表为单个 ZIP
     record["attachments"] = [{
         "original_name": zip_name,
         "custom_name": zip_name,
-        "storage_msg_id": str(storage_msg.id),
+        "storage_path": storage_path,
         "size": total_zip_size,
     }]
     record["size"] = total_zip_size
@@ -1922,25 +2288,178 @@ def _selected_indices(interaction: discord.Interaction, record: dict, file_id: s
     return indices
 
 
+def _public_base_url() -> str:
+    for key in ("PUBLIC_BASE_URL", "RENDER_EXTERNAL_URL", "KOYEB_PUBLIC_DOMAIN"):
+        value = (os.getenv(key) or "").strip().rstrip("/")
+        if not value:
+            continue
+        if key == "KOYEB_PUBLIC_DOMAIN" and not value.startswith("http"):
+            value = "https://" + value
+        return value
+    fly_app = (os.getenv("FLY_APP_NAME") or "").strip()
+    if fly_app:
+        return f"https://{fly_app}.fly.dev"
+    return ""
+
+
+def _purge_claim_tokens():
+    now = datetime.now(timezone.utc).timestamp()
+    expired = [token for token, item in _claim_tokens.items() if item.get("expires_at", 0) <= now]
+    for token in expired:
+        _claim_tokens.pop(token, None)
+
+
+def _make_claim_token(filename: str, data: bytes, user_id: int, downloader_code: str) -> str:
+    _purge_claim_tokens()
+    token = secrets.token_urlsafe(24)
+    _claim_tokens[token] = {
+        "user_id": int(user_id),
+        "downloader_code": downloader_code,
+        "filename": filename or "file",
+        "data": data,
+        "expires_at": datetime.now(timezone.utc).timestamp() + CLAIM_TTL_SEC,
+    }
+    return token
+
+
+def _claim_download_url(token: str) -> str:
+    base = _public_base_url()
+    path = f"/claim/{token}"
+    if base:
+        return f"{base}{path}"
+    return path
+
+
+def _build_claim_ticket_embed(record: dict, files: list) -> discord.Embed:
+    source = record.get("source_channel_id")
+    source_txt = f"<#{source}>" if source else "未知"
+    lines = [
+        f"**作者:** <@{record.get('uploader_id', 0)}> `{record.get('uploader_id', '?')}`",
+        f"**资源:** {record.get('name', '?')}",
+        f"**来源帖:** {source_txt}",
+        "",
+        "点下面蓝色文件名下载。图片和文件都不会在这里直接展开。",
+        "",
+    ]
+    for item in files:
+        lines.append(f"- [{item['name']}]({item['url']})（{item['size']}）")
+    lines.append("")
+    lines.append(f"链接 {CLAIM_TTL_SEC // 60} 分钟内有效，不要转发给别人。")
+    return discord.Embed(
+        title="领取单",
+        description="\n".join(lines)[:4096],
+        color=discord.Color.blurple(),
+    )
+
+
 async def _deliver_selected_files(interaction: discord.Interaction, record: dict, indices: list):
-    success = 0
+    if not _public_base_url():
+        await interaction.followup.send(
+            "领取链接还没配好公网地址。请设置 PUBLIC_BASE_URL 后重启机器人。",
+            ephemeral=True,
+        )
+        return
+    attachments = record.get("attachments") or []
+    files = []
     for idx in indices:
-        await _send_attachment_to_user(interaction, record, idx)
-        success += 1
-    if success > 0:
-        await interaction.followup.send(f"已发送 {success} 个文件", ephemeral=True)
+        if idx < 0 or idx >= len(attachments):
+            continue
+        att = attachments[idx]
+        file_bytes = await _read_attachment_bytes(record, att)
+        if file_bytes is None:
+            continue
+        downloader_code = _get_or_create_downloader_code(record, interaction.user.id)
+        filename = att.get("custom_name") or "file"
+        marked = _embed_downloader_code(file_bytes, filename, downloader_code)
+        token = _make_claim_token(filename, marked, interaction.user.id, downloader_code)
+        files.append({
+            "name": filename,
+            "size": _format_size(att.get("size", 0)),
+            "url": _claim_download_url(token),
+        })
+        _log_download(interaction, record, filename, downloader_code)
+        await _maybe_alert_download(interaction, record, filename)
+    if not files:
+        await interaction.followup.send("未选择有效文件或文件已丢失。", ephemeral=True)
+        return
+    _mark_claim_cooldown(interaction, _record_id_of(record) or "")
+    await interaction.followup.send(
+        embed=_build_claim_ticket_embed(record, files),
+        ephemeral=True,
+    )
+
+
+def _user_passed_quiz(user) -> bool:
+    guild = getattr(user, "guild", None)
+    if guild and getattr(user, "id", None) == guild.owner_id:
+        return True
+    return discord.utils.get(getattr(user, "roles", []), name=QUIZ_VERIFIED_ROLE) is not None
+
+
+def _claim_cooldown_key(interaction: discord.Interaction, file_id: str) -> tuple:
+    guild_id = str(interaction.guild.id) if interaction.guild else "0"
+    return (guild_id, str(interaction.user.id), str(file_id))
+
+
+def _claim_cooldown_left(interaction: discord.Interaction, file_id: str) -> int:
+    now = datetime.now(timezone.utc).timestamp()
+    until = _download_cooldowns.get(_claim_cooldown_key(interaction, file_id), 0)
+    return max(0, int(until - now))
+
+
+def _mark_claim_cooldown(interaction: discord.Interaction, file_id: str):
+    now = datetime.now(timezone.utc).timestamp()
+    _download_cooldowns[_claim_cooldown_key(interaction, file_id)] = now + DOWNLOAD_COOLDOWN_SEC
+
+
+async def _reply_claim(interaction: discord.Interaction, text: str, already_deferred: bool):
+    if already_deferred:
+        await interaction.followup.send(text, ephemeral=True)
     else:
-        await interaction.followup.send("未选择有效文件或发送失败", ephemeral=True)
+        await interaction.response.send_message(text, ephemeral=True)
+
+
+async def _gate_claim(interaction: discord.Interaction, file_id: str, record: dict, already_deferred: bool) -> bool:
+    if interaction.guild and interaction.user.id == interaction.guild.owner_id:
+        return True
+    if not _user_passed_quiz(interaction.user):
+        await _reply_claim(interaction, "未过审身份不能领取。", already_deferred)
+        if interaction.guild and _alert_cooldown_ok("异常下载", interaction.guild.id, interaction.user.id):
+            await _send_alert(
+                interaction.guild,
+                "异常下载",
+                "异常下载",
+                (
+                    f"**用户:** {interaction.user.mention} `{interaction.user.id}`\n"
+                    f"**资源:** {record.get('name', '?')}\n"
+                    f"**位置:** {interaction.channel.mention}\n"
+                    f"**原因:** 未过审身份尝试领取"
+                ),
+                discord.Color.orange(),
+            )
+        return False
+    left = _claim_cooldown_left(interaction, file_id)
+    if left > 0:
+        await _reply_claim(interaction, f"领取冷却中，请 {left} 秒后再试。", already_deferred)
+        return False
+    now = datetime.now(timezone.utc).timestamp()
+    key = (str(interaction.guild.id) if interaction.guild else "0", str(interaction.user.id))
+    bucket = _alert_download_times[key]
+    recent = [t for t in bucket if now - t <= ALERT_DOWNLOAD_WINDOW_SEC]
+    if len(recent) >= ALERT_DOWNLOAD_COUNT:
+        await _reply_claim(interaction, "领取过于频繁，已拒绝并通知岛主。", already_deferred)
+        await _maybe_alert_download(interaction, record, "领取请求")
+        return False
+    return True
 
 
 async def _start_download_flow(interaction: discord.Interaction, file_id: str, record: dict, already_deferred: bool = False):
+    if not await _gate_claim(interaction, file_id, record, already_deferred):
+        return
     failed = await _check_download_prereqs(interaction, record)
     if failed:
         text = "未达到上传者设置的获取条件：" + "，".join(failed)
-        if already_deferred:
-            await interaction.followup.send(text, ephemeral=True)
-        else:
-            await interaction.response.send_message(text, ephemeral=True)
+        await _reply_claim(interaction, text, already_deferred)
         return
     indices = _selected_indices(interaction, record, file_id)
     password = (record.get("conditions") or {}).get("password")
@@ -2031,60 +2550,9 @@ class DownloadPasswordModal(discord.ui.Modal, title="填写下载密码"):
             await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
             return
         await interaction.response.defer(ephemeral=True)
+        if not await _gate_claim(interaction, self.file_id, record, True):
+            return
         await _deliver_selected_files(interaction, record, self.indices)
-
-
-async def _send_attachment_to_user(interaction: discord.Interaction, record: dict, idx: int):
-    """发送指定附件给用户"""
-    att = record["attachments"][idx]
-    try:
-        guild = interaction.client.get_guild(record["guild_id"])
-        if not guild:
-            await interaction.followup.send("❌ 找不到服务器。", ephemeral=True)
-            return
-
-        guild_id_str = str(record["guild_id"])
-        channel_id = storage_channels.get(guild_id_str)
-        if not channel_id:
-            await interaction.followup.send("❌ 存储频道不存在。", ephemeral=True)
-            return
-
-        channel = guild.get_channel(int(channel_id))
-        if not channel:
-            await interaction.followup.send("❌ 存储频道已删除。", ephemeral=True)
-            return
-
-        try:
-            msg = await channel.fetch_message(int(att["storage_msg_id"]))
-        except discord.NotFound:
-            await interaction.followup.send("❌ 文件已被删除。", ephemeral=True)
-            return
-
-        if not msg.attachments:
-            await interaction.followup.send("❌ 文件附件丢失。", ephemeral=True)
-            return
-
-        attachment = msg.attachments[0]
-        file_bytes = await attachment.read()
-        downloader_code = _get_or_create_downloader_code(record, interaction.user.id)
-        marked = _embed_downloader_code(file_bytes, att.get("custom_name") or attachment.filename, downloader_code)
-
-        discord_file = discord.File(
-            fp=io.BytesIO(marked),
-            filename=att["custom_name"],
-        )
-        await interaction.followup.send(
-            content=f"**{att['custom_name']}**\n上传者: <@{record['uploader_id']}>",
-            file=discord_file,
-            ephemeral=True,
-        )
-
-        _log_download(interaction, record, att["custom_name"], downloader_code)
-        await _maybe_alert_download(interaction, record, att["custom_name"])
-
-    except Exception as e:
-        logger.error(f"发送附件失败: {e}", exc_info=True)
-        await interaction.followup.send(f"❌ 获取文件时出错: {e}", ephemeral=True)
 
 
 def _log_download(interaction: discord.Interaction, record: dict, file_label: str, downloader_code: str = ""):
@@ -3009,6 +3477,348 @@ async def checkin_days_command(interaction: discord.Interaction):
 
 
 # ═══════════════════════════════════════════
+#  赌王来一下 - 积分/抽奖券抽奖
+# ═══════════════════════════════════════════
+
+GAMBLE_PRIZE_ROLES = ("水仙十字",)
+GAMBLE_JUNK_POOL = (
+    {"key": "thanks", "name": "谢谢惠顾", "kind": "flavor"},
+    {"key": "tissue", "name": "一卷抽卷纸", "kind": "flavor"},
+    {"key": "fish", "name": "一条咸鱼", "kind": "flavor"},
+    {"key": "shell", "name": "空蚌壳", "kind": "flavor"},
+    {"key": "pebble", "name": "潮汐石子", "kind": "flavor"},
+    {"key": "receipt", "name": "过期小票", "kind": "flavor"},
+    {"key": "fragment", "name": "抽奖券碎片", "kind": "fragment"},
+)
+GAMBLE_JUNK_WEIGHTS = {
+    "thanks": 42,
+    "tissue": 10,
+    "fish": 10,
+    "shell": 8,
+    "pebble": 8,
+    "receipt": 7,
+    "fragment": 15,
+}
+GAMBLE_ROLE_RATE = {
+    "points": 0.001,
+    "ticket": 0.007,
+}
+
+
+def _empty_gamble_record() -> dict:
+    return {
+        "tickets": 0,
+        "fragments": 0,
+        "owned_roles": [],
+        "history": [],
+        "junk": {},
+    }
+
+
+def _get_gamble_record(guild_id: str, user_id: str) -> dict:
+    guild_data = gamble_data.setdefault(str(guild_id), {})
+    rec = guild_data.get(str(user_id)) or {}
+    data = _empty_gamble_record()
+    data.update(rec)
+    data["tickets"] = int(data.get("tickets") or 0)
+    data["fragments"] = int(data.get("fragments") or 0)
+    data["owned_roles"] = list(data.get("owned_roles") or [])
+    data["history"] = list(data.get("history") or [])
+    data["junk"] = dict(data.get("junk") or {})
+    guild_data[str(user_id)] = data
+    return data
+
+
+def _gamble_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="赌王来一下",
+        description=(
+            "小岛夜场开张。没过审也能抽。\n\n"
+            f"**积分抽奖** 每次 {GAMBLE_DRAW_COST_POINTS} 积分，身份组概率 0.1%\n"
+            "**抽奖券抽奖** 每次 1 张券，身份组概率 0.7%\n"
+            f"**碎片合成** {GAMBLE_FRAGMENT_PER_TICKET} 个碎片换 1 张抽奖券\n\n"
+            "大奖先开放：**水仙十字**（永久，可随时佩戴/卸下）\n"
+            "已经抽到的身份组不会再抽到。\n"
+            "没中大奖时可能是谢谢惠顾、碎片、抽卷纸、咸鱼一类小玩意。"
+        ),
+        color=discord.Color.dark_magenta(),
+    )
+    embed.set_footer(text="点按钮仅自己可见结果 | 身份组可随时切换佩戴")
+    return embed
+
+
+async def _ensure_prize_role(guild: discord.Guild, name: str):
+    role = discord.utils.get(guild.roles, name=name)
+    if role:
+        return role
+    try:
+        return await guild.create_role(
+            name=name,
+            mentionable=False,
+            hoist=False,
+            reason="赌王来一下大奖身份组",
+        )
+    except Exception as e:
+        logger.warning(f"创建奖品身份组 {name} 失败: {e}")
+        return None
+
+
+def _owned_prize_roles(record: dict) -> list:
+    owned = []
+    for name in GAMBLE_PRIZE_ROLES:
+        if name in (record.get("owned_roles") or []):
+            owned.append(name)
+    return owned
+
+
+def _available_prize_roles(record: dict) -> list:
+    owned = set(record.get("owned_roles") or [])
+    return [name for name in GAMBLE_PRIZE_ROLES if name not in owned]
+
+
+def _pick_junk() -> dict:
+    names = [item["key"] for item in GAMBLE_JUNK_POOL]
+    weights = [GAMBLE_JUNK_WEIGHTS.get(item["key"], 1) for item in GAMBLE_JUNK_POOL]
+    key = random.choices(names, weights=weights, k=1)[0]
+    for item in GAMBLE_JUNK_POOL:
+        if item["key"] == key:
+            return item
+    return GAMBLE_JUNK_POOL[0]
+
+
+def _append_history(record: dict, text: str):
+    record.setdefault("history", []).append({
+        "time": _beijing_now().isoformat(),
+        "text": text,
+    })
+    record["history"] = record["history"][-30:]
+
+
+async def _roll_gamble(interaction: discord.Interaction, source: str) -> str:
+    record = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
+    rate = GAMBLE_ROLE_RATE[source]
+    available = _available_prize_roles(record)
+    if available and random.random() < rate:
+        prize = random.choice(available)
+        record["owned_roles"].append(prize)
+        _append_history(record, f"大奖：{prize}")
+        save_gamble()
+        role = await _ensure_prize_role(interaction.guild, prize)
+        if role:
+            try:
+                await interaction.user.add_roles(role, reason="赌王来一下抽中身份组")
+            except Exception as e:
+                logger.warning(f"发放身份组 {prize} 失败: {e}")
+        return (
+            f"中了。永久身份组 **{prize}** 已经到账。\n"
+            "点「获得奖品」可以佩戴或卸下。"
+        )
+    junk = _pick_junk()
+    if junk["kind"] == "fragment":
+        record["fragments"] = int(record.get("fragments") or 0) + 1
+        _append_history(record, "抽奖券碎片 +1")
+        save_gamble()
+        return (
+            f"摸到 **抽奖券碎片** ×1。\n"
+            f"当前碎片 **{record['fragments']}** / {GAMBLE_FRAGMENT_PER_TICKET}，"
+            "集齐可合成抽奖券。"
+        )
+    junk_bag = record.setdefault("junk", {})
+    junk_bag[junk["key"]] = int(junk_bag.get(junk["key"]) or 0) + 1
+    _append_history(record, junk["name"])
+    save_gamble()
+    flavor = {
+        "thanks": "台面空空，庄家朝你点了点头。",
+        "tissue": "递过来一卷抽卷纸。大概用得上。",
+        "fish": "一条咸鱼拍在桌上，还在反光。",
+        "shell": "空蚌壳一枚。里面没有珍珠。",
+        "pebble": "潮汐石子一颗，口袋里会响。",
+        "receipt": "一张过期小票。金额看不清。",
+    }.get(junk["key"], "")
+    return f"抽到：**{junk['name']}**\n{flavor}"
+
+
+async def _do_points_draw(interaction: discord.Interaction):
+    user_data = _get_checkin_record(str(interaction.guild.id), str(interaction.user.id))
+    if user_data["points"] < GAMBLE_DRAW_COST_POINTS:
+        await interaction.response.send_message(
+            f"积分不够。需要 {GAMBLE_DRAW_COST_POINTS}，当前 **{user_data['points']}**。",
+            ephemeral=True,
+        )
+        return
+    user_data["points"] -= GAMBLE_DRAW_COST_POINTS
+    save_points()
+    result = await _roll_gamble(interaction, "points")
+    rec = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
+    await interaction.response.send_message(
+        f"{result}\n剩余积分 **{user_data['points']}**｜抽奖券 **{rec['tickets']}**｜碎片 **{rec['fragments']}**",
+        ephemeral=True,
+    )
+
+
+async def _do_ticket_draw(interaction: discord.Interaction):
+    rec = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
+    if rec["tickets"] < 1:
+        await interaction.response.send_message(
+            f"没有抽奖券。碎片 **{rec['fragments']}** / {GAMBLE_FRAGMENT_PER_TICKET}，可用「碎片合成」。",
+            ephemeral=True,
+        )
+        return
+    rec["tickets"] -= 1
+    save_gamble()
+    result = await _roll_gamble(interaction, "ticket")
+    rec = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
+    await interaction.response.send_message(
+        f"{result}\n剩余抽奖券 **{rec['tickets']}**｜碎片 **{rec['fragments']}**",
+        ephemeral=True,
+    )
+
+
+async def _do_craft_ticket(interaction: discord.Interaction):
+    rec = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
+    if rec["fragments"] < GAMBLE_FRAGMENT_PER_TICKET:
+        await interaction.response.send_message(
+            f"碎片不够。需要 {GAMBLE_FRAGMENT_PER_TICKET}，当前 **{rec['fragments']}**。",
+            ephemeral=True,
+        )
+        return
+    rec["fragments"] -= GAMBLE_FRAGMENT_PER_TICKET
+    rec["tickets"] += 1
+    _append_history(rec, "碎片合成抽奖券 ×1")
+    save_gamble()
+    await interaction.response.send_message(
+        f"合成成功。抽奖券 **{rec['tickets']}**｜碎片 **{rec['fragments']}**",
+        ephemeral=True,
+    )
+
+
+class PrizeToggleView(discord.ui.View):
+    def __init__(self, owned: list):
+        super().__init__(timeout=120)
+        for name in owned[:5]:
+            self.add_item(PrizeToggleButton(name))
+
+
+class PrizeToggleButton(discord.ui.Button):
+    def __init__(self, role_name: str):
+        super().__init__(
+            label=f"切换 {role_name}",
+            style=discord.ButtonStyle.secondary,
+        )
+        self.role_name = role_name
+
+    async def callback(self, interaction: discord.Interaction):
+        rec = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
+        if self.role_name not in (rec.get("owned_roles") or []):
+            await interaction.response.send_message("你还没有这个身份组。", ephemeral=True)
+            return
+        role = discord.utils.get(interaction.guild.roles, name=self.role_name)
+        if not role:
+            role = await _ensure_prize_role(interaction.guild, self.role_name)
+        if not role:
+            await interaction.response.send_message("找不到这个身份组。", ephemeral=True)
+            return
+        member = interaction.user
+        if role in member.roles:
+            try:
+                await member.remove_roles(role, reason="赌王来一下卸下身份组")
+            except Exception as e:
+                await interaction.response.send_message(f"卸下失败: {e}", ephemeral=True)
+                return
+            await interaction.response.send_message(f"已卸下 **{self.role_name}**。", ephemeral=True)
+            return
+        try:
+            await member.add_roles(role, reason="赌王来一下佩戴身份组")
+        except Exception as e:
+            await interaction.response.send_message(f"佩戴失败: {e}", ephemeral=True)
+            return
+        await interaction.response.send_message(f"已佩戴 **{self.role_name}**。", ephemeral=True)
+
+
+async def _do_show_prizes(interaction: discord.Interaction):
+    rec = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
+    user_data = _get_checkin_record(str(interaction.guild.id), str(interaction.user.id))
+    owned = _owned_prize_roles(rec)
+    junk_lines = []
+    for item in GAMBLE_JUNK_POOL:
+        count = int((rec.get("junk") or {}).get(item["key"]) or 0)
+        if count:
+            junk_lines.append(f"{item['name']} ×{count}")
+    hist = rec.get("history") or []
+    hist_text = "\n".join(
+        f"{_format_beijing_minute(item.get('time'))} {item.get('text')}"
+        for item in hist[-8:]
+    ) or "还没抽过"
+    desc = (
+        f"**积分:** {user_data['points']}\n"
+        f"**抽奖券:** {rec['tickets']}\n"
+        f"**碎片:** {rec['fragments']} / {GAMBLE_FRAGMENT_PER_TICKET}\n"
+        f"**身份组:** {'、'.join(owned) if owned else '暂无'}\n"
+        f"**小玩意:** {'、'.join(junk_lines) if junk_lines else '暂无'}\n\n"
+        f"**最近记录**\n{hist_text}"
+    )
+    embed = discord.Embed(title="我的奖品", description=desc[:4000], color=discord.Color.magenta())
+    view = PrizeToggleView(owned) if owned else None
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+
+
+class PersistentGambleView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="积分抽奖", style=discord.ButtonStyle.primary, custom_id="gamble_points")
+    async def points_draw(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_points_draw(interaction)
+
+    @discord.ui.button(label="抽奖券抽奖", style=discord.ButtonStyle.success, custom_id="gamble_ticket")
+    async def ticket_draw(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_ticket_draw(interaction)
+
+    @discord.ui.button(label="获得奖品", style=discord.ButtonStyle.secondary, custom_id="gamble_prizes")
+    async def show_prizes(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_show_prizes(interaction)
+
+    @discord.ui.button(label="碎片合成", style=discord.ButtonStyle.secondary, custom_id="gamble_craft")
+    async def craft_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_craft_ticket(interaction)
+
+
+async def setup_gamble_channels():
+    embed = _gamble_embed()
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if GAMBLE_CHANNEL_KEYWORD not in channel.name:
+                continue
+            try:
+                existing_msg_id = gamble_channel_messages.get(str(channel.id))
+                kept = False
+                async for old_msg in channel.history(limit=50):
+                    if old_msg.author.id != bot.user.id:
+                        continue
+                    if existing_msg_id and str(old_msg.id) == existing_msg_id:
+                        try:
+                            await old_msg.edit(embed=embed, view=PersistentGambleView())
+                            kept = True
+                            logger.info(f"更新赌王卡片: #{channel.name}")
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await old_msg.delete()
+                        except Exception:
+                            pass
+                if not kept:
+                    msg = await channel.send(embed=embed, view=PersistentGambleView())
+                    gamble_channel_messages[str(channel.id)] = str(msg.id)
+                    save_gamble_channels()
+                    logger.info(f"发布赌王卡片: #{channel.name}")
+            except discord.Forbidden:
+                logger.warning(f"无权限在 #{channel.name} 发送消息")
+            except Exception as e:
+                logger.error(f"赌王频道 #{channel.name} 设置失败: {e}")
+
+
+# ═══════════════════════════════════════════
 #  举报/工单系统
 # ═══════════════════════════════════════════
 
@@ -3427,7 +4237,7 @@ async def _create_report(
     try:
         review_channel = await get_or_create_report_review_channel(guild)
         view = PersistentReportReviewView()
-        review_msg = await review_channel.send(embed=_build_review_embed(rec), view=view)
+        review_msg = await review_channel.send(embeds=_build_review_embeds(rec), view=view)
         rec["review_message_id"] = str(review_msg.id)
         rec["review_channel_id"] = str(review_channel.id)
         save_reports()
@@ -3451,11 +4261,13 @@ def _format_evidence_block(rec: dict) -> str:
     lines = []
     if evidence_list:
         lines.append("**已确认补充资料**")
-        for i, ev in enumerate(evidence_list, 1):
+        img_n = 0
+        for ev in evidence_list:
             if ev.get("type") == "image":
-                lines.append(f"{i}. [图片] {ev.get('content', '')}")
+                img_n += 1
+                lines.append(f"{img_n}. 图片（见下方）")
             else:
-                lines.append(f"{i}. {str(ev.get('content', ''))[:300]}")
+                lines.append(f"- {str(ev.get('content', ''))[:300]}")
     else:
         lines.append("**已确认补充资料**")
         lines.append("暂无")
@@ -3463,6 +4275,29 @@ def _format_evidence_block(rec: dict) -> str:
         lines.append("")
         lines.append(f"**待确认上传:** {len(pending)} 条（举报人尚未点确认）")
     return "\n".join(lines)
+
+
+def _evidence_image_urls(rec: dict) -> list:
+    urls = []
+    for ev in rec.get("evidence") or []:
+        if ev.get("type") == "image":
+            url = (ev.get("content") or "").strip()
+            if url:
+                urls.append(url)
+    return urls
+
+
+def _build_review_embeds(rec: dict) -> list:
+    embed = _build_review_embed(rec)
+    urls = _evidence_image_urls(rec)
+    if urls:
+        embed.set_image(url=urls[0])
+    embeds = [embed]
+    for url in urls[1:9]:
+        extra = discord.Embed(color=embed.color)
+        extra.set_image(url=url)
+        embeds.append(extra)
+    return embeds
 
 
 def _build_review_embed(rec: dict) -> discord.Embed:
@@ -3535,7 +4370,7 @@ async def _update_review_card(report_id: str, guild: discord.Guild, view: discor
         if not review_channel:
             return
         review_msg = await review_channel.fetch_message(int(review_msg_id))
-        kwargs = {"embed": _build_review_embed(rec)}
+        kwargs = {"embeds": _build_review_embeds(rec)}
         if view is not None:
             kwargs["view"] = view
         await review_msg.edit(**kwargs)
@@ -3924,8 +4759,28 @@ async def setup_report_channels():
 
 async def setup_guide_channels():
     """在名称包含 GUIDE_CHANNEL_KEYWORD 的频道中发布频道导航"""
-    # 排除的频道名称
-    EXCLUDED_NAMES = {"📁-文件存储", "举报审核", "测试", "黑户地带"}
+    HIDDEN_GUIDE_KEYWORDS = (
+        GUIDE_CHANNEL_KEYWORD,
+        ALERT_CHANNEL_KEYWORD,
+        BLACKLIST_CHANNEL_KEYWORD,
+        "文件存储",
+        "举报审核",
+    )
+    EXCLUDED_NAMES = {
+        "📁-文件存储",
+        "举报审核",
+        "测试",
+        "黑户地带",
+        ALERT_CHANNEL_NAME,
+        BLACKLIST_CHANNEL_NAME,
+    }
+
+    def _hidden_from_guide(ch, guide_channel_id: int) -> bool:
+        if ch.id == guide_channel_id:
+            return True
+        if ch.name in EXCLUDED_NAMES:
+            return True
+        return any(keyword in ch.name for keyword in HIDDEN_GUIDE_KEYWORDS)
 
     for guild in bot.guilds:
         # 收集所有频道（文字、语音、论坛、舞台），按分类分组
@@ -3964,10 +4819,7 @@ async def setup_guide_channels():
             # 构建导航（排除指路自身、文件存储、举报审核）
             lines = []
             for cat_name, chs in categories.items():
-                filtered = [ch for ch in chs
-                            if ch.id != channel.id
-                            and ch.name not in EXCLUDED_NAMES
-                            and GUIDE_CHANNEL_KEYWORD not in ch.name]
+                filtered = [ch for ch in chs if not _hidden_from_guide(ch, channel.id)]
                 if not filtered:
                     continue
                 lines.append(f"**📁 {cat_name}**")
@@ -3975,10 +4827,7 @@ async def setup_guide_channels():
                     lines.append(f"　└ {ch.mention}")
                 lines.append("")
 
-            filtered_no_cat = [ch for ch in no_category
-                               if ch.id != channel.id
-                               and ch.name not in EXCLUDED_NAMES
-                               and GUIDE_CHANNEL_KEYWORD not in ch.name]
+            filtered_no_cat = [ch for ch in no_category if not _hidden_from_guide(ch, channel.id)]
             if filtered_no_cat:
                 lines.append("**📁 未分类**")
                 for ch in filtered_no_cat:
@@ -4076,6 +4925,7 @@ def _purge_guild_files(guild_id: str, extra_channel_ids=None):
     removed_ids = set()
     for fid, rec in list(file_records.items()):
         if str(rec.get("guild_id")) == gid:
+            _delete_record_files(rec)
             file_records.pop(fid, None)
             removed_ids.add(str(fid))
     extra = {str(cid) for cid in (extra_channel_ids or [])}
@@ -4372,18 +5222,47 @@ _runner = None
 async def start_http_server():
     """启动轻量 HTTP 服务器用于平台健康检查"""
     global _runner
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.getenv("SERVER_PORT") or os.getenv("PORT") or 8080)
     app = web.Application()
     
     async def health_check(request):
         return web.Response(text="OK")
-    
+
+    async def handle_claim(request):
+        _purge_claim_tokens()
+        token = request.match_info.get("token")
+        item = _claim_tokens.get(token)
+        now = datetime.now(timezone.utc).timestamp()
+        if not item:
+            return web.Response(status=404, text="链接无效或已过期")
+        if item.get("expires_at", 0) <= now:
+            _claim_tokens.pop(token, None)
+            return web.Response(status=410, text="链接已过期，请重新点下载")
+        data = item.get("data")
+        filename = item.get("filename") or "file"
+        if data is None:
+            return web.Response(status=404, text="文件已丢失")
+        ascii_name = _safe_filename(filename)
+        headers = {
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": (
+                f'attachment; filename="{ascii_name}"; '
+                f"filename*=UTF-8''{quote(filename)}"
+            ),
+            "X-Content-Type-Options": "nosniff",
+            "Cache-Control": "no-store",
+        }
+        return web.Response(body=data, headers=headers)
+
     app.router.add_get("/", health_check)
+    app.router.add_get("/claim/{token}", handle_claim)
+    app.router.add_get("/claim/{token}/{filename}", handle_claim)
     _runner = web.AppRunner(app)
     await _runner.setup()
     site = web.TCPSite(_runner, "0.0.0.0", port)
     await site.start()
-    logger.info(f"🌐 HTTP 健康检查已启动，端口: {port}")
+    public_url = _public_base_url() or "(未设置 PUBLIC_BASE_URL)"
+    logger.info(f"HTTP 已启动，端口: {port}，领取根地址: {public_url}")
 
 
 # ═══════════════════════════════════════════
@@ -4429,6 +5308,7 @@ if __name__ == "__main__":
         # 注册持久化视图（必须在 bot.start() 之前）
         bot.add_view(PersistentQuizView())
         bot.add_view(PersistentCheckinView())
+        bot.add_view(PersistentGambleView())
         bot.add_view(PersistentReportEntryView())
         bot.add_view(ThreadReportStartView())
         bot.add_view(PersistentReportReviewView())
