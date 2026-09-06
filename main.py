@@ -11,12 +11,13 @@ import zlib
 import discord
 from discord.ext import commands
 from discord import app_commands
+import aiohttp
 from aiohttp import web
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from collections import defaultdict, deque
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 # 配置日志
 logging.basicConfig(
@@ -47,10 +48,16 @@ GIVEAWAY_FILE = "giveaway_data.json"
 MUSIC_FILE = "music_data.json"
 MUSIC_CHANNEL_KEYWORD = "贝多芬"
 MUSIC_STORE_DIR = os.path.join("file_store", "music")
-MUSIC_MAX_BYTES = 10 * 1024 * 1024
+MUSIC_MAX_BYTES = 25 * 1024 * 1024
 MUSIC_MAX_TRACKS = 100
 MUSIC_PAGE_SIZE = 20
 MUSIC_AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".m4a", ".flac", ".opus")
+MUSIC_URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+", re.IGNORECASE)
+MUSIC_PLATFORM_RE = re.compile(
+    r"(music\.163\.com|163cn\.tv|y\.qq\.com|i\.y\.qq\.com|open\.spotify\.com|"
+    r"youtu\.be|youtube\.com|bilibili\.com|b23\.tv|kugou\.com|kuwo\.cn)",
+    re.IGNORECASE,
+)
 GAMBLE_CHANNEL_KEYWORD = "赌王来一下"
 GAMBLE_DRAW_COST_POINTS = 10
 GAMBLE_FRAGMENT_PER_TICKET = 5
@@ -4392,9 +4399,14 @@ def _music_state(guild_id) -> dict:
 
 
 def _music_title_from_filename(name: str) -> str:
-    base = os.path.splitext(os.path.basename(name or "未命名"))[0]
-    cleaned = " ".join((base or "未命名").replace("_", " ").split())
-    return cleaned[:80] or "未命名"
+    cleaned = " ".join((os.path.basename(name or "未命名") or "未命名").split())
+    return cleaned[:100] or "未命名"
+
+
+def _music_caption_title(text: str) -> str:
+    cleaned = " ".join((text or "").split())
+    cleaned = MUSIC_URL_RE.sub("", cleaned).strip(" -_|")
+    return cleaned[:100]
 
 
 def _is_music_attachment(att) -> bool:
@@ -4452,7 +4464,7 @@ def _build_music_embed(state: dict) -> discord.Embed:
             )
         list_txt = "\n".join(lines)
     else:
-        list_txt = "歌单还空着。把 mp3 / ogg / wav / m4a 丢进这个频道就会进歌单。"
+        list_txt = "歌单还空着。把 mp3 / ogg / wav / m4a 丢进这个频道，或发直接音频地址，就会进歌单。"
     embed = discord.Embed(
         title="贝多芬时代",
         description=(
@@ -4462,7 +4474,7 @@ def _build_music_embed(state: dict) -> discord.Embed:
         )[:4000],
         color=discord.Color.dark_gold(),
     )
-    embed.set_footer(text="在本频道丢音频即可分享 | 选歌后点播放 | 看着播放条才能听")
+    embed.set_footer(text="丢音频或直接音频链接即可分享 | 选歌后点播放 | 看着播放条才能听")
     return embed
 
 
@@ -4507,7 +4519,15 @@ class PersistentMusicView(discord.ui.View):
     async def play_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _play_selected_track(interaction)
 
-    @discord.ui.button(label="上一页", style=discord.ButtonStyle.secondary, custom_id="music_prev", row=1)
+    @discord.ui.button(label="上一首", style=discord.ButtonStyle.secondary, custom_id="music_prev_track", row=1)
+    async def prev_track_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _play_adjacent_track(interaction, -1)
+
+    @discord.ui.button(label="下一首", style=discord.ButtonStyle.secondary, custom_id="music_next_track", row=1)
+    async def next_track_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _play_adjacent_track(interaction, 1)
+
+    @discord.ui.button(label="上一页", style=discord.ButtonStyle.secondary, custom_id="music_prev", row=2)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = _music_state(interaction.guild.id)
         state["page"] = (int(state.get("page") or 0) - 1) % _music_page_count(state)
@@ -4515,7 +4535,7 @@ class PersistentMusicView(discord.ui.View):
         await _refresh_music_card(interaction.guild, state)
         await interaction.response.defer()
 
-    @discord.ui.button(label="下一页", style=discord.ButtonStyle.secondary, custom_id="music_next", row=1)
+    @discord.ui.button(label="下一页", style=discord.ButtonStyle.secondary, custom_id="music_next", row=2)
     async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         state = _music_state(interaction.guild.id)
         state["page"] = (int(state.get("page") or 0) + 1) % _music_page_count(state)
@@ -4523,7 +4543,7 @@ class PersistentMusicView(discord.ui.View):
         await _refresh_music_card(interaction.guild, state)
         await interaction.response.defer()
 
-    @discord.ui.button(label="下架这首", style=discord.ButtonStyle.danger, custom_id="music_remove", row=1)
+    @discord.ui.button(label="下架这首", style=discord.ButtonStyle.danger, custom_id="music_remove", row=2)
     async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _remove_selected_track(interaction)
 
@@ -4575,47 +4595,160 @@ async def setup_music_channels():
             logger.error(f"贝多芬频道 #{channel.name} 设置失败: {e}")
 
 
-async def _add_music_track(guild: discord.Guild, user, att) -> str:
-    state = _music_state(guild.id)
+def _append_music_track(state: dict, user, filename: str, data: bytes, title: str = "") -> str:
     if len(state.get("tracks") or []) >= MUSIC_MAX_TRACKS:
         return "歌单满了，先下架几首再分享。"
-    size = int(getattr(att, "size", 0) or 0)
+    size = len(data or b"")
+    if size <= 0:
+        return "空文件，没收入。"
     if size > MUSIC_MAX_BYTES:
-        return f"{att.filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
-    data = await att.read()
-    path = _new_music_path(att.filename)
+        return f"{filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
+    path = _new_music_path(filename)
     with open(path, "wb") as f:
         f.write(data)
+    display = (title or "").strip() or _music_title_from_filename(filename)
     track = {
         "id": secrets.token_hex(6),
-        "title": _music_title_from_filename(att.filename),
-        "filename": att.filename,
+        "title": display[:100],
+        "filename": filename,
         "path": path,
-        "size": size or len(data),
+        "size": size,
         "sharer_id": str(user.id),
         "sharer_name": getattr(user, "display_name", None) or str(user),
         "added_at": _beijing_now().isoformat(),
     }
     state.setdefault("tracks", []).append(track)
-    last_page = _music_page_count(state) - 1
-    state["page"] = last_page
+    state["page"] = _music_page_count(state) - 1
     save_music()
+    return ""
+
+
+async def _add_music_track(guild: discord.Guild, user, att, caption: str = "") -> str:
+    state = _music_state(guild.id)
+    size = int(getattr(att, "size", 0) or 0)
+    if size > MUSIC_MAX_BYTES:
+        return f"{att.filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
+    data = await att.read()
+    err = _append_music_track(
+        state,
+        user,
+        att.filename,
+        data,
+        _music_caption_title(caption) or _music_title_from_filename(att.filename),
+    )
+    if err:
+        return err
+    await _refresh_music_card(guild, state)
+    return ""
+
+
+def _filename_from_url(url: str) -> str:
+    path = unquote(urlparse(url).path or "")
+    name = os.path.basename(path.rstrip("/"))
+    if any(name.lower().endswith(ext) for ext in MUSIC_AUDIO_EXTS):
+        return name
+    return ""
+
+
+def _looks_like_audio_url(url: str) -> bool:
+    return bool(_filename_from_url(url))
+
+
+def _music_urls_in_text(text: str) -> list:
+    found = []
+    for raw in MUSIC_URL_RE.findall(text or ""):
+        url = raw.rstrip(".,;:!?)]}>\"'")
+        if url not in found:
+            found.append(url)
+    return found
+
+
+def _music_platform_note(urls: list) -> str:
+    platforms = [url for url in urls if MUSIC_PLATFORM_RE.search(url)]
+    if not platforms:
+        return ""
+    return "网易云 / QQ / YouTube 这类页面链接我不会去扒歌，发直接音频地址（以 .mp3 等结尾）才能入库。"
+
+
+async def _download_direct_audio(url: str):
+    filename = _filename_from_url(url)
+    if not filename:
+        return None, "不是直接音频地址。"
+    timeout = aiohttp.ClientTimeout(total=45)
+    headers = {"User-Agent": "Mozilla/5.0 Chen-Abot"}
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as resp:
+                if resp.status >= 400:
+                    return None, f"{filename} 下载失败（{resp.status}）。"
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                clen = resp.headers.get("Content-Length")
+                if clen and int(clen) > MUSIC_MAX_BYTES:
+                    return None, f"{filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
+                if ctype and not (
+                    ctype.startswith("audio/")
+                    or ctype in ("application/octet-stream", "binary/octet-stream")
+                    or "mpeg" in ctype
+                ):
+                    if not _looks_like_audio_url(str(resp.url)):
+                        return None, f"{filename} 看起来不是音频文件。"
+                data = bytearray()
+                async for chunk in resp.content.iter_chunked(64 * 1024):
+                    data.extend(chunk)
+                    if len(data) > MUSIC_MAX_BYTES:
+                        return None, f"{filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
+                if not data:
+                    return None, f"{filename} 是空的。"
+                final_name = _filename_from_url(str(resp.url)) or filename
+                return (final_name, bytes(data)), ""
+    except Exception as e:
+        return None, f"{filename} 下载失败: {e}"
+
+
+async def _add_music_bytes(guild: discord.Guild, user, filename: str, data: bytes, caption: str = "") -> str:
+    state = _music_state(guild.id)
+    err = _append_music_track(
+        state,
+        user,
+        filename,
+        data,
+        _music_caption_title(caption) or _music_title_from_filename(filename),
+    )
+    if err:
+        return err
     await _refresh_music_card(guild, state)
     return ""
 
 
 async def _ingest_music_message(message: discord.Message) -> bool:
     audio_atts = [att for att in (message.attachments or []) if _is_music_attachment(att)]
-    if not audio_atts:
+    urls = _music_urls_in_text(message.content or "")
+    audio_urls = [url for url in urls if _looks_like_audio_url(url)]
+    platform_note = _music_platform_note(urls)
+    if not audio_atts and not audio_urls and not platform_note:
         return False
     added = 0
     errors = []
+    caption = message.content or ""
     for att in audio_atts:
-        err = await _add_music_track(message.guild, message.author, att)
+        err = await _add_music_track(message.guild, message.author, att, caption)
         if err:
             errors.append(err)
         else:
             added += 1
+    for url in audio_urls:
+        result, err = await _download_direct_audio(url)
+        if err:
+            errors.append(err)
+            continue
+        filename, data = result
+        err = await _add_music_bytes(message.guild, message.author, filename, data, caption)
+        if err:
+            errors.append(err)
+        else:
+            added += 1
+    if platform_note:
+        errors.append(platform_note)
     try:
         await message.delete()
     except Exception:
@@ -4628,15 +4761,14 @@ async def _ingest_music_message(message: discord.Message) -> bool:
         try:
             await message.channel.send(
                 f"{message.author.mention} " + " ".join(note),
-                delete_after=8,
+                delete_after=12,
             )
         except Exception:
             pass
     return True
 
 
-def _selected_music_track(interaction: discord.Interaction, state: dict):
-    track_id = _music_selections.get((interaction.guild.id, interaction.user.id))
+def _track_by_id(state: dict, track_id) -> Optional[dict]:
     if not track_id:
         return None
     for track in state.get("tracks") or []:
@@ -4645,12 +4777,26 @@ def _selected_music_track(interaction: discord.Interaction, state: dict):
     return None
 
 
-async def _play_selected_track(interaction: discord.Interaction):
+def _selected_music_track(interaction: discord.Interaction, state: dict):
+    return _track_by_id(state, _music_selections.get((interaction.guild.id, interaction.user.id)))
+
+
+def _adjacent_music_track(state: dict, step: int):
+    tracks = state.get("tracks") or []
+    if not tracks:
+        return None
+    now = state.get("now_playing") or {}
+    current_id = now.get("track_id")
+    idx = 0
+    for i, track in enumerate(tracks):
+        if str(track.get("id")) == str(current_id):
+            idx = i
+            break
+    return tracks[(idx + step) % len(tracks)]
+
+
+async def _send_music_play(interaction: discord.Interaction, track: dict):
     state = _music_state(interaction.guild.id)
-    track = _selected_music_track(interaction, state)
-    if not track:
-        await interaction.response.send_message("先在歌单里选一首。", ephemeral=True)
-        return
     path = track.get("path")
     if not path or not os.path.isfile(path):
         await interaction.response.send_message("这首的文件丢了，先下架再重新分享。", ephemeral=True)
@@ -4681,9 +4827,28 @@ async def _play_selected_track(interaction: discord.Interaction):
         "requester_name": interaction.user.display_name,
         "track_id": track.get("id"),
     }
+    _music_selections[(interaction.guild.id, interaction.user.id)] = str(track.get("id"))
     save_music()
     await _refresh_music_card(interaction.guild, state)
     await interaction.followup.send("已切到这首。看着频道里的播放条就能听。", ephemeral=True)
+
+
+async def _play_selected_track(interaction: discord.Interaction):
+    state = _music_state(interaction.guild.id)
+    track = _selected_music_track(interaction, state)
+    if not track:
+        await interaction.response.send_message("先在歌单里选一首。", ephemeral=True)
+        return
+    await _send_music_play(interaction, track)
+
+
+async def _play_adjacent_track(interaction: discord.Interaction, step: int):
+    state = _music_state(interaction.guild.id)
+    track = _adjacent_music_track(state, step)
+    if not track:
+        await interaction.response.send_message("歌单还空着。", ephemeral=True)
+        return
+    await _send_music_play(interaction, track)
 
 
 async def _remove_selected_track(interaction: discord.Interaction):
