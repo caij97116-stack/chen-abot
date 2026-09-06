@@ -2,6 +2,7 @@ import os
 import io
 import json
 import random
+import re
 import secrets
 import struct
 import asyncio
@@ -42,6 +43,7 @@ POINTS_FILE = "points.json"
 CHECKIN_CHANNEL_FILE = "checkin_channels.json"
 GAMBLE_FILE = "gamble_data.json"
 GAMBLE_CHANNEL_FILE = "gamble_channels.json"
+GIVEAWAY_FILE = "giveaway_data.json"
 GAMBLE_CHANNEL_KEYWORD = "赌王来一下"
 GAMBLE_DRAW_COST_POINTS = 10
 GAMBLE_FRAGMENT_PER_TICKET = 5
@@ -1084,6 +1086,27 @@ def save_gamble_channels():
         logger.error(f"保存赌王频道信息失败: {e}")
 
 
+giveaway_data: dict = {}
+
+
+def load_giveaways():
+    global giveaway_data
+    try:
+        if os.path.exists(GIVEAWAY_FILE):
+            with open(GIVEAWAY_FILE, "r", encoding="utf-8") as f:
+                giveaway_data = json.load(f)
+    except Exception:
+        giveaway_data = {}
+
+
+def save_giveaways():
+    try:
+        with open(GIVEAWAY_FILE, "w", encoding="utf-8") as f:
+            json.dump(giveaway_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存红包/抽奖券发放失败: {e}")
+
+
 def _checkin_today() -> str:
     return _beijing_now().strftime("%Y-%m-%d")
 
@@ -1372,6 +1395,7 @@ async def on_ready():
     load_checkin_channels()
     load_gamble()
     load_gamble_channels()
+    load_giveaways()
     load_reports()
     load_report_channels()
     load_report_counter()
@@ -3795,6 +3819,7 @@ async def setup_gamble_channels():
                 async for old_msg in channel.history(limit=50):
                     if old_msg.author.id != bot.user.id:
                         continue
+                    title = old_msg.embeds[0].title if old_msg.embeds else ""
                     if existing_msg_id and str(old_msg.id) == existing_msg_id:
                         try:
                             await old_msg.edit(embed=embed, view=PersistentGambleView())
@@ -3802,7 +3827,7 @@ async def setup_gamble_channels():
                             logger.info(f"更新赌王卡片: #{channel.name}")
                         except Exception:
                             pass
-                    else:
+                    elif title == "赌王来一下":
                         try:
                             await old_msg.delete()
                         except Exception:
@@ -3816,6 +3841,483 @@ async def setup_gamble_channels():
                 logger.warning(f"无权限在 #{channel.name} 发送消息")
             except Exception as e:
                 logger.error(f"赌王频道 #{channel.name} 设置失败: {e}")
+
+
+def _in_gamble_channel(interaction: discord.Interaction) -> bool:
+    channel = interaction.channel
+    names = []
+    if channel is not None:
+        names.append(getattr(channel, "name", "") or "")
+        parent = getattr(channel, "parent", None)
+        if parent is not None:
+            names.append(getattr(parent, "name", "") or "")
+    return any(GAMBLE_CHANNEL_KEYWORD in name for name in names)
+
+
+def _require_owner_gamble(interaction: discord.Interaction):
+    if not _is_island_owner(interaction):
+        return "只有岛主能用这个指令。"
+    if not _in_gamble_channel(interaction):
+        return f"请到名称含「{GAMBLE_CHANNEL_KEYWORD}」的频道使用。"
+    return ""
+
+
+def _add_user_points(guild_id: str, user_id: str, amount: int) -> int:
+    rec = _get_checkin_record(str(guild_id), str(user_id))
+    rec["points"] = int(rec.get("points") or 0) + int(amount)
+    save_points()
+    return rec["points"]
+
+
+def _add_user_tickets(guild_id: str, user_id: str, amount: int) -> int:
+    rec = _get_gamble_record(str(guild_id), str(user_id))
+    rec["tickets"] = int(rec.get("tickets") or 0) + int(amount)
+    save_gamble()
+    return rec["tickets"]
+
+
+def _split_redpacket(total: int, people: int) -> list:
+    remaining_points = total
+    remaining_people = people
+    parts = []
+    for _ in range(people - 1):
+        avg = remaining_points / remaining_people
+        high = max(1, min(remaining_points - (remaining_people - 1), int(avg * 2)))
+        got = random.randint(1, high)
+        parts.append(got)
+        remaining_points -= got
+        remaining_people -= 1
+    parts.append(remaining_points)
+    random.shuffle(parts)
+    return parts
+
+
+def _parse_giveaway_deadline(text: str):
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    raw = raw.replace("年", "-").replace("月", "-").replace("日", " ").replace("号", " ")
+    raw = raw.replace("点", ":00").replace("：", ":")
+    raw = " ".join(raw.split())
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S", "%m-%d %H:%M"):
+        try:
+            parsed = datetime.strptime(raw, fmt)
+            if parsed.year == 1900:
+                parsed = parsed.replace(year=_beijing_now().year)
+            return parsed.replace(tzinfo=BEIJING_TZ)
+        except ValueError:
+            continue
+    raise ValueError("截止时间请写成 2026-09-06 22:00")
+
+
+def _giveaway_expired(rec: dict) -> bool:
+    expire_at = rec.get("expire_at") or ""
+    if not expire_at:
+        return False
+    try:
+        deadline = datetime.fromisoformat(expire_at)
+        if deadline.tzinfo is None:
+            deadline = deadline.replace(tzinfo=BEIJING_TZ)
+        return _beijing_now() >= deadline
+    except Exception:
+        return False
+
+
+async def _fetch_guild_member(guild: discord.Guild, user_id: int):
+    member = guild.get_member(user_id)
+    if member:
+        return member
+    try:
+        return await guild.fetch_member(user_id)
+    except Exception:
+        return None
+
+
+def _member_name_hits(member, token: str) -> bool:
+    names = [
+        (member.display_name or "").lower(),
+        (member.name or "").lower(),
+        (getattr(member, "global_name", None) or "").lower(),
+    ]
+    return any(token and token in name for name in names)
+
+
+async def _resolve_giveaway_users(guild: discord.Guild, text: str) -> list:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    found = []
+    seen = set()
+    tokens = [part.strip() for part in re.split(r"[,，\n\s]+", raw) if part.strip()]
+
+    def add_member(member):
+        if member is None:
+            return
+        key = str(member.id)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(member)
+
+    leftovers = []
+    for token in tokens:
+        mention = re.fullmatch(r"<@!?(\d+)>", token)
+        if mention:
+            add_member(await _fetch_guild_member(guild, int(mention.group(1))))
+            continue
+        if token.isdigit():
+            add_member(await _fetch_guild_member(guild, int(token)))
+            continue
+        leftovers.append(token.lower())
+    for token in leftovers:
+        matches = [m for m in guild.members if _member_name_hits(m, token)]
+        exact = [
+            m for m in matches
+            if token in (
+                (m.display_name or "").lower(),
+                (m.name or "").lower(),
+                (getattr(m, "global_name", None) or "").lower(),
+            )
+        ]
+        if exact:
+            matches = exact
+        if not matches:
+            try:
+                queried = await guild.query_members(query=token, limit=5)
+            except Exception:
+                queried = []
+            matches = [m for m in queried if _member_name_hits(m, token)] or list(queried)
+        if len(matches) == 1:
+            add_member(matches[0])
+        elif not matches:
+            raise ValueError(f"找不到领取人：{token}")
+        else:
+            raise ValueError(f"「{token}」对上了多人，请改用 @ 或用户ID")
+    return found
+
+
+def _new_giveaway_id() -> str:
+    for _ in range(16):
+        gid = secrets.token_hex(6)
+        if gid not in giveaway_data:
+            return gid
+    return secrets.token_hex(8)
+
+
+def _find_giveaway_by_message(message_id) -> tuple:
+    target = str(message_id)
+    for gid, rec in giveaway_data.items():
+        if str(rec.get("message_id") or "") == target:
+            return gid, rec
+    return None, None
+
+
+def _redpacket_embed(rec: dict) -> discord.Embed:
+    claimed = rec.get("claimed") or {}
+    remaining = rec.get("remaining") or []
+    total = int(rec.get("total_points") or 0)
+    slots = int(rec.get("slots") or 0)
+    taken = len(claimed)
+    if remaining:
+        status = f"还剩 **{len(remaining)}** 份，点拆开随机拿积分。"
+        color = discord.Color.red()
+    else:
+        status = "已经抢完了。"
+        color = discord.Color.dark_grey()
+    desc = (
+        f"**总分:** {total}\n"
+        f"**人数:** {slots}\n"
+        f"**已拆:** {taken}/{slots}\n\n"
+        f"{status}"
+    )
+    embed = discord.Embed(title="积分红包", description=desc, color=color)
+    embed.set_footer(text="每人只能拆一次 | 抢完后再点会提示已经没有了")
+    return embed
+
+
+def _ticket_give_embed(rec: dict) -> discord.Embed:
+    claimed = rec.get("claimed") or {}
+    amount = int(rec.get("ticket_amount") or 0)
+    mode = rec.get("mode") or "all"
+    expire_at = rec.get("expire_at") or ""
+    expire_txt = "无"
+    if expire_at:
+        try:
+            deadline = datetime.fromisoformat(expire_at)
+            expire_txt = deadline.astimezone(BEIJING_TZ).strftime("%Y-%m-%d %H:%M")
+        except Exception:
+            expire_txt = expire_at
+    if mode == "all":
+        target_txt = "全员，每人可领一次"
+    else:
+        allowed = rec.get("allowed_ids") or []
+        target_txt = " ".join(f"<@{uid}>" for uid in allowed) or "指定领取人"
+    if _giveaway_expired(rec):
+        status = "已经过期，不能再领。"
+        color = discord.Color.dark_grey()
+    else:
+        status = "点领取拿抽奖券。过了截止时间就领不到了。"
+        color = discord.Color.green()
+    desc = (
+        f"**每人张数:** {amount}\n"
+        f"**领取对象:** {target_txt}\n"
+        f"**截止:** {expire_txt}\n"
+        f"**已领取:** {len(claimed)}\n\n"
+        f"{status}"
+    )
+    embed = discord.Embed(title="抽奖券发放", description=desc[:4000], color=color)
+    embed.set_footer(text="指定的人才能领 | 每人一次")
+    return embed
+
+
+class PersistentRedPacketView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="拆开", style=discord.ButtonStyle.danger, custom_id="giveaway_redpacket_open")
+    async def open_packet(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid, rec = _find_giveaway_by_message(interaction.message.id)
+        if not rec:
+            await interaction.response.send_message("这个红包已经失效。", ephemeral=True)
+            return
+        user_id = str(interaction.user.id)
+        claimed = rec.setdefault("claimed", {})
+        remaining = rec.setdefault("remaining", [])
+        if user_id in claimed:
+            await interaction.response.send_message(
+                f"你已经拆过了，当时拿到 **{claimed[user_id]}** 积分。",
+                ephemeral=True,
+            )
+            return
+        if not remaining:
+            await interaction.response.send_message("已经没有了。", ephemeral=True)
+            return
+        got = remaining.pop(0)
+        claimed[user_id] = got
+        save_giveaways()
+        total_now = _add_user_points(rec.get("guild_id"), user_id, got)
+        try:
+            await interaction.message.edit(embed=_redpacket_embed(rec), view=PersistentRedPacketView())
+        except Exception:
+            pass
+        await interaction.response.send_message(
+            f"拆开红包，拿到 **{got}** 积分。当前积分 **{total_now}**。",
+            ephemeral=True,
+        )
+
+
+class PersistentTicketGiveView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="领取", style=discord.ButtonStyle.success, custom_id="giveaway_ticket_claim")
+    async def claim_ticket(self, interaction: discord.Interaction, button: discord.ui.Button):
+        gid, rec = _find_giveaway_by_message(interaction.message.id)
+        if not rec:
+            await interaction.response.send_message("这次发放已经失效。", ephemeral=True)
+            return
+        user_id = str(interaction.user.id)
+        claimed = rec.setdefault("claimed", {})
+        if _giveaway_expired(rec):
+            rec["status"] = "expired"
+            save_giveaways()
+            try:
+                await interaction.message.edit(embed=_ticket_give_embed(rec), view=PersistentTicketGiveView())
+            except Exception:
+                pass
+            await interaction.response.send_message("已经过期了。", ephemeral=True)
+            return
+        allowed = rec.get("allowed_ids") or []
+        if rec.get("mode") != "all" and user_id not in [str(x) for x in allowed]:
+            await interaction.response.send_message("这不是给你的，领不了。", ephemeral=True)
+            return
+        if user_id in claimed:
+            await interaction.response.send_message(
+                f"你已经领过了，当时拿到 **{claimed[user_id]}** 张抽奖券。",
+                ephemeral=True,
+            )
+            return
+        amount = int(rec.get("ticket_amount") or 0)
+        claimed[user_id] = amount
+        save_giveaways()
+        total_now = _add_user_tickets(rec.get("guild_id"), user_id, amount)
+        try:
+            await interaction.message.edit(embed=_ticket_give_embed(rec), view=PersistentTicketGiveView())
+        except Exception:
+            pass
+        await interaction.response.send_message(
+            f"领取成功，拿到 **{amount}** 张抽奖券。当前抽奖券 **{total_now}**。",
+            ephemeral=True,
+        )
+
+
+class RedPacketModal(discord.ui.Modal, title="发积分红包"):
+    def __init__(self):
+        super().__init__()
+        self.total_input = discord.ui.TextInput(
+            label="总分",
+            placeholder="例如 100",
+            required=True,
+            max_length=8,
+        )
+        self.people_input = discord.ui.TextInput(
+            label="允许领取人数",
+            placeholder="例如 5",
+            required=True,
+            max_length=4,
+        )
+        self.add_item(self.total_input)
+        self.add_item(self.people_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        err = _require_owner_gamble(interaction)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        try:
+            total = int(str(self.total_input.value).strip())
+            people = int(str(self.people_input.value).strip())
+        except ValueError:
+            await interaction.response.send_message("总分和人数都要填整数。", ephemeral=True)
+            return
+        if total < 1 or people < 1:
+            await interaction.response.send_message("总分和人数都要大于 0。", ephemeral=True)
+            return
+        if people > 50:
+            await interaction.response.send_message("一次最多 50 人抢。", ephemeral=True)
+            return
+        if total < people:
+            await interaction.response.send_message("总分不能少于人数，每人至少 1 积分。", ephemeral=True)
+            return
+        parts = _split_redpacket(total, people)
+        gid = _new_giveaway_id()
+        rec = {
+            "kind": "redpacket",
+            "guild_id": str(interaction.guild.id),
+            "channel_id": str(interaction.channel.id),
+            "message_id": "",
+            "total_points": total,
+            "slots": people,
+            "remaining": parts,
+            "claimed": {},
+            "status": "open",
+        }
+        giveaway_data[gid] = rec
+        await interaction.response.send_message("红包已发出。", ephemeral=True)
+        msg = await interaction.channel.send(embed=_redpacket_embed(rec), view=PersistentRedPacketView())
+        rec["message_id"] = str(msg.id)
+        save_giveaways()
+
+
+class TicketGiveModal(discord.ui.Modal, title="发抽奖券"):
+    def __init__(self):
+        super().__init__()
+        self.amount_input = discord.ui.TextInput(
+            label="每人发放张数",
+            placeholder="例如 2",
+            required=True,
+            max_length=4,
+        )
+        self.mode_input = discord.ui.TextInput(
+            label="发放方式",
+            placeholder="一人 / 多人 / 全员",
+            required=True,
+            max_length=8,
+        )
+        self.targets_input = discord.ui.TextInput(
+            label="领取人",
+            placeholder="一人或多人时填 @用户、ID 或名字，全员可空",
+            required=False,
+            style=discord.TextStyle.paragraph,
+            max_length=400,
+        )
+        self.deadline_input = discord.ui.TextInput(
+            label="截止时间",
+            placeholder="2026-09-06 22:00，可空表示不限期",
+            required=False,
+            max_length=32,
+        )
+        self.add_item(self.amount_input)
+        self.add_item(self.mode_input)
+        self.add_item(self.targets_input)
+        self.add_item(self.deadline_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        err = _require_owner_gamble(interaction)
+        if err:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        try:
+            amount = int(str(self.amount_input.value).strip())
+        except ValueError:
+            await interaction.response.send_message("张数要填整数。", ephemeral=True)
+            return
+        if amount < 1 or amount > 99:
+            await interaction.response.send_message("张数请填 1 到 99。", ephemeral=True)
+            return
+        mode_raw = str(self.mode_input.value or "").strip()
+        if mode_raw in ("全员", "所有人", "统一分发"):
+            mode = "all"
+            members = []
+        elif mode_raw in ("一人", "多人", "指定", "指定一人", "指定多人"):
+            mode = "specific"
+            try:
+                members = await _resolve_giveaway_users(interaction.guild, str(self.targets_input.value or ""))
+            except ValueError as e:
+                await interaction.response.send_message(str(e), ephemeral=True)
+                return
+            if not members:
+                await interaction.response.send_message("指定发放时请填写领取人。", ephemeral=True)
+                return
+        else:
+            await interaction.response.send_message("发放方式请填：一人、多人或全员。", ephemeral=True)
+            return
+        try:
+            deadline = _parse_giveaway_deadline(str(self.deadline_input.value or ""))
+        except ValueError as e:
+            await interaction.response.send_message(str(e), ephemeral=True)
+            return
+        gid = _new_giveaway_id()
+        rec = {
+            "kind": "ticket",
+            "guild_id": str(interaction.guild.id),
+            "channel_id": str(interaction.channel.id),
+            "message_id": "",
+            "ticket_amount": amount,
+            "mode": mode,
+            "allowed_ids": [str(m.id) for m in members],
+            "expire_at": deadline.isoformat() if deadline else "",
+            "claimed": {},
+            "status": "open",
+        }
+        giveaway_data[gid] = rec
+        mention = " ".join(m.mention for m in members)
+        await interaction.response.send_message("抽奖券发放已发出。", ephemeral=True)
+        msg = await interaction.channel.send(
+            content=mention or None,
+            embed=_ticket_give_embed(rec),
+            view=PersistentTicketGiveView(),
+        )
+        rec["message_id"] = str(msg.id)
+        save_giveaways()
+
+
+@bot.tree.command(name="积分红包", description="岛主在赌王频道发积分红包")
+async def redpacket_command(interaction: discord.Interaction):
+    err = _require_owner_gamble(interaction)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    await interaction.response.send_modal(RedPacketModal())
+
+
+@bot.tree.command(name="抽奖券", description="岛主在赌王频道发放抽奖券")
+async def ticket_give_command(interaction: discord.Interaction):
+    err = _require_owner_gamble(interaction)
+    if err:
+        await interaction.response.send_message(err, ephemeral=True)
+        return
+    await interaction.response.send_modal(TicketGiveModal())
 
 
 # ═══════════════════════════════════════════
@@ -5309,6 +5811,8 @@ if __name__ == "__main__":
         bot.add_view(PersistentQuizView())
         bot.add_view(PersistentCheckinView())
         bot.add_view(PersistentGambleView())
+        bot.add_view(PersistentRedPacketView())
+        bot.add_view(PersistentTicketGiveView())
         bot.add_view(PersistentReportEntryView())
         bot.add_view(ThreadReportStartView())
         bot.add_view(PersistentReportReviewView())
