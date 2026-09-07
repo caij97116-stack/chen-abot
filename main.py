@@ -60,7 +60,15 @@ MUSIC_PLATFORM_RE = re.compile(
 )
 GAMBLE_CHANNEL_KEYWORD = "赌王来一下"
 GAMBLE_DRAW_COST_POINTS = 10
+GAMBLE_DRAW_TEN = 10
 GAMBLE_FRAGMENT_PER_TICKET = 5
+STORY_FILE = "story_data.json"
+STORY_CHANNEL_KEYWORD = "故事分享会"
+STORY_STORE_DIR = os.path.join("file_store", "story")
+STORY_MAX_IMAGES = 4
+STORY_TEXT_MAX = 1000
+STORY_COMMENT_MAX = 300
+STORY_COMMENT_SHOW = 8
 REPORT_FILE = "report_data.json"
 REPORT_COUNTER_FILE = "report_counter.json"
 REPORT_CHANNEL_KEYWORD = "间谍"          # 举报入口频道关键词
@@ -188,6 +196,7 @@ _ZIP_EXTRA_ID = 0x4342  # 'CB'
 def _ensure_file_store():
     os.makedirs(FILE_STORE_DIR, exist_ok=True)
     os.makedirs(MUSIC_STORE_DIR, exist_ok=True)
+    os.makedirs(STORY_STORE_DIR, exist_ok=True)
 
 
 def _safe_filename(name: str) -> str:
@@ -1144,6 +1153,40 @@ def save_music():
         logger.error(f"保存贝多芬歌单失败: {e}")
 
 
+story_data: dict = {}
+story_channel_messages: dict = {}
+_story_pending: dict = {}
+
+
+def load_stories():
+    global story_data, story_channel_messages
+    try:
+        if os.path.exists(STORY_FILE):
+            with open(STORY_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f) or {}
+            story_data = raw.get("posts") or {}
+            story_channel_messages = raw.get("cards") or {}
+            if not story_data and "posts" not in raw and raw:
+                story_data = raw
+                story_channel_messages = {}
+    except Exception:
+        story_data = {}
+        story_channel_messages = {}
+
+
+def save_stories():
+    try:
+        with open(STORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(
+                {"posts": story_data, "cards": story_channel_messages},
+                f,
+                ensure_ascii=False,
+                indent=2,
+            )
+    except Exception as e:
+        logger.error(f"保存故事分享失败: {e}")
+
+
 def _checkin_today() -> str:
     return _beijing_now().strftime("%Y-%m-%d")
 
@@ -1434,6 +1477,7 @@ async def on_ready():
     load_gamble_channels()
     load_giveaways()
     load_music()
+    load_stories()
     load_reports()
     load_report_channels()
     load_report_counter()
@@ -1458,6 +1502,8 @@ async def on_ready():
     await setup_gamble_channels()
 
     await setup_music_channels()
+
+    await setup_story_channels()
 
     # 在举报频道中发布/更新举报按钮消息
     await setup_report_channels()
@@ -3292,6 +3338,11 @@ async def on_message(message: discord.Message):
         if ingested:
             return
 
+    if STORY_CHANNEL_KEYWORD in (getattr(message.channel, "name", "") or ""):
+        ingested = await _ingest_story_message(message)
+        if ingested:
+            return
+
     if isinstance(message.channel, discord.Thread):
         rid, rec = _find_report_by_thread(str(message.channel.id))
         if rec and rec.get("status") == "reviewing" and str(message.author.id) == str(rec.get("reporter_id")):
@@ -3603,8 +3654,8 @@ def _gamble_embed() -> discord.Embed:
         title="赌王来一下",
         description=(
             "小岛夜场开张。没过审也能抽。\n\n"
-            f"**积分抽奖** 每次 {GAMBLE_DRAW_COST_POINTS} 积分，身份组概率 0.1%\n"
-            "**抽奖券抽奖** 每次 1 张券，身份组概率 0.7%\n"
+            f"**积分抽奖** 单抽 {GAMBLE_DRAW_COST_POINTS} 积分，10 连 {GAMBLE_DRAW_COST_POINTS * GAMBLE_DRAW_TEN} 积分，身份组概率 0.1%\n"
+            f"**抽奖券抽奖** 单抽 1 张券，10 连 {GAMBLE_DRAW_TEN} 张券，身份组概率 0.7%\n"
             f"**碎片合成** {GAMBLE_FRAGMENT_PER_TICKET} 个碎片换 1 张抽奖券\n\n"
             "大奖先开放：**水仙十字**（永久，可随时佩戴/卸下）\n"
             "已经抽到的身份组不会再抽到。\n"
@@ -3612,7 +3663,7 @@ def _gamble_embed() -> discord.Embed:
         ),
         color=discord.Color.dark_magenta(),
     )
-    embed.set_footer(text="点按钮仅自己可见结果 | 身份组可随时切换佩戴")
+    embed.set_footer(text="先选单抽或 10 连 | 结果仅自己可见 | 身份组可随时切换佩戴")
     return embed
 
 
@@ -3707,38 +3758,58 @@ async def _roll_gamble(interaction: discord.Interaction, source: str) -> str:
     return f"抽到：**{junk['name']}**\n{flavor}"
 
 
-async def _do_points_draw(interaction: discord.Interaction):
+def _short_gamble_line(text: str) -> str:
+    first = (text or "").split("\n", 1)[0].strip()
+    return first[:80] or "抽到一份小玩意"
+
+
+async def _do_points_draw(interaction: discord.Interaction, times: int = 1):
+    times = 1 if times != GAMBLE_DRAW_TEN else GAMBLE_DRAW_TEN
+    cost = GAMBLE_DRAW_COST_POINTS * times
     user_data = _get_checkin_record(str(interaction.guild.id), str(interaction.user.id))
-    if user_data["points"] < GAMBLE_DRAW_COST_POINTS:
+    if user_data["points"] < cost:
         await interaction.response.send_message(
-            f"积分不够。需要 {GAMBLE_DRAW_COST_POINTS}，当前 **{user_data['points']}**。",
+            f"积分不够。{times} 连需要 {cost}，当前 **{user_data['points']}**。",
             ephemeral=True,
         )
         return
-    user_data["points"] -= GAMBLE_DRAW_COST_POINTS
+    user_data["points"] -= cost
     save_points()
-    result = await _roll_gamble(interaction, "points")
+    lines = []
+    last_full = ""
+    for i in range(times):
+        result = await _roll_gamble(interaction, "points")
+        last_full = result
+        lines.append(f"{i + 1}. {_short_gamble_line(result)}")
     rec = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
+    body = last_full if times == 1 else "\n".join(lines)
     await interaction.response.send_message(
-        f"{result}\n剩余积分 **{user_data['points']}**｜抽奖券 **{rec['tickets']}**｜碎片 **{rec['fragments']}**",
+        f"{body}\n剩余积分 **{user_data['points']}**｜抽奖券 **{rec['tickets']}**｜碎片 **{rec['fragments']}**",
         ephemeral=True,
     )
 
 
-async def _do_ticket_draw(interaction: discord.Interaction):
+async def _do_ticket_draw(interaction: discord.Interaction, times: int = 1):
+    times = 1 if times != GAMBLE_DRAW_TEN else GAMBLE_DRAW_TEN
     rec = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
-    if rec["tickets"] < 1:
+    if rec["tickets"] < times:
         await interaction.response.send_message(
-            f"没有抽奖券。碎片 **{rec['fragments']}** / {GAMBLE_FRAGMENT_PER_TICKET}，可用「碎片合成」。",
+            f"抽奖券不够。{times} 连需要 {times} 张，当前 **{rec['tickets']}**。碎片 **{rec['fragments']}** / {GAMBLE_FRAGMENT_PER_TICKET}。",
             ephemeral=True,
         )
         return
-    rec["tickets"] -= 1
+    rec["tickets"] -= times
     save_gamble()
-    result = await _roll_gamble(interaction, "ticket")
+    lines = []
+    last_full = ""
+    for i in range(times):
+        result = await _roll_gamble(interaction, "ticket")
+        last_full = result
+        lines.append(f"{i + 1}. {_short_gamble_line(result)}")
     rec = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
+    body = last_full if times == 1 else "\n".join(lines)
     await interaction.response.send_message(
-        f"{result}\n剩余抽奖券 **{rec['tickets']}**｜碎片 **{rec['fragments']}**",
+        f"{body}\n剩余抽奖券 **{rec['tickets']}**｜碎片 **{rec['fragments']}**",
         ephemeral=True,
     )
 
@@ -3831,17 +3902,55 @@ async def _do_show_prizes(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
+class GambleTimesView(discord.ui.View):
+    def __init__(self, source: str):
+        super().__init__(timeout=60)
+        self.source = source
+
+    @discord.ui.button(label="单抽", style=discord.ButtonStyle.primary)
+    async def draw_one(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.source == "ticket":
+            await _do_ticket_draw(interaction, 1)
+        else:
+            await _do_points_draw(interaction, 1)
+
+    @discord.ui.button(label="10连", style=discord.ButtonStyle.success)
+    async def draw_ten(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if self.source == "ticket":
+            await _do_ticket_draw(interaction, GAMBLE_DRAW_TEN)
+        else:
+            await _do_points_draw(interaction, GAMBLE_DRAW_TEN)
+
+
+async def _ask_gamble_times(interaction: discord.Interaction, source: str):
+    if source == "ticket":
+        rec = _get_gamble_record(str(interaction.guild.id), str(interaction.user.id))
+        hint = f"当前抽奖券 **{rec['tickets']}**。单抽 1 张，10 连 {GAMBLE_DRAW_TEN} 张。"
+    else:
+        user_data = _get_checkin_record(str(interaction.guild.id), str(interaction.user.id))
+        hint = (
+            f"当前积分 **{user_data['points']}**。"
+            f"单抽 {GAMBLE_DRAW_COST_POINTS}，10 连 {GAMBLE_DRAW_COST_POINTS * GAMBLE_DRAW_TEN}。"
+        )
+    title = "抽奖券抽奖" if source == "ticket" else "积分抽奖"
+    await interaction.response.send_message(
+        f"{title}：选单抽还是 10 连。\n{hint}",
+        view=GambleTimesView(source),
+        ephemeral=True,
+    )
+
+
 class PersistentGambleView(discord.ui.View):
     def __init__(self):
         super().__init__(timeout=None)
 
     @discord.ui.button(label="积分抽奖", style=discord.ButtonStyle.primary, custom_id="gamble_points")
     async def points_draw(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _do_points_draw(interaction)
+        await _ask_gamble_times(interaction, "points")
 
     @discord.ui.button(label="抽奖券抽奖", style=discord.ButtonStyle.success, custom_id="gamble_ticket")
     async def ticket_draw(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _do_ticket_draw(interaction)
+        await _ask_gamble_times(interaction, "ticket")
 
     @discord.ui.button(label="获得奖品", style=discord.ButtonStyle.secondary, custom_id="gamble_prizes")
     async def show_prizes(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4872,6 +4981,455 @@ async def _remove_selected_track(interaction: discord.Interaction):
     save_music()
     await _refresh_music_card(interaction.guild, state)
     await interaction.response.send_message(f"已下架 **{track.get('title')}**。", ephemeral=True)
+
+
+# ═══════════════════════════════════════════
+#  故事分享会
+# ═══════════════════════════════════════════
+
+STORY_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp", ".gif")
+
+
+def _story_channel_of(guild: discord.Guild):
+    for channel in getattr(guild, "text_channels", []) or []:
+        if STORY_CHANNEL_KEYWORD in (channel.name or ""):
+            return channel
+    return None
+
+
+def _is_story_image(att) -> bool:
+    name = (getattr(att, "filename", "") or "").lower()
+    if any(name.endswith(ext) for ext in STORY_IMAGE_EXTS):
+        return True
+    ctype = (getattr(att, "content_type", "") or "").lower()
+    return ctype.startswith("image/")
+
+
+def _new_story_image_path(filename: str) -> str:
+    os.makedirs(STORY_STORE_DIR, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    return os.path.join(STORY_STORE_DIR, f"{stamp}_{secrets.token_hex(4)}_{_safe_filename(filename)}")
+
+
+def _find_story_by_message(message_id) -> tuple:
+    target = str(message_id)
+    for pid, post in story_data.items():
+        if str(post.get("message_id") or "") == target:
+            return pid, post
+    return None, None
+
+
+def _story_author_label(post: dict) -> str:
+    if post.get("anonymous"):
+        return "一位岛民"
+    return post.get("author_name") or "岛民"
+
+
+def _story_comment_label(post: dict, comment: dict) -> str:
+    if post.get("anonymous") and str(comment.get("user_id")) == str(post.get("author_id")):
+        return "分享者"
+    if comment.get("anonymous"):
+        return "一位岛民"
+    return comment.get("user_name") or "岛民"
+
+
+def _build_story_embeds(post: dict) -> list:
+    text = (post.get("text") or "").strip() or "（无文字）"
+    comments = post.get("comments") or []
+    shown = comments[-STORY_COMMENT_SHOW:]
+    lines = [text, "", f"— {_story_author_label(post)}"]
+    if shown:
+        lines.append("")
+        lines.append("**评论**")
+        hidden_n = max(0, len(comments) - len(shown))
+        if hidden_n:
+            lines.append(f"更早还有 {hidden_n} 条")
+        for item in shown:
+            stamp = _format_beijing_minute(item.get("time"))
+            body = (item.get("text") or "").strip()
+            lines.append(f"- {_story_comment_label(post, item)}　{stamp}\n  {body}")
+    else:
+        lines.append("")
+        lines.append("还没有评论。点下面的按钮写下你的感受。")
+    embed = discord.Embed(
+        title="一段故事",
+        description="\n".join(lines)[:4000],
+        color=discord.Color.teal() if post.get("anonymous") else discord.Color.blue(),
+    )
+    urls = [u for u in (post.get("image_urls") or []) if u][:STORY_MAX_IMAGES]
+    if urls:
+        embed.set_image(url=urls[0])
+    embed.set_footer(text="匿名分享不会露出发布者 | 评论时可自己选匿名或实名")
+    embeds = [embed]
+    for url in urls[1:]:
+        extra = discord.Embed(color=embed.color)
+        extra.set_image(url=url)
+        embeds.append(extra)
+    return embeds
+
+
+def _story_entry_embed() -> discord.Embed:
+    embed = discord.Embed(
+        title="故事分享会",
+        description=(
+            "把游玩时被触动的文字截图、摘抄发到这里。\n"
+            "一段文字，最多 4 张图。发布时选匿名或实名。\n\n"
+            "**匿名**：公开卡片不露你是谁；你能看见评论并回复，别人始终看不出分享者。\n"
+            "**实名**：名字和内容都摊开。\n\n"
+            "点「分享一段故事」，或直接把截图丢进这个频道再选匿名/实名。"
+        ),
+        color=discord.Color.teal(),
+    )
+    return embed
+
+
+async def _save_story_images(attachments: list) -> list:
+    images = []
+    for att in attachments:
+        if len(images) >= STORY_MAX_IMAGES:
+            break
+        if not _is_story_image(att):
+            continue
+        data = await att.read()
+        if not data:
+            continue
+        path = _new_story_image_path(att.filename)
+        with open(path, "wb") as f:
+            f.write(data)
+        images.append({
+            "path": path,
+            "filename": att.filename,
+            "size": len(data),
+        })
+    return images
+
+
+def _story_files(images: list) -> list:
+    files = []
+    for i, img in enumerate(images or []):
+        path = img.get("path")
+        if not path or not os.path.isfile(path):
+            continue
+        ext = os.path.splitext(img.get("filename") or "")[1].lower()
+        if ext not in STORY_IMAGE_EXTS:
+            ext = ".png"
+        files.append(discord.File(path, filename=f"摘抄{i + 1}{ext}"))
+    return files
+
+
+async def _refresh_story_message(channel, post: dict):
+    msg_id = post.get("message_id")
+    if not msg_id or not channel:
+        return
+    try:
+        msg = await channel.fetch_message(int(msg_id))
+        await msg.edit(embeds=_build_story_embeds(post), view=PersistentStoryPostView())
+    except Exception as e:
+        logger.warning(f"刷新故事卡失败: {e}")
+
+
+async def _publish_story(channel, author, text: str, images: list, anonymous: bool) -> str:
+    body = (text or "").strip()
+    if not body:
+        return "先写一段文字再分享。"
+    if len(body) > STORY_TEXT_MAX:
+        body = body[:STORY_TEXT_MAX]
+    post_id = secrets.token_hex(6)
+    post = {
+        "id": post_id,
+        "guild_id": str(channel.guild.id),
+        "channel_id": str(channel.id),
+        "message_id": "",
+        "author_id": str(author.id),
+        "author_name": getattr(author, "display_name", None) or str(author),
+        "anonymous": bool(anonymous),
+        "text": body,
+        "images": images or [],
+        "image_urls": [],
+        "comments": [],
+        "created_at": _beijing_now().isoformat(),
+    }
+    files = _story_files(post["images"])
+    msg = await channel.send(
+        embeds=_build_story_embeds(post),
+        view=PersistentStoryPostView(),
+        files=files or None,
+    )
+    urls = [att.url for att in (msg.attachments or [])]
+    post["image_urls"] = urls
+    post["message_id"] = str(msg.id)
+    story_data[post_id] = post
+    save_stories()
+    if urls:
+        try:
+            await msg.edit(embeds=_build_story_embeds(post), view=PersistentStoryPostView())
+        except Exception:
+            pass
+    return ""
+
+
+class StoryShareModal(discord.ui.Modal, title="分享一段故事"):
+    def __init__(self, anonymous: bool, preset_text: str = "", preset_images: list = None):
+        super().__init__()
+        self.anonymous = anonymous
+        self.preset_images = list(preset_images or [])
+        self.body = discord.ui.TextInput(
+            label="摘抄或触动你的文字",
+            placeholder="一段摘抄、一句对白、当时的感觉……",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=STORY_TEXT_MAX,
+            default=(preset_text or "")[:STORY_TEXT_MAX] or None,
+        )
+        self.add_item(self.body)
+        self.file_upload = None
+        if _supports_modal_file_upload() and not self.preset_images:
+            self.file_upload = discord.ui.FileUpload(
+                min_values=0,
+                max_values=STORY_MAX_IMAGES,
+                required=False,
+            )
+            self.add_item(discord.ui.Label(
+                text="截图（最多 4 张）",
+                description="文字摘抄的截图，可不传",
+                component=self.file_upload,
+            ))
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        images = list(self.preset_images)
+        if self.file_upload:
+            atts = [att for att in (self.file_upload.values or []) if _is_story_image(att)]
+            if atts:
+                images = await _save_story_images(atts)
+        err = await _publish_story(
+            interaction.channel,
+            interaction.user,
+            str(self.body.value or ""),
+            images,
+            self.anonymous,
+        )
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+        mode = "匿名" if self.anonymous else "实名"
+        await interaction.followup.send(f"已{mode}分享到故事会。", ephemeral=True)
+
+
+class StoryModeView(discord.ui.View):
+    def __init__(self, preset_text: str = "", preset_images: list = None):
+        super().__init__(timeout=180)
+        self.preset_text = preset_text or ""
+        self.preset_images = list(preset_images or [])
+
+    async def _open(self, interaction: discord.Interaction, anonymous: bool):
+        await interaction.response.send_modal(
+            StoryShareModal(anonymous, self.preset_text, self.preset_images)
+        )
+
+    @discord.ui.button(label="匿名分享", style=discord.ButtonStyle.secondary)
+    async def anon_share(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open(interaction, True)
+
+    @discord.ui.button(label="实名分享", style=discord.ButtonStyle.primary)
+    async def named_share(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._open(interaction, False)
+
+
+class PersistentStoryEntryView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="分享一段故事", style=discord.ButtonStyle.primary, custom_id="story_entry_share")
+    async def share_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_message(
+            "这次分享要匿名还是实名？",
+            view=StoryModeView(),
+            ephemeral=True,
+        )
+
+
+class StoryCommentModal(discord.ui.Modal, title="写下评论"):
+    def __init__(self, post_id: str, anonymous: bool):
+        super().__init__()
+        self.post_id = post_id
+        self.anonymous = anonymous
+        self.body = discord.ui.TextInput(
+            label="评论",
+            placeholder="你的感受、共鸣、想说的话",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            max_length=STORY_COMMENT_MAX,
+        )
+        self.add_item(self.body)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        post = story_data.get(self.post_id)
+        if not post:
+            await interaction.response.send_message("这条分享找不到了。", ephemeral=True)
+            return
+        comment = {
+            "id": secrets.token_hex(4),
+            "user_id": str(interaction.user.id),
+            "user_name": interaction.user.display_name,
+            "anonymous": bool(self.anonymous),
+            "text": str(self.body.value or "").strip()[:STORY_COMMENT_MAX],
+            "time": _beijing_now().isoformat(),
+        }
+        if not comment["text"]:
+            await interaction.response.send_message("评论是空的。", ephemeral=True)
+            return
+        post.setdefault("comments", []).append(comment)
+        save_stories()
+        channel = interaction.channel
+        await _refresh_story_message(channel, post)
+        await interaction.response.send_message("评论已写下。", ephemeral=True)
+
+
+class StoryCommentModeView(discord.ui.View):
+    def __init__(self, post_id: str):
+        super().__init__(timeout=120)
+        self.post_id = post_id
+
+    @discord.ui.button(label="匿名评论", style=discord.ButtonStyle.secondary)
+    async def anon_comment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(StoryCommentModal(self.post_id, True))
+
+    @discord.ui.button(label="实名评论", style=discord.ButtonStyle.primary)
+    async def named_comment(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(StoryCommentModal(self.post_id, False))
+
+
+class PersistentStoryPostView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(label="评论", style=discord.ButtonStyle.secondary, custom_id="story_post_comment")
+    async def comment_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pid, post = _find_story_by_message(interaction.message.id)
+        if not post:
+            await interaction.response.send_message("这条分享找不到了。", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "这次评论要匿名还是实名？",
+            view=StoryCommentModeView(pid),
+            ephemeral=True,
+        )
+
+
+class StoryPendingView(discord.ui.View):
+    def __init__(self, pending_key: str, user_id: int):
+        super().__init__(timeout=300)
+        self.pending_key = pending_key
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("这是别人的发布确认。", ephemeral=True)
+            return False
+        return True
+
+    async def _finish(self, interaction: discord.Interaction, anonymous: bool):
+        pending = _story_pending.pop(self.pending_key, None)
+        if not pending:
+            await interaction.response.send_message("这条待发布已经过期，重新丢一次或点「分享一段故事」。", ephemeral=True)
+            return
+        text = (pending.get("text") or "").strip()
+        images = pending.get("images") or []
+        if not text:
+            await interaction.response.send_modal(StoryShareModal(anonymous, "", images))
+            return
+        await interaction.response.defer(ephemeral=True)
+        err = await _publish_story(interaction.channel, interaction.user, text, images, anonymous)
+        if err:
+            await interaction.followup.send(err, ephemeral=True)
+            return
+        mode = "匿名" if anonymous else "实名"
+        await interaction.followup.send(f"已{mode}分享到故事会。", ephemeral=True)
+        prompt_id = pending.get("prompt_id")
+        if prompt_id:
+            try:
+                msg = await interaction.channel.fetch_message(int(prompt_id))
+                await msg.delete()
+            except Exception:
+                pass
+
+    @discord.ui.button(label="匿名发布", style=discord.ButtonStyle.secondary)
+    async def anon_publish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, True)
+
+    @discord.ui.button(label="实名发布", style=discord.ButtonStyle.primary)
+    async def named_publish(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self._finish(interaction, False)
+
+
+async def _ingest_story_message(message: discord.Message) -> bool:
+    atts = [att for att in (message.attachments or []) if _is_story_image(att)]
+    text = (message.content or "").strip()
+    if not atts:
+        return False
+    try:
+        images = await _save_story_images(atts)
+    except Exception as e:
+        logger.warning(f"故事截图保存失败: {e}")
+        return False
+    if not images:
+        return False
+    try:
+        await message.delete()
+    except Exception:
+        pass
+    key = f"{message.guild.id}:{message.author.id}:{secrets.token_hex(3)}"
+    _story_pending[key] = {
+        "text": text[:STORY_TEXT_MAX],
+        "images": images,
+        "prompt_id": "",
+    }
+    try:
+        prompt = await message.channel.send(
+            f"{message.author.mention} 截图已收下。选匿名还是实名发布？没有文字的话，选完后会再请你补一段。",
+            view=StoryPendingView(key, message.author.id),
+        )
+        _story_pending[key]["prompt_id"] = str(prompt.id)
+    except Exception as e:
+        logger.warning(f"故事确认条发送失败: {e}")
+        _story_pending.pop(key, None)
+        return False
+    return True
+
+
+async def setup_story_channels():
+    os.makedirs(STORY_STORE_DIR, exist_ok=True)
+    embed = _story_entry_embed()
+    for guild in bot.guilds:
+        channel = _story_channel_of(guild)
+        if not channel:
+            continue
+        try:
+            existing_msg_id = story_channel_messages.get(str(channel.id))
+            kept = False
+            async for old_msg in channel.history(limit=40):
+                if old_msg.author.id != bot.user.id:
+                    continue
+                title = old_msg.embeds[0].title if old_msg.embeds else ""
+                if existing_msg_id and str(old_msg.id) == existing_msg_id:
+                    try:
+                        await old_msg.edit(embed=embed, view=PersistentStoryEntryView())
+                        kept = True
+                    except Exception:
+                        pass
+                elif title == "故事分享会":
+                    try:
+                        await old_msg.delete()
+                    except Exception:
+                        pass
+            if not kept:
+                msg = await channel.send(embed=embed, view=PersistentStoryEntryView())
+                story_channel_messages[str(channel.id)] = str(msg.id)
+                save_stories()
+            logger.info(f"更新故事分享会入口: #{channel.name}")
+        except Exception as e:
+            logger.error(f"故事分享会 #{channel.name} 设置失败: {e}")
 
 
 # ═══════════════════════════════════════════
@@ -6374,6 +6932,8 @@ if __name__ == "__main__":
         bot.add_view(PublishedFileView())
         bot.add_view(PersistentStorageCardView())
         bot.add_view(PersistentMusicView())
+        bot.add_view(PersistentStoryEntryView())
+        bot.add_view(PersistentStoryPostView())
 
         # 启动心跳任务
         bot.heartbeat_task = asyncio.create_task(heartbeat())
