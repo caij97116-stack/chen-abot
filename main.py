@@ -4,6 +4,7 @@ import json
 import random
 import re
 import secrets
+import shutil
 import struct
 import asyncio
 import zipfile
@@ -47,15 +48,20 @@ GAMBLE_CHANNEL_FILE = "gamble_channels.json"
 GIVEAWAY_FILE = "giveaway_data.json"
 MUSIC_FILE = "music_data.json"
 MUSIC_CHANNEL_KEYWORD = "贝多芬"
+MUSIC_VOICE_KEYWORD = "音乐世家"
 MUSIC_STORE_DIR = os.path.join("file_store", "music")
 MUSIC_MAX_BYTES = 25 * 1024 * 1024
 MUSIC_MAX_TRACKS = 100
 MUSIC_PAGE_SIZE = 20
 MUSIC_AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".m4a", ".flac", ".opus")
 MUSIC_URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+", re.IGNORECASE)
-MUSIC_PLATFORM_RE = re.compile(
+MUSIC_STREAM_RE = re.compile(
+    r"(youtu\.be|youtube\.com|music\.youtube\.com|soundcloud\.com|snd\.sc)",
+    re.IGNORECASE,
+)
+MUSIC_BLOCKED_RE = re.compile(
     r"(music\.163\.com|163cn\.tv|y\.qq\.com|i\.y\.qq\.com|open\.spotify\.com|"
-    r"youtu\.be|youtube\.com|bilibili\.com|b23\.tv|kugou\.com|kuwo\.cn)",
+    r"bilibili\.com|b23\.tv|kugou\.com|kuwo\.cn)",
     re.IGNORECASE,
 )
 GAMBLE_CHANNEL_KEYWORD = "赌王来一下"
@@ -1133,6 +1139,7 @@ def save_giveaways():
 
 music_data: dict = {}
 _music_selections: dict = {}
+_music_play_gen: dict = {}
 
 
 def load_music():
@@ -4485,6 +4492,21 @@ def _music_channel_of(guild: discord.Guild):
     return None
 
 
+def _music_voice_of(guild: discord.Guild):
+    for channel in getattr(guild, "voice_channels", []) or []:
+        if MUSIC_VOICE_KEYWORD in (channel.name or ""):
+            return channel
+    return None
+
+
+def _ffmpeg_bin() -> Optional[str]:
+    return shutil.which("ffmpeg")
+
+
+def _looks_like_stream_url(url: str) -> bool:
+    return bool(MUSIC_STREAM_RE.search(url or ""))
+
+
 def _music_state(guild_id) -> dict:
     key = str(guild_id)
     rec = music_data.get(key)
@@ -4562,18 +4584,21 @@ def _build_music_embed(state: dict) -> discord.Embed:
     now = state.get("now_playing") or {}
     if now.get("title"):
         now_txt = f"正在播：**{now['title']}**（{now.get('sharer_name') or '未知'} 分享，{now.get('requester_name') or '未知'} 点的）"
+        if now.get("voice"):
+            now_txt += "\n进「音乐世家」语音房就能听。"
     else:
-        now_txt = "还没在播。选一首再点播放。"
+        now_txt = "还没在播。选一首再点播放；机器人会进「音乐世家」语音房出声。"
     if tracks:
         start = page * MUSIC_PAGE_SIZE
         lines = []
         for i, track in enumerate(_music_page_tracks(state), start + 1):
+            kind = "链接" if track.get("kind") == "stream" else _format_size(track.get("size", 0))
             lines.append(
-                f"{i}. {track.get('title', '?')}  ·  {track.get('sharer_name', '?')}  ·  {_format_size(track.get('size', 0))}"
+                f"{i}. {track.get('title', '?')}  ·  {track.get('sharer_name', '?')}  ·  {kind}"
             )
         list_txt = "\n".join(lines)
     else:
-        list_txt = "歌单还空着。把 mp3 / ogg / wav / m4a 丢进这个频道，或发直接音频地址，就会进歌单。"
+        list_txt = "歌单还空着。把 mp3 丢进这个频道，或发 YouTube / SoundCloud / 直接音频地址，就会进歌单。"
     embed = discord.Embed(
         title="贝多芬时代",
         description=(
@@ -4583,7 +4608,7 @@ def _build_music_embed(state: dict) -> discord.Embed:
         )[:4000],
         color=discord.Color.dark_gold(),
     )
-    embed.set_footer(text="丢音频或直接音频链接即可分享 | 选歌后点播放 | 看着播放条才能听")
+    embed.set_footer(text="文字频道点歌 | 音乐世家语音房出声 | 网易云页面链接不解析")
     return embed
 
 
@@ -4593,9 +4618,10 @@ class PersistentMusicView(discord.ui.View):
         tracks = _music_page_tracks(state) if state else []
         options = []
         for i, track in enumerate(tracks[:25]):
+            kind = "链接" if track.get("kind") == "stream" else _format_size(track.get("size", 0))
             options.append(discord.SelectOption(
                 label=str(track.get("title") or "未命名")[:100],
-                description=f"{track.get('sharer_name', '?')} · {_format_size(track.get('size', 0))}"[:100],
+                description=f"{track.get('sharer_name', '?')} · {kind}"[:100],
                 value=str(track.get("id") or i),
             ))
         select_kwargs = {
@@ -4635,6 +4661,10 @@ class PersistentMusicView(discord.ui.View):
     @discord.ui.button(label="下一首", style=discord.ButtonStyle.secondary, custom_id="music_next_track", row=1)
     async def next_track_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _play_adjacent_track(interaction, 1)
+
+    @discord.ui.button(label="停止", style=discord.ButtonStyle.danger, custom_id="music_stop", row=1)
+    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _stop_music_play(interaction)
 
     @discord.ui.button(label="上一页", style=discord.ButtonStyle.secondary, custom_id="music_prev", row=2)
     async def prev_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -4699,9 +4729,22 @@ async def setup_music_channels():
         state["channel_id"] = str(channel.id)
         try:
             await _refresh_music_card(guild, state)
-            logger.info(f"更新贝多芬点唱机: #{channel.name}")
+            voice = _music_voice_of(guild)
+            if voice:
+                logger.info(f"更新贝多芬点唱机: #{channel.name} <-> {voice.name}")
+            else:
+                logger.warning(f"{guild.name} 没有名称含「{MUSIC_VOICE_KEYWORD}」的语音房")
         except Exception as e:
             logger.error(f"贝多芬频道 #{channel.name} 设置失败: {e}")
+
+
+def _commit_music_track(state: dict, track: dict) -> str:
+    if len(state.get("tracks") or []) >= MUSIC_MAX_TRACKS:
+        return "歌单满了，先下架几首再分享。"
+    state.setdefault("tracks", []).append(track)
+    state["page"] = _music_page_count(state) - 1
+    save_music()
+    return ""
 
 
 def _append_music_track(state: dict, user, filename: str, data: bytes, title: str = "") -> str:
@@ -4716,8 +4759,9 @@ def _append_music_track(state: dict, user, filename: str, data: bytes, title: st
     with open(path, "wb") as f:
         f.write(data)
     display = (title or "").strip() or _music_title_from_filename(filename)
-    track = {
+    return _commit_music_track(state, {
         "id": secrets.token_hex(6),
+        "kind": "file",
         "title": display[:100],
         "filename": filename,
         "path": path,
@@ -4725,10 +4769,54 @@ def _append_music_track(state: dict, user, filename: str, data: bytes, title: st
         "sharer_id": str(user.id),
         "sharer_name": getattr(user, "display_name", None) or str(user),
         "added_at": _beijing_now().isoformat(),
+    })
+
+
+def _probe_stream_info(url: str) -> tuple:
+    import yt_dlp
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+        "format": "bestaudio/best",
+        "default_search": "auto",
     }
-    state.setdefault("tracks", []).append(track)
-    state["page"] = _music_page_count(state) - 1
-    save_music()
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+    if (info or {}).get("_type") == "playlist":
+        entries = [item for item in (info.get("entries") or []) if item]
+        info = entries[0] if entries else info
+    title = ((info or {}).get("title") or url or "未命名")[:100]
+    stream_url = (info or {}).get("url") or ""
+    webpage = (info or {}).get("webpage_url") or url
+    return title, stream_url, webpage
+
+
+async def _add_stream_track(guild: discord.Guild, user, url: str, caption: str = "") -> str:
+    state = _music_state(guild.id)
+    if len(state.get("tracks") or []) >= MUSIC_MAX_TRACKS:
+        return "歌单满了，先下架几首再分享。"
+    try:
+        title, _stream, webpage = await asyncio.to_thread(_probe_stream_info, url)
+    except Exception as e:
+        return f"这条链接解析失败: {e}"
+    display = _music_caption_title(caption) or title
+    err = _commit_music_track(state, {
+        "id": secrets.token_hex(6),
+        "kind": "stream",
+        "title": display[:100],
+        "filename": "",
+        "path": "",
+        "url": webpage or url,
+        "size": 0,
+        "sharer_id": str(user.id),
+        "sharer_name": getattr(user, "display_name", None) or str(user),
+        "added_at": _beijing_now().isoformat(),
+    })
+    if err:
+        return err
+    await _refresh_music_card(guild, state)
     return ""
 
 
@@ -4772,11 +4860,11 @@ def _music_urls_in_text(text: str) -> list:
     return found
 
 
-def _music_platform_note(urls: list) -> str:
-    platforms = [url for url in urls if MUSIC_PLATFORM_RE.search(url)]
-    if not platforms:
+def _music_blocked_note(urls: list) -> str:
+    blocked = [url for url in urls if MUSIC_BLOCKED_RE.search(url)]
+    if not blocked:
         return ""
-    return "网易云 / QQ / YouTube 这类页面链接我不会去扒歌，发直接音频地址（以 .mp3 等结尾）才能入库。"
+    return "网易云 / QQ / B站 / Spotify 页面链接不解析。YouTube、SoundCloud 或直接音频地址可以入库。"
 
 
 async def _download_direct_audio(url: str):
@@ -4833,8 +4921,9 @@ async def _ingest_music_message(message: discord.Message) -> bool:
     audio_atts = [att for att in (message.attachments or []) if _is_music_attachment(att)]
     urls = _music_urls_in_text(message.content or "")
     audio_urls = [url for url in urls if _looks_like_audio_url(url)]
-    platform_note = _music_platform_note(urls)
-    if not audio_atts and not audio_urls and not platform_note:
+    stream_urls = [url for url in urls if _looks_like_stream_url(url)]
+    blocked_note = _music_blocked_note(urls)
+    if not audio_atts and not audio_urls and not stream_urls and not blocked_note:
         return False
     added = 0
     errors = []
@@ -4856,8 +4945,14 @@ async def _ingest_music_message(message: discord.Message) -> bool:
             errors.append(err)
         else:
             added += 1
-    if platform_note:
-        errors.append(platform_note)
+    for url in stream_urls:
+        err = await _add_stream_track(message.guild, message.author, url, caption)
+        if err:
+            errors.append(err)
+        else:
+            added += 1
+    if blocked_note:
+        errors.append(blocked_note)
     try:
         await message.delete()
     except Exception:
@@ -4904,42 +4999,176 @@ def _adjacent_music_track(state: dict, step: int):
     return tracks[(idx + step) % len(tracks)]
 
 
-async def _send_music_play(interaction: discord.Interaction, track: dict):
-    state = _music_state(interaction.guild.id)
-    path = track.get("path")
-    if not path or not os.path.isfile(path):
-        await interaction.response.send_message("这首的文件丢了，先下架再重新分享。", ephemeral=True)
-        return
-    await interaction.response.defer(ephemeral=True)
-    channel = interaction.channel
-    filename = track.get("filename") or (track.get("title") + ".mp3")
-    try:
-        audio = discord.File(path, filename=filename)
-        play_msg = await channel.send(
-            content=f"正在播 **{track.get('title')}**（{track.get('sharer_name')} 分享）",
-            file=audio,
-        )
-    except Exception as e:
-        await interaction.followup.send(f"播放失败: {e}", ephemeral=True)
-        return
-    old_play_id = state.get("play_message_id")
-    if old_play_id and str(old_play_id) != str(play_msg.id):
+async def _ensure_music_voice(guild: discord.Guild):
+    voice_ch = _music_voice_of(guild)
+    if not voice_ch:
+        return None, "找不到名称含「音乐世家」的语音房。"
+    if not _ffmpeg_bin():
+        return None, "托管环境没有 ffmpeg，语音房播不了。"
+    vc = guild.voice_client
+    if vc and vc.channel and vc.channel.id == voice_ch.id:
+        return vc, ""
+    if vc:
         try:
-            old_msg = await channel.fetch_message(int(old_play_id))
-            await old_msg.delete()
+            await vc.move_to(voice_ch)
+            return guild.voice_client, ""
         except Exception:
-            pass
-    state["play_message_id"] = str(play_msg.id)
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+    try:
+        vc = await voice_ch.connect(reconnect=True, timeout=15)
+        return vc, ""
+    except Exception as e:
+        return None, f"进音乐世家失败: {e}"
+
+
+def _ffmpeg_source(path_or_url: str, is_url: bool):
+    before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5" if is_url else None
+    return discord.FFmpegPCMAudio(
+        path_or_url,
+        before_options=before,
+        options="-vn",
+    )
+
+
+async def _mark_now_playing(guild: discord.Guild, track: dict, requester_name: str, voice: bool):
+    state = _music_state(guild.id)
     state["now_playing"] = {
         "title": track.get("title"),
         "sharer_name": track.get("sharer_name"),
-        "requester_name": interaction.user.display_name,
+        "requester_name": requester_name,
         "track_id": track.get("id"),
+        "voice": bool(voice),
     }
-    _music_selections[(interaction.guild.id, interaction.user.id)] = str(track.get("id"))
     save_music()
-    await _refresh_music_card(interaction.guild, state)
-    await interaction.followup.send("已切到这首。看着频道里的播放条就能听。", ephemeral=True)
+    text_ch = await _music_channel_from_state(guild, state)
+    if text_ch:
+        old_play_id = state.get("play_message_id")
+        if old_play_id:
+            try:
+                old_msg = await text_ch.fetch_message(int(old_play_id))
+                await old_msg.delete()
+            except Exception:
+                pass
+        try:
+            play_msg = await text_ch.send(
+                f"正在「音乐世家」播 **{track.get('title')}**（{track.get('sharer_name')} 分享）"
+            )
+            state["play_message_id"] = str(play_msg.id)
+            save_music()
+        except Exception:
+            pass
+    await _refresh_music_card(guild, state)
+
+
+async def _on_music_finished(guild_id: int, track_id: str, error, gen: int):
+    if _music_play_gen.get(guild_id) != gen:
+        return
+    guild = bot.get_guild(guild_id)
+    if not guild:
+        return
+    if error:
+        logger.warning(f"贝多芬播放结束异常: {error}")
+    vc = guild.voice_client
+    if vc and vc.is_playing():
+        return
+    state = _music_state(guild.id)
+    now = state.get("now_playing") or {}
+    if str(now.get("track_id") or "") != str(track_id):
+        return
+    nxt = _adjacent_music_track(state, 1)
+    if not nxt or str(nxt.get("id")) == str(track_id):
+        state["now_playing"] = None
+        save_music()
+        await _refresh_music_card(guild, state)
+        return
+    await _start_voice_play(guild, nxt, None)
+
+
+async def _start_voice_play(guild: discord.Guild, track: dict, requester) -> str:
+    gen = int(_music_play_gen.get(guild.id) or 0) + 1
+    _music_play_gen[guild.id] = gen
+    vc, err = await _ensure_music_voice(guild)
+    if err:
+        return err
+    source_path = ""
+    is_url = False
+    if track.get("kind") == "stream" or track.get("url"):
+        try:
+            _title, stream_url, _web = await asyncio.to_thread(_probe_stream_info, track.get("url"))
+        except Exception as e:
+            return f"链接失效或解析失败: {e}"
+        if not stream_url:
+            return "这条链接此刻没有可播的音频。"
+        source_path = stream_url
+        is_url = True
+    else:
+        path = track.get("path")
+        if not path or not os.path.isfile(path):
+            return "这首的文件丢了，先下架再重新分享。"
+        source_path = path
+    try:
+        source = _ffmpeg_source(source_path, is_url)
+    except Exception as e:
+        return f"音频源打不开: {e}"
+    if vc.is_playing() or vc.is_paused():
+        vc.stop()
+        await asyncio.sleep(0.4)
+    requester_name = getattr(requester, "display_name", None) or (track.get("requester_name") or "点唱机")
+    if requester:
+        _music_selections[(guild.id, requester.id)] = str(track.get("id"))
+
+    def after_play(play_err):
+        try:
+            asyncio.run_coroutine_threadsafe(
+                _on_music_finished(guild.id, str(track.get("id")), play_err, gen),
+                bot.loop,
+            )
+        except Exception:
+            pass
+
+    try:
+        vc.play(source, after=after_play)
+    except Exception as e:
+        return f"语音房播放失败: {e}"
+    await _mark_now_playing(guild, track, requester_name, True)
+    return ""
+
+
+async def _stop_voice(guild: discord.Guild):
+    _music_play_gen[guild.id] = int(_music_play_gen.get(guild.id) or 0) + 1
+    vc = guild.voice_client
+    if vc:
+        try:
+            if vc.is_playing() or vc.is_paused():
+                vc.stop()
+        except Exception:
+            pass
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+    state = _music_state(guild.id)
+    state["now_playing"] = None
+    save_music()
+    await _refresh_music_card(guild, state)
+
+
+async def _stop_music_play(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    await _stop_voice(interaction.guild)
+    await interaction.followup.send("已停止，机器人离开「音乐世家」。", ephemeral=True)
+
+
+async def _send_music_play(interaction: discord.Interaction, track: dict):
+    await interaction.response.defer(ephemeral=True)
+    err = await _start_voice_play(interaction.guild, track, interaction.user)
+    if err:
+        await interaction.followup.send(err, ephemeral=True)
+        return
+    await interaction.followup.send("已切到这首。进「音乐世家」就能听。", ephemeral=True)
 
 
 async def _play_selected_track(interaction: discord.Interaction):
@@ -4972,8 +5201,16 @@ async def _remove_selected_track(interaction: discord.Interaction):
         return
     state["tracks"] = [item for item in state.get("tracks") or [] if item.get("id") != track.get("id")]
     now = state.get("now_playing") or {}
-    if now.get("track_id") == track.get("id"):
+    was_playing = str(now.get("track_id") or "") == str(track.get("id"))
+    if was_playing:
         state["now_playing"] = None
+        _music_play_gen[interaction.guild.id] = int(_music_play_gen.get(interaction.guild.id) or 0) + 1
+        vc = interaction.guild.voice_client
+        if vc and (vc.is_playing() or vc.is_paused()):
+            try:
+                vc.stop()
+            except Exception:
+                pass
     pages = _music_page_count(state)
     if int(state.get("page") or 0) >= pages:
         state["page"] = pages - 1
