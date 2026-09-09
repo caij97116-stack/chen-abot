@@ -1140,6 +1140,7 @@ def save_giveaways():
 music_data: dict = {}
 _music_selections: dict = {}
 _music_play_gen: dict = {}
+_music_pending: dict = {}
 
 
 def load_music():
@@ -4608,7 +4609,7 @@ def _build_music_embed(state: dict) -> discord.Embed:
         )[:4000],
         color=discord.Color.dark_gold(),
     )
-    embed.set_footer(text="文字频道点歌 | 音乐世家语音房出声 | 网易云页面链接不解析")
+    embed.set_footer(text="丢音频后自己填歌名 | 音乐世家语音房出声 | YouTube / SoundCloud 可入库")
     return embed
 
 
@@ -4747,31 +4748,6 @@ def _commit_music_track(state: dict, track: dict) -> str:
     return ""
 
 
-def _append_music_track(state: dict, user, filename: str, data: bytes, title: str = "") -> str:
-    if len(state.get("tracks") or []) >= MUSIC_MAX_TRACKS:
-        return "歌单满了，先下架几首再分享。"
-    size = len(data or b"")
-    if size <= 0:
-        return "空文件，没收入。"
-    if size > MUSIC_MAX_BYTES:
-        return f"{filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
-    path = _new_music_path(filename)
-    with open(path, "wb") as f:
-        f.write(data)
-    display = (title or "").strip() or _music_title_from_filename(filename)
-    return _commit_music_track(state, {
-        "id": secrets.token_hex(6),
-        "kind": "file",
-        "title": display[:100],
-        "filename": filename,
-        "path": path,
-        "size": size,
-        "sharer_id": str(user.id),
-        "sharer_name": getattr(user, "display_name", None) or str(user),
-        "added_at": _beijing_now().isoformat(),
-    })
-
-
 def _probe_stream_info(url: str) -> tuple:
     import yt_dlp
     opts = {
@@ -4821,22 +4797,144 @@ async def _add_stream_track(guild: discord.Guild, user, url: str, caption: str =
 
 
 async def _add_music_track(guild: discord.Guild, user, att, caption: str = "") -> str:
-    state = _music_state(guild.id)
     size = int(getattr(att, "size", 0) or 0)
     if size > MUSIC_MAX_BYTES:
         return f"{att.filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
     data = await att.read()
-    err = _append_music_track(
-        state,
-        user,
-        att.filename,
-        data,
-        _music_caption_title(caption) or _music_title_from_filename(att.filename),
-    )
-    if err:
-        return err
-    await _refresh_music_card(guild, state)
+    return await _stage_music_bytes(guild, user, att.filename, data, caption)
+
+
+def _discard_pending_music(key: str):
+    pending = _music_pending.pop(key, None)
+    if not pending:
+        return
+    path = pending.get("path")
+    if path and os.path.isfile(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+
+async def _stage_music_bytes(guild: discord.Guild, user, filename: str, data: bytes, caption: str = "") -> str:
+    state = _music_state(guild.id)
+    if len(state.get("tracks") or []) >= MUSIC_MAX_TRACKS:
+        return "歌单满了，先下架几首再分享。"
+    size = len(data or b"")
+    if size <= 0:
+        return "空文件，没收入。"
+    if size > MUSIC_MAX_BYTES:
+        return f"{filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
+    path = _new_music_path(filename)
+    with open(path, "wb") as f:
+        f.write(data)
+    key = f"{guild.id}:{user.id}:{secrets.token_hex(4)}"
+    _music_pending[key] = {
+        "guild_id": str(guild.id),
+        "user_id": str(user.id),
+        "filename": filename,
+        "path": path,
+        "size": size,
+        "default_title": _music_caption_title(caption) or _music_title_from_filename(filename),
+        "sharer_name": getattr(user, "display_name", None) or str(user),
+    }
+    channel = _music_channel_of(guild)
+    if not channel:
+        _discard_pending_music(key)
+        return "找不到贝多芬频道。"
+    try:
+        await channel.send(
+            f"{user.mention} 文件已收下。文件名经常对不上歌名，点下面自己改名再进歌单。",
+            view=MusicNameView(key, user.id),
+            delete_after=300,
+        )
+    except Exception as e:
+        _discard_pending_music(key)
+        return f"请你改名的提示发不出去: {e}"
     return ""
+
+
+class MusicNameModal(discord.ui.Modal, title="给这首歌起名"):
+    def __init__(self, pending_key: str, default_title: str):
+        super().__init__()
+        self.pending_key = pending_key
+        self.title_input = discord.ui.TextInput(
+            label="歌名",
+            placeholder="歌名 · 歌手，或你想显示的名字",
+            style=discord.TextStyle.short,
+            required=True,
+            max_length=100,
+            default=(default_title or "")[:100] or None,
+        )
+        self.add_item(self.title_input)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        pending = _music_pending.get(self.pending_key)
+        if not pending:
+            await interaction.response.send_message("这条待命名已经过期，重新丢一次文件。", ephemeral=True)
+            return
+        if str(interaction.user.id) != str(pending.get("user_id")):
+            await interaction.response.send_message("只能给自己刚上传的歌起名。", ephemeral=True)
+            return
+        title = " ".join(str(self.title_input.value or "").split())[:100]
+        if not title:
+            await interaction.response.send_message("歌名是空的。", ephemeral=True)
+            return
+        state = _music_state(interaction.guild.id)
+        err = _commit_music_track(state, {
+            "id": secrets.token_hex(6),
+            "kind": "file",
+            "title": title,
+            "filename": pending.get("filename") or title,
+            "path": pending.get("path"),
+            "size": int(pending.get("size") or 0),
+            "sharer_id": str(interaction.user.id),
+            "sharer_name": pending.get("sharer_name") or interaction.user.display_name,
+            "added_at": _beijing_now().isoformat(),
+        })
+        _music_pending.pop(self.pending_key, None)
+        if err:
+            path = pending.get("path")
+            if path and os.path.isfile(path):
+                try:
+                    os.remove(path)
+                except Exception:
+                    pass
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+        await _refresh_music_card(interaction.guild, state)
+        await interaction.response.send_message(f"已收入歌单：**{title}**", ephemeral=True)
+        try:
+            if interaction.message:
+                await interaction.message.delete()
+        except Exception:
+            pass
+
+
+class MusicNameView(discord.ui.View):
+    def __init__(self, pending_key: str, user_id: int):
+        super().__init__(timeout=300)
+        self.pending_key = pending_key
+        self.user_id = user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("这是别人的改名确认。", ephemeral=True)
+            return False
+        return True
+
+    async def on_timeout(self):
+        _discard_pending_music(self.pending_key)
+
+    @discord.ui.button(label="填写歌名", style=discord.ButtonStyle.primary)
+    async def name_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        pending = _music_pending.get(self.pending_key)
+        if not pending:
+            await interaction.response.send_message("这条待命名已经过期，重新丢一次文件。", ephemeral=True)
+            return
+        await interaction.response.send_modal(
+            MusicNameModal(self.pending_key, pending.get("default_title") or "")
+        )
 
 
 def _filename_from_url(url: str) -> str:
@@ -4903,18 +5001,7 @@ async def _download_direct_audio(url: str):
 
 
 async def _add_music_bytes(guild: discord.Guild, user, filename: str, data: bytes, caption: str = "") -> str:
-    state = _music_state(guild.id)
-    err = _append_music_track(
-        state,
-        user,
-        filename,
-        data,
-        _music_caption_title(caption) or _music_title_from_filename(filename),
-    )
-    if err:
-        return err
-    await _refresh_music_card(guild, state)
-    return ""
+    return await _stage_music_bytes(guild, user, filename, data, caption)
 
 
 async def _ingest_music_message(message: discord.Message) -> bool:
@@ -4926,6 +5013,7 @@ async def _ingest_music_message(message: discord.Message) -> bool:
     if not audio_atts and not audio_urls and not stream_urls and not blocked_note:
         return False
     added = 0
+    staged = 0
     errors = []
     caption = message.content or ""
     for att in audio_atts:
@@ -4933,7 +5021,7 @@ async def _ingest_music_message(message: discord.Message) -> bool:
         if err:
             errors.append(err)
         else:
-            added += 1
+            staged += 1
     for url in audio_urls:
         result, err = await _download_direct_audio(url)
         if err:
@@ -4944,7 +5032,7 @@ async def _ingest_music_message(message: discord.Message) -> bool:
         if err:
             errors.append(err)
         else:
-            added += 1
+            staged += 1
     for url in stream_urls:
         err = await _add_stream_track(message.guild, message.author, url, caption)
         if err:
