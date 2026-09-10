@@ -6704,6 +6704,7 @@ async def setup_guide_channels():
         BLACKLIST_CHANNEL_KEYWORD,
         "文件存储",
         "举报审核",
+        "测试",
     )
     EXCLUDED_NAMES = {
         "📁-文件存储",
@@ -6714,12 +6715,20 @@ async def setup_guide_channels():
         BLACKLIST_CHANNEL_NAME,
     }
 
+    def _everyone_can_see(ch) -> bool:
+        try:
+            return bool(ch.permissions_for(ch.guild.default_role).view_channel)
+        except Exception:
+            return False
+
     def _hidden_from_guide(ch, guide_channel_id: int) -> bool:
         if ch.id == guide_channel_id:
             return True
         if ch.name in EXCLUDED_NAMES:
             return True
-        return any(keyword in ch.name for keyword in HIDDEN_GUIDE_KEYWORDS)
+        if any(keyword in (ch.name or "") for keyword in HIDDEN_GUIDE_KEYWORDS):
+            return True
+        return not _everyone_can_see(ch)
 
     for guild in bot.guilds:
         # 收集所有频道（文字、语音、论坛、舞台），按分类分组
