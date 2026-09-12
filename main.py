@@ -6701,7 +6701,6 @@ async def setup_guide_channels():
     HIDDEN_GUIDE_KEYWORDS = (
         GUIDE_CHANNEL_KEYWORD,
         ALERT_CHANNEL_KEYWORD,
-        BLACKLIST_CHANNEL_KEYWORD,
         "文件存储",
         "举报审核",
         "测试",
@@ -6710,9 +6709,7 @@ async def setup_guide_channels():
         "📁-文件存储",
         "举报审核",
         "测试",
-        "黑户地带",
         ALERT_CHANNEL_NAME,
-        BLACKLIST_CHANNEL_NAME,
     }
 
     def _everyone_can_see(ch) -> bool:
