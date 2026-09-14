@@ -98,6 +98,7 @@ ALERT_SPAM_COUNT = 6
 ALERT_COOLDOWN_SEC = 180
 DOWNLOAD_COOLDOWN_SEC = 30
 CLAIM_TTL_SEC = 600
+CLAIM_REUSE_GRACE_SEC = 30
 AD_KEYWORDS = (
     "免费代充", "代充", "出号", "收号", "卖号", "倒卖", "代肝",
     "加v", "加微", "加vx", "微信", "qq群", "QQ群", "淘宝", "咸鱼",
@@ -2686,7 +2687,10 @@ def _build_claim_ticket_embed(record: dict, files: list) -> discord.Embed:
     for item in files:
         lines.append(f"- [{item['name']}]({item['url']})（{item['size']}）")
     lines.append("")
-    lines.append(f"链接 {CLAIM_TTL_SEC // 60} 分钟内有效，不要转发给别人。")
+    lines.append(
+        f"链接 {CLAIM_TTL_SEC // 60} 分钟内有效，每次下载只能用一次；"
+        "文件里已带你的专属下载人码，转发会追溯到你这，别外传。"
+    )
     return discord.Embed(
         title="领取单",
         description="\n".join(lines)[:4096],
@@ -7835,6 +7839,15 @@ async def start_http_server():
         if item.get("expires_at", 0) <= now:
             _claim_tokens.pop(token, None)
             return web.Response(status=410, text="链接已过期，请重新点下载")
+        first_served = item.get("first_served_at")
+        if first_served and now - first_served > CLAIM_REUSE_GRACE_SEC:
+            _claim_tokens.pop(token, None)
+            return web.Response(
+                status=403,
+                text="这个下载链接已经用过了。回去在 Discord 里重新点一次下载即可。",
+            )
+        if not first_served:
+            item["first_served_at"] = now
         data = item.get("data")
         filename = item.get("filename") or "file"
         if data is None:
