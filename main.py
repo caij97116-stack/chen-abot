@@ -118,9 +118,21 @@ SECURITY_DEFAULTS = {
     "block_invites": True,
     "shield_mentions": True,
     "raid_shield": True,
+    "shield_secrets": True,
     "timeout_min": SECURITY_TIMEOUT_MIN,
     "keywords": [],
 }
+SECRET_PATTERNS = (
+    re.compile(r"sk-[A-Za-z0-9_\-]{20,}"),
+    re.compile(r"(?i)\b(?:api[_\- ]?key|secret|token|password|passwd|密钥|口令|授权码)\b\s*[:=：]\s*[^\s]{6,}"),
+    re.compile(r"\b[MN][A-Za-z\d]{23}\.[\w\-]{6}\.[\w\-]{27}\b"),
+    re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{2,5})?\b"),
+)
+SECRET_WORD_RE = re.compile(
+    r"(?i)(api[_\- ]?key|token|secret|密钥|口令|面板|后台|端口|password|cookie)"
+)
+MASK_REMINDER_SHORT = "API Key / Token / Cookie / 面板地址 / 服务器 IP 端口都要挡住，密钥进了公屏马上撤回。"
 security_data: dict = {}
 _raid_join_times: dict = defaultdict(deque)
 _slash_last: dict = {}
@@ -1047,6 +1059,55 @@ async def _audit_log(guild: discord.Guild, title: str, description: str):
     if not guild:
         return
     await _send_alert(guild, "操作审计", title, description, discord.Color.dark_teal())
+
+
+def _secret_hit(text: str) -> bool:
+    t = text or ""
+    for pattern in SECRET_PATTERNS:
+        if pattern.search(t):
+            return True
+    return False
+
+
+async def _maybe_remind_mask(message: discord.Message):
+    if not message.guild or message.author.bot:
+        return
+    guild = message.guild
+    if message.author.id == guild.owner_id:
+        return
+    alert_channel = _find_alert_channel(guild)
+    if alert_channel and message.channel.id == alert_channel.id:
+        return
+    if not _security_settings(guild.id).get("shield_secrets", True):
+        return
+    text = message.content or ""
+    has_attach = bool(message.attachments)
+    strong = _secret_hit(text)
+    weak = has_attach and bool(SECRET_WORD_RE.search(text))
+    if not strong and not weak:
+        return
+    if not _alert_cooldown_ok("遮挡提醒", guild.id, message.author.id):
+        return
+    try:
+        await message.reply(
+            f"{message.author.mention} 发截图或日志前先打码：{MASK_REMINDER_SHORT}",
+            mention_author=False,
+            delete_after=45,
+        )
+    except Exception:
+        pass
+    await _send_alert(
+        guild,
+        "疑似泄露",
+        "疑似密钥 / 面板信息",
+        (
+            f"**用户:** {message.author.mention} `{message.author.id}`\n"
+            f"**位置:** {message.channel.mention}\n"
+            f"**附件:** {'有' if has_attach else '无'}\n"
+            f"**命中:** {'疑似密钥/地址' if strong else '截图 + 敏感词'}"
+        ),
+        discord.Color.orange(),
+    )
 
 
 def _find_record_by_storage_card(message_id) -> tuple:
@@ -3605,6 +3666,8 @@ async def on_message(message: discord.Message):
                 except Exception:
                     pass
 
+    await _maybe_remind_mask(message)
+
     await _maybe_alert_message(message)
 
     # 检查消息中是否包含 FAQ 关键词
@@ -3660,6 +3723,7 @@ SECURITY_TOGGLE_LABELS = {
     "block_invites": "拦截邀请链接",
     "shield_mentions": "拦截 @everyone/@here",
     "raid_shield": "防突袭",
+    "shield_secrets": "截图防泄露（敏感的自动提醒）",
 }
 
 
@@ -3692,6 +3756,7 @@ def _build_security_embed(guild_id) -> discord.Embed:
         app_commands.Choice(name="拦截邀请链接", value="block_invites"),
         app_commands.Choice(name="拦截 @everyone/@here", value="shield_mentions"),
         app_commands.Choice(name="防突袭", value="raid_shield"),
+        app_commands.Choice(name="截图防泄露", value="shield_secrets"),
         app_commands.Choice(name="自动禁言时长", value="timeout"),
     ],
     开关=[
