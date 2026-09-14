@@ -53,6 +53,8 @@ MUSIC_STORE_DIR = os.path.join("file_store", "music")
 MUSIC_MAX_BYTES = 25 * 1024 * 1024
 MUSIC_MAX_TRACKS = 100
 MUSIC_PAGE_SIZE = 20
+MUSIC_IDLE_SEC = 300
+MUSIC_LOOP_MODES = ("off", "all", "one")
 MUSIC_AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".m4a", ".flac", ".opus")
 MUSIC_URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+", re.IGNORECASE)
 MUSIC_STREAM_RE = re.compile(
@@ -1141,6 +1143,7 @@ music_data: dict = {}
 _music_selections: dict = {}
 _music_play_gen: dict = {}
 _music_pending: dict = {}
+_music_idle_since: dict = {}
 
 
 def load_music():
@@ -4519,6 +4522,9 @@ def _music_state(guild_id) -> dict:
             "card_message_id": "",
             "play_message_id": "",
             "channel_id": "",
+            "queue": [],
+            "loop": "off",
+            "shuffle": False,
         }
         music_data[key] = rec
     rec.setdefault("tracks", [])
@@ -4527,6 +4533,9 @@ def _music_state(guild_id) -> dict:
     rec.setdefault("card_message_id", "")
     rec.setdefault("play_message_id", "")
     rec.setdefault("channel_id", "")
+    rec.setdefault("queue", [])
+    rec.setdefault("loop", "off")
+    rec.setdefault("shuffle", False)
     return rec
 
 
@@ -4600,16 +4609,33 @@ def _build_music_embed(state: dict) -> discord.Embed:
         list_txt = "\n".join(lines)
     else:
         list_txt = "歌单还空着。把 mp3 丢进这个频道，或发 YouTube / SoundCloud / 直接音频地址，就会进歌单。"
+    loop_mode = state.get("loop") or "off"
+    loop_txt = {"off": "关", "all": "列表循环", "one": "单曲循环"}.get(loop_mode, "关")
+    shuffle_txt = "开" if state.get("shuffle") else "关"
+    queue = state.get("queue") or []
+    if queue:
+        queue_names = []
+        for tid in queue[:10]:
+            track = _track_by_id(state, tid)
+            if track:
+                queue_names.append(f"{len(queue_names) + 1}. {track.get('title', '?')}")
+        extra = f"（还有 {len(queue) - len(queue_names)} 首）" if len(queue) > 10 else ""
+        queue_txt = "**队列**\n" + "\n".join(queue_names) + extra
+    else:
+        queue_txt = "**队列**：空。选中歌后点「加到队列」，播完自动接着放。"
     embed = discord.Embed(
         title="贝多芬时代",
         description=(
             f"{now_txt}\n\n"
             f"**歌单**（第 {page + 1}/{pages} 页，共 {len(tracks)} 首）\n"
-            f"{list_txt}"
+            f"{list_txt}\n\n"
+            f"{queue_txt}"
         )[:4000],
         color=discord.Color.dark_gold(),
     )
-    embed.set_footer(text="丢音频后自己填歌名 | 音乐世家语音房出声 | YouTube / SoundCloud 可入库")
+    embed.set_footer(
+        text=f"循环：{loop_txt} | 随机：{shuffle_txt} | 空闲 {MUSIC_IDLE_SEC // 60} 分钟自动离房"
+    )
     return embed
 
 
@@ -4687,6 +4713,18 @@ class PersistentMusicView(discord.ui.View):
     async def remove_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _remove_selected_track(interaction)
 
+    @discord.ui.button(label="加到队列", style=discord.ButtonStyle.success, custom_id="music_queue_add", row=3)
+    async def queue_add_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _queue_selected_track(interaction)
+
+    @discord.ui.button(label="循环", style=discord.ButtonStyle.secondary, custom_id="music_loop", row=3)
+    async def loop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _toggle_music_loop(interaction)
+
+    @discord.ui.button(label="随机", style=discord.ButtonStyle.secondary, custom_id="music_shuffle", row=3)
+    async def shuffle_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _toggle_music_shuffle(interaction)
+
 
 async def _music_channel_from_state(guild: discord.Guild, state: dict):
     channel_id = state.get("channel_id")
@@ -4730,6 +4768,7 @@ async def setup_music_channels():
         state["channel_id"] = str(channel.id)
         try:
             await _refresh_music_card(guild, state)
+            await _set_voice_status(guild, "")
             voice = _music_voice_of(guild)
             if voice:
                 logger.info(f"更新贝多芬点唱机: #{channel.name} <-> {voice.name}")
@@ -5087,6 +5126,45 @@ def _adjacent_music_track(state: dict, step: int):
     return tracks[(idx + step) % len(tracks)]
 
 
+def _random_music_track(state: dict, exclude_id=None):
+    tracks = [t for t in (state.get("tracks") or []) if str(t.get("id")) != str(exclude_id)]
+    if not tracks:
+        return None
+    return random.choice(tracks)
+
+
+async def _set_voice_status(guild: discord.Guild, text: str):
+    voice = _music_voice_of(guild)
+    if not voice:
+        return
+    try:
+        await bot.http.request(
+            discord.http.Route(
+                "PUT",
+                "/channels/{channel_id}/voice-status",
+                channel_id=voice.id,
+            ),
+            json={"status": (text or "")[:500]},
+        )
+    except Exception as e:
+        logger.warning(f"写语音房状态失败: {e}")
+
+
+async def _set_bot_presence(title: str = ""):
+    try:
+        if title:
+            await bot.change_presence(
+                activity=discord.Activity(
+                    type=discord.ActivityType.listening,
+                    name=title[:128],
+                )
+            )
+        else:
+            await bot.change_presence(activity=None)
+    except Exception:
+        pass
+
+
 async def _ensure_music_voice(guild: discord.Guild):
     voice_ch = _music_voice_of(guild)
     if not voice_ch:
@@ -5122,6 +5200,7 @@ def _ffmpeg_source(path_or_url: str, is_url: bool):
 
 
 async def _mark_now_playing(guild: discord.Guild, track: dict, requester_name: str, voice: bool):
+    _music_idle_since.pop(guild.id, None)
     state = _music_state(guild.id)
     state["now_playing"] = {
         "title": track.get("title"),
@@ -5131,6 +5210,9 @@ async def _mark_now_playing(guild: discord.Guild, track: dict, requester_name: s
         "voice": bool(voice),
     }
     save_music()
+    if voice:
+        await _set_voice_status(guild, f"正在播 {track.get('title') or '未知曲目'}")
+        await _set_bot_presence(track.get("title") or "")
     text_ch = await _music_channel_from_state(guild, state)
     if text_ch:
         old_play_id = state.get("play_message_id")
@@ -5166,16 +5248,35 @@ async def _on_music_finished(guild_id: int, track_id: str, error, gen: int):
     now = state.get("now_playing") or {}
     if str(now.get("track_id") or "") != str(track_id):
         return
-    nxt = _adjacent_music_track(state, 1)
-    if not nxt or str(nxt.get("id")) == str(track_id):
+    current = _track_by_id(state, track_id)
+    loop_mode = state.get("loop") or "off"
+    nxt = None
+    if loop_mode == "one" and current:
+        nxt = current
+    if nxt is None:
+        queue = state.get("queue") or []
+        while queue:
+            cand = _track_by_id(state, queue.pop(0))
+            if cand:
+                nxt = cand
+                break
+        state["queue"] = queue
+    if nxt is None and state.get("shuffle"):
+        nxt = _random_music_track(state, exclude_id=track_id)
+    if nxt is None:
+        nxt = _adjacent_music_track(state, 1)
+    if not nxt or (str(nxt.get("id")) == str(track_id) and loop_mode not in ("one", "all")):
         state["now_playing"] = None
         save_music()
+        await _set_voice_status(guild, "")
+        await _set_bot_presence("")
         await _refresh_music_card(guild, state)
         return
     await _start_voice_play(guild, nxt, None)
 
 
 async def _start_voice_play(guild: discord.Guild, track: dict, requester) -> str:
+    _music_idle_since.pop(guild.id, None)
     gen = int(_music_play_gen.get(guild.id) or 0) + 1
     _music_play_gen[guild.id] = gen
     vc, err = await _ensure_music_voice(guild)
@@ -5240,8 +5341,49 @@ async def _stop_voice(guild: discord.Guild):
             pass
     state = _music_state(guild.id)
     state["now_playing"] = None
+    _music_idle_since.pop(guild.id, None)
     save_music()
+    await _set_voice_status(guild, "")
+    await _set_bot_presence("")
     await _refresh_music_card(guild, state)
+
+
+async def _idle_leave_voice(guild: discord.Guild):
+    _music_idle_since.pop(guild.id, None)
+    vc = guild.voice_client
+    if vc:
+        try:
+            await vc.disconnect(force=True)
+        except Exception:
+            pass
+    await _set_voice_status(guild, "")
+    await _set_bot_presence("")
+    logger.info(f"{guild.name} 点唱机空闲，已离开语音房")
+
+
+async def _music_idle_watchdog():
+    while True:
+        await asyncio.sleep(60)
+        try:
+            for guild in list(bot.guilds):
+                vc = guild.voice_client
+                if not vc or not vc.is_connected():
+                    _music_idle_since.pop(guild.id, None)
+                    continue
+                if vc.is_playing() or vc.is_paused():
+                    _music_idle_since.pop(guild.id, None)
+                    continue
+                state = _music_state(guild.id)
+                if (state.get("now_playing") or {}).get("track_id"):
+                    continue
+                since = _music_idle_since.get(guild.id)
+                if since is None:
+                    _music_idle_since[guild.id] = datetime.now(timezone.utc).timestamp()
+                    continue
+                if datetime.now(timezone.utc).timestamp() - since >= MUSIC_IDLE_SEC:
+                    await _idle_leave_voice(guild)
+        except Exception as e:
+            logger.warning(f"点唱机空闲检查异常: {e}")
 
 
 async def _stop_music_play(interaction: discord.Interaction):
@@ -5277,6 +5419,59 @@ async def _play_adjacent_track(interaction: discord.Interaction, step: int):
     await _send_music_play(interaction, track)
 
 
+async def _queue_selected_track(interaction: discord.Interaction):
+    state = _music_state(interaction.guild.id)
+    track = _selected_music_track(interaction, state)
+    if not track:
+        await interaction.response.send_message("先在歌单里选一首。", ephemeral=True)
+        return
+    vc = interaction.guild.voice_client
+    playing = bool(vc and (vc.is_playing() or vc.is_paused()))
+    now_id = str((state.get("now_playing") or {}).get("track_id") or "")
+    if not playing and not now_id:
+        await interaction.response.defer(ephemeral=True)
+        err = await _start_voice_play(interaction.guild, track, interaction.user)
+        await interaction.followup.send(
+            err or f"当前没在播，直接放 **{track.get('title')}**。",
+            ephemeral=True,
+        )
+        return
+    if now_id == str(track.get("id")):
+        await interaction.response.send_message("这首正在播。", ephemeral=True)
+        return
+    queue = state.setdefault("queue", [])
+    if len(queue) >= MUSIC_MAX_TRACKS:
+        await interaction.response.send_message("队列太长了，先清一清。", ephemeral=True)
+        return
+    if str(track.get("id")) in queue:
+        await interaction.response.send_message("这首已经在队列里了。", ephemeral=True)
+        return
+    queue.append(str(track.get("id")))
+    save_music()
+    await _refresh_music_card(interaction.guild, state)
+    await interaction.response.send_message(f"已加入队列：**{track.get('title')}**", ephemeral=True)
+
+
+async def _toggle_music_loop(interaction: discord.Interaction):
+    state = _music_state(interaction.guild.id)
+    cur = state.get("loop") or "off"
+    idx = MUSIC_LOOP_MODES.index(cur) if cur in MUSIC_LOOP_MODES else 0
+    state["loop"] = MUSIC_LOOP_MODES[(idx + 1) % len(MUSIC_LOOP_MODES)]
+    save_music()
+    await _refresh_music_card(interaction.guild, state)
+    label = {"off": "关", "all": "列表循环", "one": "单曲循环"}[state["loop"]]
+    await interaction.response.send_message(f"循环：{label}", ephemeral=True)
+
+
+async def _toggle_music_shuffle(interaction: discord.Interaction):
+    state = _music_state(interaction.guild.id)
+    state["shuffle"] = not state.get("shuffle")
+    save_music()
+    await _refresh_music_card(interaction.guild, state)
+    label = "开" if state["shuffle"] else "关"
+    await interaction.response.send_message(f"随机播放：{label}", ephemeral=True)
+
+
 async def _remove_selected_track(interaction: discord.Interaction):
     state = _music_state(interaction.guild.id)
     track = _selected_music_track(interaction, state)
@@ -5288,10 +5483,13 @@ async def _remove_selected_track(interaction: discord.Interaction):
         await interaction.response.send_message("只能下架自己分享的歌。", ephemeral=True)
         return
     state["tracks"] = [item for item in state.get("tracks") or [] if item.get("id") != track.get("id")]
+    state["queue"] = [q for q in state.get("queue") or [] if str(q) != str(track.get("id"))]
     now = state.get("now_playing") or {}
     was_playing = str(now.get("track_id") or "") == str(track.get("id"))
     if was_playing:
         state["now_playing"] = None
+        await _set_voice_status(interaction.guild, "")
+        await _set_bot_presence("")
         _music_play_gen[interaction.guild.id] = int(_music_play_gen.get(interaction.guild.id) or 0) + 1
         vc = interaction.guild.voice_client
         if vc and (vc.is_playing() or vc.is_paused()):
@@ -7268,6 +7466,7 @@ if __name__ == "__main__":
 
         # 启动心跳任务
         bot.heartbeat_task = asyncio.create_task(heartbeat())
+        bot.music_idle_task = asyncio.create_task(_music_idle_watchdog())
 
         logger.info("🚀 正在启动 Chen-Abot...")
         try:
