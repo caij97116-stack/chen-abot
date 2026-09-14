@@ -40,4 +40,5 @@ guide_channels.json
 download_logs.json
 file_records.json
 channel_published.json
+security_data.json
 file_store/

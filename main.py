@@ -103,6 +103,27 @@ AD_KEYWORDS = (
     "加v", "加微", "加vx", "微信", "qq群", "QQ群", "淘宝", "咸鱼",
     "闲鱼", "转卖", "代打", "优惠券",
 )
+SECURITY_FILE = "security_data.json"
+INVITE_RE = re.compile(
+    r"(discord(?:app)?\.com/invite/|discord\.gg/|dsc\.gg/|discord\.me/|discord\.com/invite)",
+    re.IGNORECASE,
+)
+RAID_JOIN_WINDOW_SEC = 20
+RAID_JOIN_COUNT = 8
+SECURITY_TIMEOUT_MIN = 10
+SLASH_MIN_INTERVAL_SEC = 3
+SECURITY_DEFAULTS = {
+    "auto_action": True,
+    "block_invites": True,
+    "shield_mentions": True,
+    "raid_shield": True,
+    "timeout_min": SECURITY_TIMEOUT_MIN,
+    "keywords": [],
+}
+security_data: dict = {}
+_raid_join_times: dict = defaultdict(deque)
+_slash_last: dict = {}
+_slash_rate_installed = False
 _alert_download_times: dict = defaultdict(deque)
 _alert_message_times: dict = defaultdict(deque)
 _alert_last_sent: dict = {}
@@ -819,46 +840,212 @@ def _looks_like_ad(text: str) -> bool:
     return False
 
 
+def load_security():
+    global security_data
+    try:
+        if os.path.exists(SECURITY_FILE):
+            with open(SECURITY_FILE, "r", encoding="utf-8") as f:
+                security_data = json.load(f) or {}
+    except Exception:
+        security_data = {}
+
+
+def save_security():
+    try:
+        with open(SECURITY_FILE, "w", encoding="utf-8") as f:
+            json.dump(security_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存小岛防护设置失败: {e}")
+
+
+def _security_settings(guild_id) -> dict:
+    key = str(guild_id)
+    rec = security_data.get(key)
+    if not isinstance(rec, dict):
+        rec = {}
+        security_data[key] = rec
+    for k, v in SECURITY_DEFAULTS.items():
+        if k == "keywords":
+            if not isinstance(rec.get(k), list):
+                rec[k] = []
+        else:
+            rec.setdefault(k, v)
+    return rec
+
+
+def _security_timeout_minutes(settings: dict) -> int:
+    try:
+        minutes = int(settings.get("timeout_min") or SECURITY_TIMEOUT_MIN)
+    except Exception:
+        minutes = SECURITY_TIMEOUT_MIN
+    return max(1, min(minutes, 1440))
+
+
+async def _security_timeout(member: discord.Member, reason: str):
+    settings = _security_settings(member.guild.id)
+    if not settings.get("auto_action", True):
+        return
+    try:
+        await member.timeout(
+            timedelta(minutes=_security_timeout_minutes(settings)),
+            reason=f"小岛防护：{reason}",
+        )
+    except Exception as e:
+        logger.warning(f"自动禁言失败: {e}")
+
+
+async def _delete_message_safe(message: discord.Message):
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+def _can_manage(guild: discord.Guild, member) -> bool:
+    if member.id == guild.owner_id:
+        return True
+    perms = getattr(member, "guild_permissions", None)
+    return bool(perms and (perms.administrator or perms.manage_messages or perms.manage_guild))
+
+
+def _looks_like_sensitive(guild_id, text: str) -> bool:
+    lowered = (text or "").lower()
+    for word in _security_settings(guild_id).get("keywords") or []:
+        if word and word.lower() in lowered:
+            return True
+    return False
+
+
+def _looks_like_invite(text: str) -> bool:
+    return bool(INVITE_RE.search(text or ""))
+
+
 async def _maybe_alert_message(message: discord.Message):
     if not message.guild or message.author.bot:
         return
-    if message.author.id == message.guild.owner_id:
+    guild = message.guild
+    if message.author.id == guild.owner_id:
         return
-    alert_channel = _find_alert_channel(message.guild)
+    alert_channel = _find_alert_channel(guild)
     if alert_channel and message.channel.id == alert_channel.id:
         return
+    settings = _security_settings(guild.id)
+
+    if _looks_like_sensitive(guild.id, message.content):
+        await _delete_message_safe(message)
+        await _security_timeout(message.author, "触发敏感词")
+        if _alert_cooldown_ok("敏感词", guild.id, message.author.id):
+            await _send_alert(
+                guild, "敏感词", "敏感词拦截",
+                (
+                    f"**用户:** {message.author.mention} `{message.author.id}`\n"
+                    f"**位置:** {message.channel.mention}\n"
+                    f"**内容:** {(message.content or '')[:500]}\n"
+                    f"**处理:** 已删消息并禁言"
+                ),
+                discord.Color.dark_red(),
+            )
+        return
+
+    if settings.get("block_invites", True) and _looks_like_invite(message.content):
+        await _delete_message_safe(message)
+        await _security_timeout(message.author, "发送邀请链接")
+        if _alert_cooldown_ok("邀请链接", guild.id, message.author.id):
+            await _send_alert(
+                guild, "邀请链接", "邀请链接拦截",
+                (
+                    f"**用户:** {message.author.mention} `{message.author.id}`\n"
+                    f"**位置:** {message.channel.mention}\n"
+                    f"**内容:** {(message.content or '')[:500]}\n"
+                    f"**处理:** 已删消息并禁言"
+                ),
+                discord.Color.red(),
+            )
+        return
+
+    if settings.get("shield_mentions", True) and message.mention_everyone and not _can_manage(guild, message.author):
+        await _delete_message_safe(message)
+        await _security_timeout(message.author, "滥用 @everyone/@here")
+        if _alert_cooldown_ok("全体提及", guild.id, message.author.id):
+            await _send_alert(
+                guild, "全体提及", "@everyone/@here 拦截",
+                (
+                    f"**用户:** {message.author.mention} `{message.author.id}`\n"
+                    f"**位置:** {message.channel.mention}\n"
+                    f"**内容:** {(message.content or '')[:500]}\n"
+                    f"**处理:** 已删消息并禁言"
+                ),
+                discord.Color.orange(),
+            )
+        return
+
     now = datetime.now(timezone.utc).timestamp()
-    key = (str(message.guild.id), str(message.author.id))
+    key = (str(guild.id), str(message.author.id))
     bucket = _alert_message_times[key]
     bucket.append(now)
     while bucket and now - bucket[0] > ALERT_SPAM_WINDOW_SEC:
         bucket.popleft()
-    if len(bucket) >= ALERT_SPAM_COUNT and _alert_cooldown_ok("刷屏", message.guild.id, message.author.id):
+    if len(bucket) >= ALERT_SPAM_COUNT:
+        await _delete_message_safe(message)
+        await _security_timeout(message.author, "刷屏")
+        if _alert_cooldown_ok("刷屏", guild.id, message.author.id):
+            await _send_alert(
+                guild, "刷屏", "刷屏",
+                (
+                    f"**用户:** {message.author.mention} `{message.author.id}`\n"
+                    f"**位置:** {message.channel.mention}\n"
+                    f"**原因:** {ALERT_SPAM_WINDOW_SEC} 秒内发了 {len(bucket)} 条消息\n"
+                    f"**最近内容:** {(message.content or '')[:200] or '（无文字）'}"
+                ),
+                discord.Color.gold(),
+            )
+        return
+
+    if _looks_like_ad(message.content):
+        await _delete_message_safe(message)
+        await _security_timeout(message.author, "疑似广告/买卖")
+        if _alert_cooldown_ok("广告", guild.id, message.author.id):
+            await _send_alert(
+                guild, "广告", "广告",
+                (
+                    f"**用户:** {message.author.mention} `{message.author.id}`\n"
+                    f"**位置:** {message.channel.mention}\n"
+                    f"**原因:** 消息疑似广告/买卖\n"
+                    f"**内容:** {(message.content or '')[:500]}"
+                ),
+                discord.Color.red(),
+            )
+
+
+async def _security_on_join(member: discord.Member):
+    guild = member.guild
+    settings = _security_settings(guild.id)
+    if not settings.get("raid_shield", True):
+        return
+    now = datetime.now(timezone.utc).timestamp()
+    bucket = _raid_join_times[str(guild.id)]
+    bucket.append(now)
+    while bucket and now - bucket[0] > RAID_JOIN_WINDOW_SEC:
+        bucket.popleft()
+    if len(bucket) < RAID_JOIN_COUNT:
+        return
+    await _security_timeout(member, "疑似突袭")
+    if _alert_cooldown_ok("防突袭", guild.id, "raid"):
         await _send_alert(
-            message.guild,
-            "刷屏",
-            "刷屏",
+            guild, "防突袭", "疑似突袭",
             (
-                f"**用户:** {message.author.mention} `{message.author.id}`\n"
-                f"**位置:** {message.channel.mention}\n"
-                f"**原因:** {ALERT_SPAM_WINDOW_SEC} 秒内发了 {len(bucket)} 条消息\n"
-                f"**最近内容:** {(message.content or '')[:200] or '（无文字）'}"
+                f"**新成员:** {member.mention} `{member.id}`\n"
+                f"**原因:** {RAID_JOIN_WINDOW_SEC} 秒内涌入 {len(bucket)} 人\n"
+                f"**处理:** 新号自动禁言；建议临时调高验证等级或设慢速模式"
             ),
-            discord.Color.gold(),
+            discord.Color.dark_red(),
         )
-    if _looks_like_ad(message.content) and _alert_cooldown_ok("广告", message.guild.id, message.author.id):
-        await _send_alert(
-            message.guild,
-            "广告",
-            "广告",
-            (
-                f"**用户:** {message.author.mention} `{message.author.id}`\n"
-                f"**位置:** {message.channel.mention}\n"
-                f"**原因:** 消息疑似广告/买卖\n"
-                f"**内容:** {(message.content or '')[:500]}"
-            ),
-            discord.Color.red(),
-        )
+
+
+async def _audit_log(guild: discord.Guild, title: str, description: str):
+    if not guild:
+        return
+    await _send_alert(guild, "操作审计", title, description, discord.Color.dark_teal())
 
 
 def _find_record_by_storage_card(message_id) -> tuple:
@@ -1474,6 +1661,34 @@ def save_quiz_cooldowns():
 #  Bot 启动与就绪
 # ═══════════════════════════════════════════
 
+class SlashRateLimited(app_commands.CheckFailure):
+    pass
+
+
+async def _slash_rate_check(interaction: discord.Interaction) -> bool:
+    if getattr(interaction, "type", None) is not discord.InteractionType.application_command:
+        return True
+    key = (interaction.guild_id, getattr(interaction.user, "id", 0))
+    now = datetime.now(timezone.utc).timestamp()
+    last = _slash_last.get(key, 0)
+    if now - last < SLASH_MIN_INTERVAL_SEC:
+        raise SlashRateLimited()
+    _slash_last[key] = now
+    return True
+
+
+def _install_slash_rate_limit():
+    global _slash_rate_installed
+    if _slash_rate_installed:
+        return
+    _slash_rate_installed = True
+    for cmd in bot.tree.walk_commands():
+        try:
+            cmd.add_check(_slash_rate_check)
+        except Exception:
+            pass
+
+
 @bot.event
 async def on_ready():
     load_records()
@@ -1495,6 +1710,8 @@ async def on_ready():
     load_guide_channels()
     load_download_logs()
     load_channel_published()
+    load_security()
+    _install_slash_rate_limit()
     _ensure_file_store()
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
@@ -1541,6 +1758,10 @@ async def on_member_join(member: discord.Member):
             logger.info(f"已为 {member.name} 分配 {MEMBER_ROLE_NAME} 身份组")
         except discord.Forbidden:
             pass
+    try:
+        await _security_on_join(member)
+    except Exception as e:
+        logger.warning(f"新成员防护检查失败: {e}")
 
 
 async def setup_quiz_channels():
@@ -3424,6 +3645,131 @@ async def announce(interaction: discord.Interaction, 频道: discord.TextChannel
         await interaction.followup.send(f"❌ 没有权限在 {频道.mention} 发送消息。", ephemeral=True)
     except Exception as e:
         await interaction.followup.send(f"❌ 发送失败: {e}", ephemeral=True)
+
+
+# ═══════════════════════════════════════════
+#  小岛防护设置（仅岛主）
+# ═══════════════════════════════════════════
+
+SECURITY_TOGGLE_LABELS = {
+    "auto_action": "自动处置（删消息 + 禁言）",
+    "block_invites": "拦截邀请链接",
+    "shield_mentions": "拦截 @everyone/@here",
+    "raid_shield": "防突袭",
+}
+
+
+def _build_security_embed(guild_id) -> discord.Embed:
+    settings = _security_settings(guild_id)
+    lines = []
+    for key, label in SECURITY_TOGGLE_LABELS.items():
+        lines.append(f"{'✅' if settings.get(key) else '⬜'} {label}")
+    lines.append(f"⏱️ 自动禁言时长：{_security_timeout_minutes(settings)} 分钟")
+    kws = settings.get("keywords") or []
+    if kws:
+        shown = "、".join(kws[:10]) + ("…" if len(kws) > 10 else "")
+        lines.append(f"🔒 自定义敏感词（{len(kws)}）：{shown}")
+    else:
+        lines.append("🔒 自定义敏感词：无")
+    embed = discord.Embed(
+        title="小岛防护设置",
+        description="\n".join(lines),
+        color=discord.Color.dark_teal(),
+    )
+    embed.set_footer(text="用 /防护设置 修改开关 | /添加敏感词、/删除敏感词 维护词表")
+    return embed
+
+
+@bot.tree.command(name="防护设置", description="查看或修改小岛防护（仅岛主）")
+@app_commands.describe(项目="要修改的项目", 开关="开或关", 禁言分钟="自动禁言时长，1~1440 分钟")
+@app_commands.choices(
+    项目=[
+        app_commands.Choice(name="自动处置（删+禁言）", value="auto_action"),
+        app_commands.Choice(name="拦截邀请链接", value="block_invites"),
+        app_commands.Choice(name="拦截 @everyone/@here", value="shield_mentions"),
+        app_commands.Choice(name="防突袭", value="raid_shield"),
+        app_commands.Choice(name="自动禁言时长", value="timeout"),
+    ],
+    开关=[
+        app_commands.Choice(name="开", value="on"),
+        app_commands.Choice(name="关", value="off"),
+    ],
+)
+async def security_config(
+    interaction: discord.Interaction,
+    项目: app_commands.Choice[str] = None,
+    开关: app_commands.Choice[str] = None,
+    禁言分钟: app_commands.Range[int, 1, 1440] = None,
+):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能改。", ephemeral=True)
+        return
+    settings = _security_settings(interaction.guild.id)
+    changed = []
+    if 项目:
+        if 项目.value == "timeout":
+            if 禁言分钟 is None:
+                await interaction.response.send_message("改时长要填「禁言分钟」。", ephemeral=True)
+                return
+            settings["timeout_min"] = int(禁言分钟)
+            changed.append(f"禁言时长 → {settings['timeout_min']} 分钟")
+        else:
+            if 开关 is None:
+                await interaction.response.send_message("改开关要选「开」或「关」。", ephemeral=True)
+                return
+            settings[项目.value] = (开关.value == "on")
+            changed.append(f"{SECURITY_TOGGLE_LABELS.get(项目.value, 项目.value)} → {'开' if settings[项目.value] else '关'}")
+        save_security()
+        await _audit_log(interaction.guild, "防护设置变更", f"**操作人:** {interaction.user.mention}\n" + "\n".join(changed))
+    await interaction.response.send_message(embed=_build_security_embed(interaction.guild.id), ephemeral=True)
+
+
+@bot.tree.command(name="添加敏感词", description="添加一条自动删除的敏感词（仅岛主）")
+async def add_sensitive_word(interaction: discord.Interaction, 词: str):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    word = " ".join((词 or "").split())[:50]
+    if not word:
+        await interaction.response.send_message("词是空的。", ephemeral=True)
+        return
+    settings = _security_settings(interaction.guild.id)
+    kws = settings.setdefault("keywords", [])
+    if word in kws:
+        await interaction.response.send_message(f"「{word}」已经在词表里了。", ephemeral=True)
+        return
+    kws.append(word)
+    save_security()
+    await _audit_log(interaction.guild, "敏感词变更", f"**操作人:** {interaction.user.mention}\n**新增:** {word}")
+    await interaction.response.send_message(f"已添加敏感词：**{word}**", ephemeral=True)
+
+
+@bot.tree.command(name="删除敏感词", description="删除一条敏感词（仅岛主）")
+async def remove_sensitive_word(interaction: discord.Interaction, 词: str):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    word = " ".join((词 or "").split())[:50]
+    settings = _security_settings(interaction.guild.id)
+    kws = settings.setdefault("keywords", [])
+    if word not in kws:
+        await interaction.response.send_message(f"词表里没有「{word}」。", ephemeral=True)
+        return
+    kws.remove(word)
+    save_security()
+    await _audit_log(interaction.guild, "敏感词变更", f"**操作人:** {interaction.user.mention}\n**删除:** {word}")
+    await interaction.response.send_message(f"已删除敏感词：**{word}**", ephemeral=True)
+
+
+@bot.tree.command(name="敏感词列表", description="查看当前敏感词（仅岛主）")
+async def list_sensitive_words(interaction: discord.Interaction):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    kws = _security_settings(interaction.guild.id).get("keywords") or []
+    body = "\n".join(f"- {w}" for w in kws) if kws else "（空）"
+    embed = discord.Embed(title="敏感词列表", description=body[:4000], color=discord.Color.dark_teal())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ═══════════════════════════════════════════
@@ -7085,106 +7431,205 @@ def _purge_guild_files(guild_id: str, extra_channel_ids=None):
     save_download_logs()
 
 
-@bot.tree.command(name="清理测试数据", description="清空工单、黑户地带、存储文件和帖子公开卡片（仅岛主）")
+CLEANUP_ITEM_OPTIONS = [
+    discord.SelectOption(label="举报工单与子区（含编号重置）", value="threads"),
+    discord.SelectOption(label="帖子公开卡片", value="cards"),
+    discord.SelectOption(label="资源码 / 下载人码 / 下载记录重置", value="codes"),
+]
+
+
+class CleanupConfirmView(discord.ui.View):
+    def __init__(self, owner_id: int, guild: discord.Guild):
+        super().__init__(timeout=180)
+        self.owner_id = owner_id
+        self.guild = guild
+        self.items = set()
+        self.channel_ids = set()
+
+        item_select = discord.ui.Select(
+            placeholder="第一步：勾选要清理的东西（可多选）",
+            min_values=0,
+            max_values=len(CLEANUP_ITEM_OPTIONS),
+            options=CLEANUP_ITEM_OPTIONS,
+            row=0,
+        )
+        item_select.callback = self._on_items
+        self.add_item(item_select)
+
+        channels = list(guild.text_channels)[:25]
+        channel_options = [
+            discord.SelectOption(label=f"#{c.name}"[:100], value=str(c.id))
+            for c in channels
+        ]
+        channel_select = discord.ui.Select(
+            placeholder="第二步：勾选要清空消息的频道（可多选）",
+            min_values=0,
+            max_values=max(1, min(25, len(channel_options))),
+            options=channel_options or [discord.SelectOption(label="没有可清空的文字频道", value="none")],
+            row=1,
+        )
+        if not channel_options:
+            channel_select.disabled = True
+        channel_select.callback = self._on_channels
+        self.add_item(channel_select)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.owner_id:
+            await interaction.response.send_message("这是岛主的清理确认。", ephemeral=True)
+            return False
+        return True
+
+    async def _on_items(self, interaction: discord.Interaction):
+        values = (interaction.data or {}).get("values") or []
+        self.items = {v for v in values if v in {o.value for o in CLEANUP_ITEM_OPTIONS}}
+        await interaction.response.defer()
+
+    async def _on_channels(self, interaction: discord.Interaction):
+        values = (interaction.data or {}).get("values") or []
+        self.channel_ids = {v for v in values if v != "none"}
+        await interaction.response.defer()
+
+    @discord.ui.button(label="确认清理", style=discord.ButtonStyle.danger, row=2)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not self.items and not self.channel_ids:
+            await interaction.response.send_message("还没选要清理的东西或频道。", ephemeral=True)
+            return
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            content="正在清理，请稍候…",
+            embed=None,
+            view=self,
+        )
+        summary = await _run_cleanup(interaction.guild, self.items, self.channel_ids)
+        await interaction.followup.send(summary, ephemeral=True)
+        self.stop()
+
+    @discord.ui.button(label="取消", style=discord.ButtonStyle.secondary, row=2)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(content="已取消，什么都没清。", embed=None, view=self)
+        self.stop()
+
+
+async def _run_cleanup(guild: discord.Guild, items: set, channel_ids: set) -> str:
+    guild_id = str(guild.id)
+    lines = []
+    card_channel_ids = set()
+
+    if "threads" in items:
+        deleted_threads = 0
+        for rec in list(report_data.values()):
+            if rec.get("guild_id") != guild_id:
+                continue
+            thread_id = rec.get("thread_id")
+            if not thread_id:
+                continue
+            thread = guild.get_thread(int(thread_id))
+            if thread is None:
+                try:
+                    thread = await guild.fetch_channel(int(thread_id))
+                except Exception:
+                    thread = None
+            if thread:
+                try:
+                    await thread.delete()
+                    deleted_threads += 1
+                except Exception as e:
+                    logger.warning(f"删除子频道失败: {e}")
+        _purge_guild_reports(guild_id)
+        lines.append(f"已关闭举报子区 {deleted_threads} 个，工单编号回到 #001")
+
+    if "cards" in items:
+        deleted_cards = 0
+        seen_cards = set()
+        for rec in list(file_records.values()):
+            if str(rec.get("guild_id")) != guild_id:
+                continue
+            msg_id = rec.get("published_msg_id")
+            channel_id = rec.get("source_channel_id")
+            if not msg_id or not channel_id:
+                continue
+            key = (str(channel_id), str(msg_id))
+            if key in seen_cards:
+                continue
+            seen_cards.add(key)
+            channel = guild.get_channel(int(channel_id))
+            if channel is None:
+                continue
+            card_channel_ids.add(str(channel_id))
+            try:
+                msg = await channel.fetch_message(int(msg_id))
+                await msg.delete()
+                deleted_cards += 1
+            except Exception:
+                pass
+            channel_published.pop(str(channel_id), None)
+        for cid, pub in list(channel_published.items()):
+            msg_id = (pub or {}).get("message_id")
+            if not msg_id:
+                continue
+            key = (str(cid), str(msg_id))
+            if key in seen_cards:
+                continue
+            channel = guild.get_channel(int(cid)) if str(cid).isdigit() else None
+            if channel is None or channel.guild.id != guild.id:
+                continue
+            seen_cards.add(key)
+            card_channel_ids.add(str(cid))
+            try:
+                msg = await channel.fetch_message(int(msg_id))
+                await msg.delete()
+                deleted_cards += 1
+            except Exception:
+                pass
+            channel_published.pop(str(cid), None)
+        save_channel_published()
+        lines.append(f"已删除帖子公开卡片 {deleted_cards} 张")
+
+    if channel_ids:
+        cleared_total = 0
+        cleared_channels = 0
+        for cid in channel_ids:
+            channel = guild.get_channel(int(cid)) if str(cid).isdigit() else None
+            if channel is None:
+                continue
+            cleared_channels += 1
+            cleared_total += await _wipe_channel_messages(channel)
+        lines.append(f"已清空 {cleared_channels} 个频道，共 {cleared_total} 条消息")
+
+    if "codes" in items:
+        _purge_guild_files(guild_id, extra_channel_ids=card_channel_ids)
+        lines.append("资源码 / 下载人码 / 下载记录已重置")
+
+    if not lines:
+        lines.append("没有执行任何清理。")
+    summary = "清理完成：\n" + "\n".join(f"- {line}" for line in lines)
+    await _audit_log(
+        guild,
+        "清理测试数据",
+        f"**操作人:** {guild.owner.mention if guild.owner else '岛主'}\n" + "\n".join(f"- {line}" for line in lines),
+    )
+    return summary
+
+
+@bot.tree.command(name="清理测试数据", description="选择频道和内容后二次确认清理（仅岛主）")
 async def cleanup_reports(interaction: discord.Interaction):
     if interaction.user.id != interaction.guild.owner_id:
         await interaction.response.send_message("只有岛主才能使用此命令。", ephemeral=True)
         return
-
-    await interaction.response.defer(ephemeral=True)
-    guild = interaction.guild
-    guild_id = str(guild.id)
-    deleted_threads = 0
-    deleted_cards = 0
-    card_channel_ids = set()
-
-    for rec in list(report_data.values()):
-        if rec.get("guild_id") != guild_id:
-            continue
-        thread_id = rec.get("thread_id")
-        if not thread_id:
-            continue
-        thread = guild.get_thread(int(thread_id))
-        if thread is None:
-            try:
-                thread = await guild.fetch_channel(int(thread_id))
-            except Exception:
-                thread = None
-        if thread:
-            try:
-                await thread.delete()
-                deleted_threads += 1
-            except Exception as e:
-                logger.warning(f"删除子频道失败: {e}")
-
-    seen_cards = set()
-    for rec in list(file_records.values()):
-        if str(rec.get("guild_id")) != guild_id:
-            continue
-        msg_id = rec.get("published_msg_id")
-        channel_id = rec.get("source_channel_id")
-        if not msg_id or not channel_id:
-            continue
-        key = (str(channel_id), str(msg_id))
-        if key in seen_cards:
-            continue
-        seen_cards.add(key)
-        channel = guild.get_channel(int(channel_id))
-        if channel is None:
-            continue
-        card_channel_ids.add(str(channel_id))
-        try:
-            msg = await channel.fetch_message(int(msg_id))
-            await msg.delete()
-            deleted_cards += 1
-        except Exception:
-            pass
-    for cid, pub in list(channel_published.items()):
-        msg_id = (pub or {}).get("message_id")
-        if not msg_id:
-            continue
-        key = (str(cid), str(msg_id))
-        if key in seen_cards:
-            continue
-        channel = guild.get_channel(int(cid)) if str(cid).isdigit() else None
-        if channel is None or channel.guild.id != guild.id:
-            continue
-        seen_cards.add(key)
-        card_channel_ids.add(str(cid))
-        try:
-            msg = await channel.fetch_message(int(msg_id))
-            await msg.delete()
-            deleted_cards += 1
-        except Exception:
-            pass
-
-    review_channel = discord.utils.get(guild.text_channels, name=REPORT_REVIEW_CHANNEL_NAME)
-    blacklist_channel = None
-    for channel in guild.text_channels:
-        if BLACKLIST_CHANNEL_KEYWORD in channel.name:
-            blacklist_channel = channel
-            break
-    storage_channel = None
-    storage_id = storage_channels.get(guild_id)
-    if storage_id:
-        storage_channel = guild.get_channel(int(storage_id))
-    if storage_channel is None:
-        storage_channel = discord.utils.get(guild.text_channels, name="📁-文件存储")
-
-    cleared_review = await _wipe_channel_messages(review_channel)
-    cleared_blacklist = await _wipe_channel_messages(blacklist_channel)
-    cleared_storage = await _wipe_channel_messages(storage_channel)
-    _purge_guild_reports(guild_id)
-    _purge_guild_files(guild_id, extra_channel_ids=card_channel_ids)
-
-    await interaction.followup.send(
-        f"清理完成，工单和文件都回到最初状态。\n"
-        f"已关闭举报子区 {deleted_threads} 个\n"
-        f"审核频道已清空 {cleared_review} 条\n"
-        f"黑户地带公示已清空 {cleared_blacklist} 条\n"
-        f"存储频道文件已清空 {cleared_storage} 条\n"
-        f"帖子公开卡片已删除 {deleted_cards} 张\n"
-        f"工单从 #001、资源码从空重新开始",
+    embed = discord.Embed(
+        title="清理测试数据",
+        description=(
+            "先勾选要清理的内容，再勾选要清空消息的频道，最后点「确认清理」。\n"
+            "不勾选就不会动。"
+        ),
+        color=discord.Color.red(),
+    )
+    await interaction.response.send_message(
+        embed=embed,
+        view=CleanupConfirmView(interaction.user.id, interaction.guild),
         ephemeral=True,
     )
 
@@ -7344,6 +7789,15 @@ class ReportCopyView(discord.ui.View):
 
 @bot.tree.error
 async def on_app_command_error(interaction: discord.Interaction, error):
+    if isinstance(error, SlashRateLimited):
+        try:
+            await interaction.response.send_message(
+                f"点太快了，{SLASH_MIN_INTERVAL_SEC} 秒后再试。",
+                ephemeral=True,
+            )
+        except Exception:
+            pass
+        return
     if isinstance(error, app_commands.errors.MissingPermissions):
         await interaction.response.send_message("你没有权限执行此操作！", ephemeral=True)
         return
