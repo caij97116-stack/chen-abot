@@ -980,7 +980,7 @@ async def _notify_subscribers(guild: discord.Guild, record: dict, jump_url: str)
                 color=discord.Color.purple(),
                 timestamp=_beijing_now(),
             )
-            embed.set_footer(text="不想收了，就在卡片上点「订阅 TA」取消")
+            embed.set_footer(text="不想收了，就在订阅卡上点「订阅 / 取消订阅」")
             await member.send(embed=embed)
         except Exception:
             pass
@@ -3065,6 +3065,7 @@ async def _publish_file(interaction: discord.Interaction, file_id: str, record: 
         save_records()
         save_channel_published()
         await _upsert_storage_card(interaction.guild, file_id, record)
+        await _upsert_subscribe_card(interaction.channel, record)
         await _notify_subscribers(interaction.guild, record, pub_msg.jump_url)
 
         await interaction.followup.send(
@@ -3094,6 +3095,86 @@ def _build_published_card(record: dict, file_id: str, persistent: bool = True):
     embed.set_footer(text=f"上传者: {record.get('uploader_name', '未知')} | 先满足条件，再选择文件后下载")
     view = PublishedFileView(file_id, record, persistent=persistent)
     return embed, view
+
+
+# ─── 独立订阅卡片 ───
+
+def _find_record_by_subscribe_card(message_id):
+    target = str(message_id)
+    for rid, rec in file_records.items():
+        if str(rec.get("subscribe_msg_id") or "") == target:
+            return rid, rec
+    return None, None
+
+
+def _build_subscribe_card(record: dict) -> discord.Embed:
+    uploader_id = str(record.get("uploader_id") or "")
+    name = record.get("uploader_name") or "这位分享者"
+    count = len([x for x in _subscribers_of(record.get("guild_id") or "", uploader_id) if x != uploader_id])
+    embed = discord.Embed(
+        title="订阅这位分享者",
+        description=(
+            f"喜欢 **{name}** 的资源？点下面的按钮订阅。\n"
+            f"TA 以后发布新资源，机器人会私信通知你。\n\n"
+            f"**当前订阅人数:** {count}"
+        ),
+        color=discord.Color.blurple(),
+    )
+    embed.set_footer(text="点一次订阅，再点一次取消")
+    return embed
+
+
+class PersistentSubscribeView(discord.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="订阅 / 取消订阅",
+        style=discord.ButtonStyle.primary,
+        emoji="🔔",
+        custom_id="subscribe_toggle",
+    )
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        rid, record = _find_record_by_subscribe_card(interaction.message.id)
+        if not record:
+            rid, record = _resolve_published_record(interaction, "")
+        if not record:
+            await interaction.response.send_message("这张订阅卡对应的资源已经找不到了。", ephemeral=True)
+            return
+        uploader_id = str(record.get("uploader_id") or "")
+        if not uploader_id:
+            await interaction.response.send_message("找不到上传者。", ephemeral=True)
+            return
+        if str(interaction.user.id) == uploader_id:
+            await interaction.response.send_message("这是你自己发的，不用订阅。", ephemeral=True)
+            return
+        now_subscribed = _toggle_subscription(interaction.guild.id, interaction.user.id, uploader_id)
+        name = record.get("uploader_name") or "TA"
+        if now_subscribed:
+            text = f"已订阅 **{name}**，TA 以后发新资源会私信你。想取消再点一次。"
+        else:
+            text = f"已取消订阅 **{name}**。"
+        try:
+            await interaction.message.edit(embed=_build_subscribe_card(record))
+        except Exception:
+            pass
+        await interaction.response.send_message(text, ephemeral=True)
+
+
+async def _upsert_subscribe_card(channel: discord.TextChannel, record: dict):
+    old_id = record.get("subscribe_msg_id")
+    if old_id:
+        try:
+            old_msg = await channel.fetch_message(int(old_id))
+            await old_msg.delete()
+        except Exception:
+            pass
+    try:
+        msg = await channel.send(embed=_build_subscribe_card(record), view=PersistentSubscribeView())
+        record["subscribe_msg_id"] = str(msg.id)
+        save_records()
+    except Exception as e:
+        logger.warning(f"发送订阅卡失败: {e}")
 
 
 _download_selections: dict = {}
@@ -3368,36 +3449,6 @@ class PublishedFileView(discord.ui.View):
         self.download_btn = discord.ui.Button(**button_kwargs)
         self.download_btn.callback = self.on_download
         self.add_item(self.download_btn)
-        sub_kwargs = {
-            "label": "订阅 TA",
-            "style": discord.ButtonStyle.secondary,
-            "row": 1,
-        }
-        if persistent:
-            sub_kwargs["custom_id"] = "pub_file_subscribe"
-        self.subscribe_btn = discord.ui.Button(**sub_kwargs)
-        self.subscribe_btn.callback = self.on_subscribe
-        self.add_item(self.subscribe_btn)
-
-    async def on_subscribe(self, interaction: discord.Interaction):
-        file_id, record = _resolve_published_record(interaction, self._file_id)
-        if not record:
-            await interaction.response.send_message("发布记录已过期。", ephemeral=True)
-            return
-        uploader_id = str(record.get("uploader_id") or "")
-        if not uploader_id:
-            await interaction.response.send_message("找不到上传者。", ephemeral=True)
-            return
-        if str(interaction.user.id) == uploader_id:
-            await interaction.response.send_message("这是你自己发的，不用订阅。", ephemeral=True)
-            return
-        now_subscribed = _toggle_subscription(interaction.guild.id, interaction.user.id, uploader_id)
-        name = record.get("uploader_name") or "TA"
-        if now_subscribed:
-            text = f"已订阅 **{name}**，TA 以后发新资源会私信你。想取消再点一次这个按钮。"
-        else:
-            text = f"已取消订阅 **{name}**。"
-        await interaction.response.send_message(text, ephemeral=True)
 
     async def on_select(self, interaction: discord.Interaction):
         values = []
@@ -8533,6 +8584,7 @@ if __name__ == "__main__":
         bot.add_view(PersistentReportReviewView())
         bot.add_view(PersistentEvidenceView())
         bot.add_view(PublishedFileView())
+        bot.add_view(PersistentSubscribeView())
         bot.add_view(PersistentStorageCardView())
         bot.add_view(PersistentMusicView())
         bot.add_view(PersistentStoryEntryView())
