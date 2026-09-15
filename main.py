@@ -7797,32 +7797,87 @@ async def setup_guide_channels():
 #  /清理测试数据 - 仅岛主可用，工单、审核频道、黑户地带一并回到初始
 # ═══════════════════════════════════════════
 
-async def _wipe_channel_messages(channel) -> int:
+def _collect_protected_message_ids() -> set:
+    """收集所有机器人常驻卡的消息 ID，清理频道时不能删。"""
+    protected = set()
+
+    def add(mid):
+        if mid:
+            protected.add(str(mid))
+
+    for store in (
+        quiz_channel_messages,
+        checkin_channel_messages,
+        gamble_channel_messages,
+        story_channel_messages,
+        report_channel_messages,
+        guide_channel_messages,
+    ):
+        for mid in (store or {}).values():
+            add(mid)
+
+    for rec in file_records.values():
+        add(rec.get("storage_card_msg_id"))
+    for pub in channel_published.values():
+        add((pub or {}).get("message_id"))
+    for rec in report_data.values():
+        add(rec.get("review_message_id"))
+        add(rec.get("public_message_id"))
+    for state in music_data.values():
+        if isinstance(state, dict):
+            add(state.get("card_message_id"))
+            add(state.get("play_message_id"))
+    for rec in giveaway_data.values():
+        if isinstance(rec, dict):
+            add(rec.get("message_id"))
+    for post in story_data.values():
+        if isinstance(post, dict):
+            add(post.get("message_id"))
+    return protected
+
+
+def _is_protected_message(msg: discord.Message, protected_ids: set) -> bool:
+    if str(msg.id) in protected_ids:
+        return True
+    if msg.author.id == bot.user.id:
+        if msg.pinned:
+            return True
+        try:
+            if msg.components:
+                return True
+        except Exception:
+            pass
+    return False
+
+
+async def _wipe_channel_messages(channel, protected: set = None) -> int:
     if channel is None:
         return 0
+    protected_ids = {str(x) for x in (protected or set()) if x}
     cleared = 0
+    before = None
     try:
         while True:
-            batch = []
-            async for msg in channel.history(limit=100):
-                batch.append(msg)
-            if not batch:
+            raw = []
+            async for msg in channel.history(limit=100, before=before):
+                raw.append(msg)
+            if not raw:
                 break
-            try:
-                await channel.delete_messages(batch)
-                cleared += len(batch)
-                if len(batch) < 100:
-                    break
-                continue
-            except Exception:
-                pass
-            for msg in batch:
+            before = raw[-1]
+            targets = [m for m in raw if not _is_protected_message(m, protected_ids)]
+            if targets:
                 try:
-                    await msg.delete()
-                    cleared += 1
+                    await channel.delete_messages(targets)
+                    cleared += len(targets)
                 except Exception:
-                    pass
-            if len(batch) < 100:
+                    for msg in targets:
+                        try:
+                            await msg.delete()
+                            cleared += 1
+                            await asyncio.sleep(0.25)
+                        except Exception:
+                            pass
+            if len(raw) < 100:
                 break
     except Exception as e:
         logger.warning(f"清空频道 #{getattr(channel, 'name', '?')} 失败: {e}")
@@ -8019,6 +8074,7 @@ async def _run_cleanup(guild: discord.Guild, items: set, channel_ids: set) -> st
         lines.append(f"已删除帖子公开卡片 {deleted_cards} 张")
 
     if channel_ids:
+        protected = _collect_protected_message_ids()
         cleared_total = 0
         cleared_channels = 0
         for cid in channel_ids:
@@ -8026,8 +8082,11 @@ async def _run_cleanup(guild: discord.Guild, items: set, channel_ids: set) -> st
             if channel is None:
                 continue
             cleared_channels += 1
-            cleared_total += await _wipe_channel_messages(channel)
-        lines.append(f"已清空 {cleared_channels} 个频道，共 {cleared_total} 条消息")
+            cleared_total += await _wipe_channel_messages(channel, protected)
+        lines.append(
+            f"已清空 {cleared_channels} 个频道，共 {cleared_total} 条消息"
+            "（机器人常驻卡和置顶消息已保留）"
+        )
 
     if "codes" in items:
         _purge_guild_files(guild_id, extra_channel_ids=card_channel_ids)
