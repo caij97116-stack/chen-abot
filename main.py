@@ -62,11 +62,32 @@ MUSIC_STREAM_RE = re.compile(
     r"(youtu\.be|youtube\.com|music\.youtube\.com|soundcloud\.com|snd\.sc)",
     re.IGNORECASE,
 )
-MUSIC_BLOCKED_RE = re.compile(
-    r"(music\.163\.com|163cn\.tv|y\.qq\.com|i\.y\.qq\.com|open\.spotify\.com|"
-    r"bilibili\.com|b23\.tv|kugou\.com|kuwo\.cn)",
+MUSIC_BILI_RE = re.compile(
+    r"(bilibili\.com|b23\.tv|bili2233\.cn|acg\.tv)",
     re.IGNORECASE,
 )
+MUSIC_BLOCKED_RE = re.compile(
+    r"(music\.163\.com|163cn\.tv|y\.qq\.com|i\.y\.qq\.com|open\.spotify\.com|"
+    r"kugou\.com|kuwo\.cn)",
+    re.IGNORECASE,
+)
+# B站取流：view 接口拿元数据（分区 tid 用于筛选），playurl 接口拿纯音频轨
+BILI_API = "https://api.bilibili.com"
+BILI_REFERER = "https://www.bilibili.com/"
+BILI_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+# 音乐区主/子分区 tid：原创音乐、翻唱、VOCALOID、电音、演奏、MV、三次元音乐、音乐综合
+BILI_MUSIC_TIDS = {3, 28, 29, 30, 31, 59, 130, 193, 194}
+# 分区不在音乐区时，再用标题里的音乐关键词兜底
+BILI_MUSIC_WORDS = (
+    "mv", "官方", "音乐", "歌曲", "高音质", "无损", "纯音乐", "伴奏", "翻唱",
+    "cover", "bgm", "ost", "主题曲", "片头曲", "片尾曲", "专辑", "remix",
+    "合唱", "歌", "live", "现场", "演唱会",
+)
+# 带这些词的消息可无视筛选强制入库，给用户留个口子
+BILI_FORCE_WORDS = ("强制入库", "就当音乐")
 GAMBLE_CHANNEL_KEYWORD = "赌王来一下"
 GAMBLE_DRAW_COST_POINTS = 10
 GAMBLE_DRAW_TEN = 10
@@ -5457,7 +5478,7 @@ def _ffmpeg_bin() -> Optional[str]:
 
 
 def _looks_like_stream_url(url: str) -> bool:
-    return bool(MUSIC_STREAM_RE.search(url or ""))
+    return bool(MUSIC_STREAM_RE.search(url or "") or MUSIC_BILI_RE.search(url or ""))
 
 
 def _music_state(guild_id) -> dict:
@@ -5557,7 +5578,7 @@ def _build_music_embed(state: dict) -> discord.Embed:
             )
         list_txt = "\n".join(lines)
     else:
-        list_txt = "歌单还空着。把 mp3 丢进这个频道，或发 YouTube / SoundCloud / 直接音频地址，就会进歌单。"
+        list_txt = "歌单还空着。把 mp3 丢进这个频道，或发 B站 / YouTube / SoundCloud / 直接音频地址，就会进歌单。"
     loop_mode = state.get("loop") or "off"
     loop_txt = {"off": "关", "all": "列表循环", "one": "单曲循环"}.get(loop_mode, "关")
     shuffle_txt = "开" if state.get("shuffle") else "关"
@@ -5736,6 +5757,118 @@ def _commit_music_track(state: dict, track: dict) -> str:
     return ""
 
 
+class _MusicRejected(Exception):
+    """链接内容不像音乐，拒绝入库。消息会直接展示给用户。"""
+
+
+def _looks_like_bili_url(url: str) -> bool:
+    return bool(MUSIC_BILI_RE.search(url or ""))
+
+
+def _bili_headers() -> dict:
+    return {"User-Agent": BILI_UA, "Referer": BILI_REFERER}
+
+
+def _bili_bvid(url: str) -> str:
+    found = re.search(r"(BV[0-9A-Za-z]{10})", url or "")
+    return found.group(1) if found else ""
+
+
+def _bili_aid(url: str) -> str:
+    found = re.search(r"av(\d+)", url or "", re.IGNORECASE)
+    return found.group(1) if found else ""
+
+
+async def _bili_expand(url: str) -> str:
+    if not re.search(r"(b23\.tv|bili2233\.cn|acg\.tv)", url or "", re.IGNORECASE):
+        return url
+    timeout = aiohttp.ClientTimeout(total=15)
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=_bili_headers()) as session:
+            async with session.get(url, allow_redirects=False) as resp:
+                return resp.headers.get("Location") or url
+    except Exception:
+        return url
+
+
+def _bili_pick_audio(dash: dict) -> str:
+    audios = (dash or {}).get("audio") or []
+    if not audios:
+        return ""
+    best = max(audios, key=lambda item: int(item.get("bandwidth") or 0))
+    return best.get("baseUrl") or best.get("base_url") or ""
+
+
+def _bili_looks_like_music(tid: int, title: str, caption: str) -> bool:
+    if any(word in (caption or "") for word in BILI_FORCE_WORDS):
+        return True
+    if tid in BILI_MUSIC_TIDS:
+        return True
+    text = (title or "").lower()
+    return any(word in text for word in BILI_MUSIC_WORDS)
+
+
+async def _resolve_bilibili(url: str, caption: str = "", enforce_filter: bool = True) -> tuple:
+    expanded = await _bili_expand(url)
+    bvid = _bili_bvid(expanded)
+    aid = _bili_aid(expanded)
+    if not bvid and not aid:
+        raise ValueError("这条 B站 链接里没找到视频号。")
+    headers = _bili_headers()
+    timeout = aiohttp.ClientTimeout(total=25)
+    view_params = {"bvid": bvid} if bvid else {"aid": aid}
+    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+        async with session.get(f"{BILI_API}/x/web-interface/view", params=view_params) as resp:
+            payload = await resp.json()
+        data = payload.get("data") or {}
+        if not data:
+            raise ValueError("B站 这条视频的信息没拿到，可能被风控了，稍后再试。")
+        title = (data.get("title") or "未命名")[:100]
+        tid = int(data.get("tid") or 0)
+        cid = int(data.get("cid") or 0)
+        if not cid:
+            pages = data.get("pages") or []
+            if pages:
+                cid = int(pages[0].get("cid") or 0)
+        if not cid:
+            raise ValueError("这条 B站 视频没有可播的音轨。")
+        key = bvid or f"av{aid}"
+        if enforce_filter and not _bili_looks_like_music(tid, title, caption):
+            raise _MusicRejected(
+                f"《{title}》看着不像音乐，没放进歌单。"
+                "贝多芬只收 MV、歌曲、纯音乐这类；游戏解说、直播实况请等观影室。"
+                "如果判错了，消息里带上「强制入库」再发一次。"
+            )
+        play_params = {
+            "bvid": bvid,
+            "cid": cid,
+            "fnval": 16,
+            "fnver": 0,
+            "fourk": 1,
+        }
+        if not bvid:
+            play_params.pop("bvid")
+            play_params["avid"] = aid
+        async with session.get(f"{BILI_API}/x/player/playurl", params=play_params) as resp:
+            play = await resp.json()
+    play_data = play.get("data") or {}
+    stream_url = _bili_pick_audio(play_data.get("dash") or {})
+    if not stream_url:
+        durl = play_data.get("durl") or []
+        if durl:
+            stream_url = durl[0].get("url") or ""
+    if not stream_url:
+        raise ValueError("B站 这条视频拿不到可播音频，可能只对登录用户开放。")
+    webpage = f"https://www.bilibili.com/video/{key}"
+    return title, stream_url, webpage, headers
+
+
+async def _resolve_stream(url: str, caption: str = "", enforce_filter: bool = True) -> tuple:
+    if _looks_like_bili_url(url):
+        return await _resolve_bilibili(url, caption, enforce_filter)
+    return await asyncio.to_thread(_probe_stream_info, url)
+
+
 def _probe_stream_info(url: str) -> tuple:
     import yt_dlp
     opts = {
@@ -5746,6 +5879,9 @@ def _probe_stream_info(url: str) -> tuple:
         "format": "bestaudio/best",
         "default_search": "auto",
     }
+    cookiefile = (os.getenv("YTDLP_COOKIEFILE") or "").strip()
+    if cookiefile and os.path.isfile(cookiefile):
+        opts["cookiefile"] = cookiefile
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=False)
     if (info or {}).get("_type") == "playlist":
@@ -5754,7 +5890,7 @@ def _probe_stream_info(url: str) -> tuple:
     title = ((info or {}).get("title") or url or "未命名")[:100]
     stream_url = (info or {}).get("url") or ""
     webpage = (info or {}).get("webpage_url") or url
-    return title, stream_url, webpage
+    return title, stream_url, webpage, {}
 
 
 async def _add_stream_track(guild: discord.Guild, user, url: str, caption: str = "") -> str:
@@ -5762,7 +5898,9 @@ async def _add_stream_track(guild: discord.Guild, user, url: str, caption: str =
     if len(state.get("tracks") or []) >= MUSIC_MAX_TRACKS:
         return "歌单满了，先下架几首再分享。"
     try:
-        title, _stream, webpage = await asyncio.to_thread(_probe_stream_info, url)
+        title, _stream, webpage, _headers = await _resolve_stream(url, caption)
+    except _MusicRejected as e:
+        return str(e)
     except Exception as e:
         return f"这条链接解析失败: {e}"
     display = _music_caption_title(caption) or title
@@ -5950,7 +6088,7 @@ def _music_blocked_note(urls: list) -> str:
     blocked = [url for url in urls if MUSIC_BLOCKED_RE.search(url)]
     if not blocked:
         return ""
-    return "网易云 / QQ / B站 / Spotify 页面链接不解析。YouTube、SoundCloud 或直接音频地址可以入库。"
+    return "网易云 / QQ 音乐 / 酷狗 / 酷我 / Spotify 页面链接不解析。YouTube、SoundCloud、B站 或直接音频地址可以入库。"
 
 
 async def _download_direct_audio(url: str):
@@ -6139,11 +6277,16 @@ async def _ensure_music_voice(guild: discord.Guild):
         return None, f"进音乐世家失败: {e}"
 
 
-def _ffmpeg_source(path_or_url: str, is_url: bool):
-    before = "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5" if is_url else None
+def _ffmpeg_source(path_or_url: str, is_url: bool, headers: dict = None):
+    parts = []
+    if is_url:
+        parts.append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
+    if headers:
+        raw = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
+        parts.append(f'-headers "{raw}"')
     return discord.FFmpegPCMAudio(
         path_or_url,
-        before_options=before,
+        before_options=" ".join(parts) or None,
         options="-vn",
     )
 
@@ -6233,9 +6376,12 @@ async def _start_voice_play(guild: discord.Guild, track: dict, requester) -> str
         return err
     source_path = ""
     is_url = False
+    stream_headers = {}
     if track.get("kind") == "stream" or track.get("url"):
         try:
-            _title, stream_url, _web = await asyncio.to_thread(_probe_stream_info, track.get("url"))
+            _title, stream_url, _web, stream_headers = await _resolve_stream(
+                track.get("url"), enforce_filter=False
+            )
         except Exception as e:
             return f"链接失效或解析失败: {e}"
         if not stream_url:
@@ -6248,7 +6394,7 @@ async def _start_voice_play(guild: discord.Guild, track: dict, requester) -> str
             return "这首的文件丢了，先下架再重新分享。"
         source_path = path
     try:
-        source = _ffmpeg_source(source_path, is_url)
+        source = _ffmpeg_source(source_path, is_url, stream_headers)
     except Exception as e:
         return f"音频源打不开: {e}"
     if vc.is_playing() or vc.is_paused():
