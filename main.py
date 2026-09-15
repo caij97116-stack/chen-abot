@@ -33,6 +33,7 @@ intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
 intents.guilds = True
+intents.invites = True
 
 bot = commands.Bot(command_prefix=None, intents=intents)
 
@@ -105,6 +106,11 @@ AD_KEYWORDS = (
     "闲鱼", "转卖", "代打", "优惠券",
 )
 SECURITY_FILE = "security_data.json"
+INVITE_FILE = "invite_data.json"
+INVITE_DEFAULT_HOURS = 168
+INVITE_MAX_HOURS = 168
+INVITE_MAX_USES_LIMIT = 100
+_invite_cache: dict = {}
 INVITE_RE = re.compile(
     r"(discord(?:app)?\.com/invite/|discord\.gg/|dsc\.gg/|discord\.me/|discord\.com/invite)",
     re.IGNORECASE,
@@ -134,6 +140,7 @@ SECRET_WORD_RE = re.compile(
 )
 MASK_REMINDER_SHORT = "API Key / Token / Cookie / 面板地址 / 服务器 IP 端口都要挡住，密钥进了公屏马上撤回。"
 security_data: dict = {}
+invite_data: dict = {}
 _raid_join_times: dict = defaultdict(deque)
 _slash_last: dict = {}
 _slash_rate_installed = False
@@ -869,6 +876,97 @@ def save_security():
             json.dump(security_data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"保存小岛防护设置失败: {e}")
+
+
+def load_invites():
+    global invite_data
+    try:
+        if os.path.exists(INVITE_FILE):
+            with open(INVITE_FILE, "r", encoding="utf-8") as f:
+                invite_data = json.load(f) or {}
+    except Exception:
+        invite_data = {}
+
+
+def save_invites():
+    try:
+        with open(INVITE_FILE, "w", encoding="utf-8") as f:
+            json.dump(invite_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存邀请溯源记录失败: {e}")
+
+
+def _invite_settings(guild_id) -> dict:
+    settings = invite_data.setdefault("_settings", {})
+    rec = settings.get(str(guild_id))
+    if not isinstance(rec, dict):
+        rec = {}
+        settings[str(guild_id)] = rec
+    rec.setdefault("creator_role", "")
+    return rec
+
+
+def _guild_invite_records(guild_id) -> dict:
+    rec = invite_data.get(str(guild_id))
+    if not isinstance(rec, dict):
+        rec = {}
+        invite_data[str(guild_id)] = rec
+    return rec
+
+
+def _can_create_invite(member, guild) -> bool:
+    if member.id == guild.owner_id:
+        return True
+    role_name = (_invite_settings(guild.id).get("creator_role") or "").strip()
+    if not role_name:
+        return False
+    return discord.utils.get(getattr(member, "roles", []), name=role_name) is not None
+
+
+async def _fetch_guild_invite_uses(guild: discord.Guild):
+    try:
+        invites = await guild.invites()
+    except Exception as e:
+        logger.warning(f"读取服务器邀请列表失败: {e}")
+        return None
+    return {inv.code: int(inv.uses or 0) for inv in invites}
+
+
+async def _seed_invite_cache(guild: discord.Guild):
+    uses = await _fetch_guild_invite_uses(guild)
+    if uses is None:
+        return
+    for code, count in uses.items():
+        _invite_cache[f"{guild.id}:{code}"] = count
+
+
+async def _record_invite_join(member: discord.Member):
+    guild = member.guild
+    uses = await _fetch_guild_invite_uses(guild)
+    if uses is None:
+        return None
+    used_code = None
+    for code, count in uses.items():
+        prev = _invite_cache.get(f"{guild.id}:{code}")
+        if prev is not None and count > prev:
+            used_code = code
+            break
+    for code, count in uses.items():
+        _invite_cache[f"{guild.id}:{code}"] = count
+    if not used_code:
+        return None
+    records = _guild_invite_records(guild.id)
+    inv_rec = records.get(used_code)
+    if not inv_rec:
+        return used_code
+    inv_rec.setdefault("joined", []).append({
+        "user_id": str(member.id),
+        "user_name": getattr(member, "display_name", None) or str(member),
+        "at": _beijing_now().isoformat(),
+    })
+    inv_rec["uses"] = max(int(inv_rec.get("uses") or 0), uses.get(used_code))
+    save_invites()
+    return used_code
 
 
 def _security_settings(guild_id) -> dict:
@@ -1773,8 +1871,11 @@ async def on_ready():
     load_download_logs()
     load_channel_published()
     load_security()
+    load_invites()
     _install_slash_rate_limit()
     _ensure_file_store()
+    for guild in bot.guilds:
+        await _seed_invite_cache(guild)
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -1824,6 +1925,266 @@ async def on_member_join(member: discord.Member):
         await _security_on_join(member)
     except Exception as e:
         logger.warning(f"新成员防护检查失败: {e}")
+    try:
+        await _record_invite_join(member)
+    except Exception as e:
+        logger.warning(f"邀请溯源检查失败: {e}")
+
+
+@bot.event
+async def on_invite_create(invite: discord.Invite):
+    if invite.guild:
+        _invite_cache[f"{invite.guild.id}:{invite.code}"] = int(invite.uses or 0)
+
+
+@bot.event
+async def on_invite_delete(invite: discord.Invite):
+    if invite.guild:
+        _invite_cache.pop(f"{invite.guild.id}:{invite.code}", None)
+
+
+# ═══════════════════════════════════════════
+#  邀请溯源 - 机器人生成专属邀请并追踪谁带进来
+# ═══════════════════════════════════════════
+
+def _invite_link(code: str) -> str:
+    return f"https://discord.gg/{code}"
+
+
+def _invite_records_of_user(guild_id, user_id) -> list:
+    user_id = str(user_id)
+    recs = []
+    for code, rec in _guild_invite_records(guild_id).items():
+        if str(rec.get("inviter_id")) == user_id:
+            recs.append((code, rec))
+    recs.sort(key=lambda item: len(item[1].get("joined") or []), reverse=True)
+    return recs
+
+
+@bot.tree.command(name="邀请链接", description="生成带溯源的服务器邀请链接，记录谁用它进来的")
+@app_commands.describe(
+    有效期小时="多少小时后失效，0 表示永久（最长 168 小时）",
+    最多次数="最多可用次数，0 表示不限（最多 100）",
+    备注="给这条邀请加个备注，方便自己区分",
+)
+async def invite_create(
+    interaction: discord.Interaction,
+    有效期小时: app_commands.Range[int, 0, INVITE_MAX_HOURS] = INVITE_DEFAULT_HOURS,
+    最多次数: app_commands.Range[int, 0, INVITE_MAX_USES_LIMIT] = 0,
+    备注: str = "",
+):
+    if not interaction.guild:
+        await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+        return
+    if not _can_create_invite(interaction.user, interaction.guild):
+        role_name = (_invite_settings(interaction.guild.id).get("creator_role") or "").strip()
+        need = f"「{role_name}」身份组" if role_name else "岛主"
+        await interaction.response.send_message(f"你还没有创建邀请的权限，需要 {need}。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True)
+    channel = interaction.channel
+    if not isinstance(channel, discord.TextChannel):
+        channel = discord.utils.get(interaction.guild.text_channels)
+    if channel is None:
+        await interaction.followup.send("这个服务器没有可创建邀请的文字频道。", ephemeral=True)
+        return
+    max_age = 0 if int(有效期小时) == 0 else int(有效期小时) * 3600
+    try:
+        invite = await channel.create_invite(
+            max_age=max_age,
+            max_uses=int(最多次数),
+            unique=True,
+            reason=f"邀请溯源：{interaction.user} ({interaction.user.id})",
+        )
+    except discord.Forbidden:
+        await interaction.followup.send("机器人缺少「管理服务器」权限，创建不了邀请。", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.followup.send(f"创建邀请失败: {e}", ephemeral=True)
+        return
+    note = " ".join((备注 or "").split())[:100]
+    records = _guild_invite_records(interaction.guild.id)
+    records[invite.code] = {
+        "code": invite.code,
+        "inviter_id": str(interaction.user.id),
+        "inviter_name": getattr(interaction.user, "display_name", None) or str(interaction.user),
+        "channel_id": str(channel.id),
+        "created_at": _beijing_now().isoformat(),
+        "max_uses": int(最多次数),
+        "max_age": max_age,
+        "note": note,
+        "uses": 0,
+        "joined": [],
+    }
+    _invite_cache[f"{interaction.guild.id}:{invite.code}"] = 0
+    save_invites()
+    hours_txt = "永久" if max_age == 0 else f"{有效期小时} 小时"
+    uses_txt = "不限" if int(最多次数) == 0 else f"{最多次数} 次"
+    await interaction.followup.send(
+        f"邀请已生成：{_invite_link(invite.code)}\n"
+        f"有效期：{hours_txt}　可用次数：{uses_txt}\n"
+        f"备注：{note or '（无）'}\n"
+        "有人用它进来就会记在你的名下，可用 `/我的邀请` 查看。",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="我的邀请", description="查看自己发出的邀请和带进来的成员")
+async def my_invites(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+        return
+    recs = _invite_records_of_user(interaction.guild.id, interaction.user.id)
+    if not recs:
+        await interaction.response.send_message("你还没发过邀请，可以用 `/邀请链接` 生成一条。", ephemeral=True)
+        return
+    total = sum(len(rec.get("joined") or []) for _, rec in recs)
+    lines = [f"你一共带进来 **{total}** 人。", ""]
+    for code, rec in recs[:10]:
+        joined = rec.get("joined") or []
+        lines.append(f"**{_invite_link(code)}**　{rec.get('note') or '（无备注）'}")
+        lines.append(f"　带来 {len(joined)} 人，当前计数 {rec.get('uses', 0)}")
+        for item in joined[-5:]:
+            lines.append(f"　　- {item.get('user_name', '?')}　{_format_beijing_minute(item.get('at'))}")
+        lines.append("")
+    embed = discord.Embed(
+        title="我的邀请",
+        description="\n".join(lines)[:4000],
+        color=discord.Color.blurple(),
+    )
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="邀请记录", description="查看邀请溯源记录（仅岛主）")
+@app_commands.describe(邀请码="只看某条邀请码带来的成员，可不填")
+async def invite_records(interaction: discord.Interaction, 邀请码: str = ""):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能看。", ephemeral=True)
+        return
+    guild_id = interaction.guild.id
+    records = _guild_invite_records(guild_id)
+    needle = (邀请码 or "").strip()
+    if needle:
+        needle = needle.rstrip("/").split("/")[-1]
+    if needle:
+        rec = records.get(needle)
+        if not rec:
+            await interaction.response.send_message("没有这条邀请码的记录。", ephemeral=True)
+            return
+        items = rec.get("joined") or []
+        lines = [
+            f"**邀请码:** {rec.get('code')}",
+            f"**邀请人:** {rec.get('inviter_name')} `{rec.get('inviter_id')}`",
+            f"**创建时间:** {_format_beijing_minute(rec.get('created_at'))}",
+            f"**备注:** {rec.get('note') or '（无）'}",
+            f"**计数:** {rec.get('uses', 0)}　**带来:** {len(items)} 人",
+            "",
+        ]
+        for item in items[-30:]:
+            lines.append(f"- {item.get('user_name', '?')} `{item.get('user_id')}`　{_format_beijing_minute(item.get('at'))}")
+        embed = discord.Embed(title="邀请记录", description="\n".join(lines)[:4000], color=discord.Color.teal())
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    if not records:
+        await interaction.response.send_message("还没有任何邀请记录。", ephemeral=True)
+        return
+    rows = []
+    for code, rec in records.items():
+        rows.append((code, rec, len(rec.get("joined") or [])))
+    rows.sort(key=lambda r: r[2], reverse=True)
+    lines = []
+    for code, rec, joined in rows[:20]:
+        lines.append(
+            f"**{rec.get('inviter_name')}**　{joined} 人　{_invite_link(code)}　"
+            f"{rec.get('note') or '（无备注）'}"
+        )
+    embed = discord.Embed(
+        title="邀请记录总览",
+        description="\n".join(lines)[:4000],
+        color=discord.Color.teal(),
+    )
+    embed.set_footer(text="输入 /邀请记录 邀请码 查看某条带来的人")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="邀请排行", description="按带进来的人数排行")
+async def invite_rank(interaction: discord.Interaction):
+    if not interaction.guild:
+        await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+        return
+    stats = defaultdict(int)
+    names = {}
+    for rec in _guild_invite_records(interaction.guild.id).values():
+        inviter = str(rec.get("inviter_id") or "")
+        if not inviter:
+            continue
+        stats[inviter] += len(rec.get("joined") or [])
+        names.setdefault(inviter, rec.get("inviter_name") or inviter)
+    if not stats:
+        await interaction.response.send_message("还没有邀请记录。", ephemeral=True)
+        return
+    ranked = sorted(stats.items(), key=lambda kv: kv[1], reverse=True)[:10]
+    medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, (uid, count) in enumerate(ranked):
+        prefix = medals[i] if i < len(medals) else f"{i + 1}."
+        lines.append(f"{prefix} {names.get(uid, uid)} — **{count}** 人")
+    embed = discord.Embed(title="邀请排行", description="\n".join(lines), color=discord.Color.gold())
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="邀请设置", description="设置谁能创建邀请（仅岛主）")
+@app_commands.describe(身份组="允许创建邀请的身份组名称，留空表示仅岛主")
+async def invite_settings_cmd(interaction: discord.Interaction, 身份组: str = ""):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能改。", ephemeral=True)
+        return
+    role_name = " ".join((身份组 or "").split())[:100]
+    if role_name and discord.utils.get(interaction.guild.roles, name=role_name) is None:
+        await interaction.response.send_message(f"找不到身份组「{role_name}」。", ephemeral=True)
+        return
+    settings = _invite_settings(interaction.guild.id)
+    settings["creator_role"] = role_name
+    save_invites()
+    await _audit_log(
+        interaction.guild,
+        "邀请设置变更",
+        f"**操作人:** {interaction.user.mention}\n**创建权限:** {role_name or '仅岛主'}",
+    )
+    await interaction.response.send_message(
+        f"已设置：{'「' + role_name + '」身份组' if role_name else '仅岛主'} 可以创建邀请。",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="关闭邀请", description="作废一条邀请（仅岛主）")
+@app_commands.describe(邀请码="要作废的邀请码或完整链接")
+async def invite_revoke(interaction: discord.Interaction, 邀请码: str):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    code = (邀请码 or "").strip().rstrip("/").split("/")[-1]
+    await interaction.response.defer(ephemeral=True)
+    revoked = False
+    try:
+        invite = await bot.fetch_invite(code)
+        await invite.delete(reason=f"岛主作废邀请：{interaction.user}")
+        revoked = True
+    except Exception as e:
+        logger.warning(f"作废邀请失败: {e}")
+    records = _guild_invite_records(interaction.guild.id)
+    records.pop(code, None)
+    _invite_cache.pop(f"{interaction.guild.id}:{code}", None)
+    save_invites()
+    await _audit_log(
+        interaction.guild,
+        "邀请作废",
+        f"**操作人:** {interaction.user.mention}\n**邀请码:** {code}\n**Discord 侧删除:** {'成功' if revoked else '失败或已过期'}",
+    )
+    await interaction.followup.send(
+        f"已作废邀请 `{code}`" + ("" if revoked else "（Discord 侧可能已过期或不存在，记录已移除）"),
+        ephemeral=True,
+    )
 
 
 async def setup_quiz_channels():
