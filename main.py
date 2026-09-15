@@ -107,6 +107,7 @@ AD_KEYWORDS = (
 )
 SECURITY_FILE = "security_data.json"
 INVITE_FILE = "invite_data.json"
+SUBSCRIBE_FILE = "subscribe_data.json"
 INVITE_DEFAULT_HOURS = 168
 INVITE_MAX_HOURS = 168
 INVITE_MAX_USES_LIMIT = 100
@@ -141,6 +142,7 @@ SECRET_WORD_RE = re.compile(
 MASK_REMINDER_SHORT = "API Key / Token / Cookie / 面板地址 / 服务器 IP 端口都要挡住，密钥进了公屏马上撤回。"
 security_data: dict = {}
 invite_data: dict = {}
+subscribe_data: dict = {}
 _raid_join_times: dict = defaultdict(deque)
 _slash_last: dict = {}
 _slash_rate_installed = False
@@ -894,6 +896,94 @@ def save_invites():
             json.dump(invite_data, f, ensure_ascii=False, indent=2)
     except Exception as e:
         logger.error(f"保存邀请溯源记录失败: {e}")
+
+
+def load_subscriptions():
+    global subscribe_data
+    try:
+        if os.path.exists(SUBSCRIBE_FILE):
+            with open(SUBSCRIBE_FILE, "r", encoding="utf-8") as f:
+                subscribe_data = json.load(f) or {}
+    except Exception:
+        subscribe_data = {}
+
+
+def save_subscriptions():
+    try:
+        with open(SUBSCRIBE_FILE, "w", encoding="utf-8") as f:
+            json.dump(subscribe_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存订阅记录失败: {e}")
+
+
+def _subscribe_map(guild_id) -> dict:
+    rec = subscribe_data.get(str(guild_id))
+    if not isinstance(rec, dict):
+        rec = {}
+        subscribe_data[str(guild_id)] = rec
+    return rec
+
+
+def _is_subscribed(guild_id, subscriber_id, uploader_id) -> bool:
+    subs = _subscribe_map(guild_id).get(str(uploader_id)) or []
+    return str(subscriber_id) in {str(x) for x in subs}
+
+
+def _toggle_subscription(guild_id, subscriber_id, uploader_id) -> bool:
+    rec = _subscribe_map(guild_id)
+    subs = [str(x) for x in (rec.get(str(uploader_id)) or [])]
+    key = str(subscriber_id)
+    if key in subs:
+        subs = [x for x in subs if x != key]
+        rec[str(uploader_id)] = subs
+        save_subscriptions()
+        return False
+    subs.append(key)
+    rec[str(uploader_id)] = subs
+    save_subscriptions()
+    return True
+
+
+def _subscribers_of(guild_id, uploader_id) -> list:
+    return [str(x) for x in (_subscribe_map(guild_id).get(str(uploader_id)) or [])]
+
+
+async def _notify_subscribers(guild: discord.Guild, record: dict, jump_url: str):
+    if not guild:
+        return
+    uploader_id = str(record.get("uploader_id") or "")
+    if not uploader_id:
+        return
+    subscribers = [
+        uid for uid in _subscribers_of(guild.id, uploader_id)
+        if uid != uploader_id
+    ]
+    if not subscribers:
+        return
+    uploader_name = record.get("uploader_name") or f"<@{uploader_id}>"
+    name = record.get("name", "新资源")
+    channel_id = record.get("source_channel_id")
+    where = f"<#{channel_id}>" if channel_id else "频道"
+    for uid in subscribers:
+        member = guild.get_member(int(uid)) if uid.isdigit() else None
+        if member is None:
+            continue
+        try:
+            embed = discord.Embed(
+                title="订阅更新",
+                description=(
+                    f"你订阅的 **{uploader_name}** 刚发布了新资源：\n"
+                    f"**{name}**\n\n"
+                    f"位置：{where}\n"
+                    f"[点这里直达卡片]({jump_url})"
+                ),
+                color=discord.Color.purple(),
+                timestamp=_beijing_now(),
+            )
+            embed.set_footer(text="不想收了，就在卡片上点「订阅 TA」取消")
+            await member.send(embed=embed)
+        except Exception:
+            pass
 
 
 def _invite_settings(guild_id) -> dict:
@@ -1872,6 +1962,7 @@ async def on_ready():
     load_channel_published()
     load_security()
     load_invites()
+    load_subscriptions()
     _install_slash_rate_limit()
     _ensure_file_store()
     for guild in bot.guilds:
@@ -2974,6 +3065,7 @@ async def _publish_file(interaction: discord.Interaction, file_id: str, record: 
         save_records()
         save_channel_published()
         await _upsert_storage_card(interaction.guild, file_id, record)
+        await _notify_subscribers(interaction.guild, record, pub_msg.jump_url)
 
         await interaction.followup.send(
             f"文件 **{record['name']}** 已发布到频道！",
@@ -3276,6 +3368,36 @@ class PublishedFileView(discord.ui.View):
         self.download_btn = discord.ui.Button(**button_kwargs)
         self.download_btn.callback = self.on_download
         self.add_item(self.download_btn)
+        sub_kwargs = {
+            "label": "订阅 TA",
+            "style": discord.ButtonStyle.secondary,
+            "row": 1,
+        }
+        if persistent:
+            sub_kwargs["custom_id"] = "pub_file_subscribe"
+        self.subscribe_btn = discord.ui.Button(**sub_kwargs)
+        self.subscribe_btn.callback = self.on_subscribe
+        self.add_item(self.subscribe_btn)
+
+    async def on_subscribe(self, interaction: discord.Interaction):
+        file_id, record = _resolve_published_record(interaction, self._file_id)
+        if not record:
+            await interaction.response.send_message("发布记录已过期。", ephemeral=True)
+            return
+        uploader_id = str(record.get("uploader_id") or "")
+        if not uploader_id:
+            await interaction.response.send_message("找不到上传者。", ephemeral=True)
+            return
+        if str(interaction.user.id) == uploader_id:
+            await interaction.response.send_message("这是你自己发的，不用订阅。", ephemeral=True)
+            return
+        now_subscribed = _toggle_subscription(interaction.guild.id, interaction.user.id, uploader_id)
+        name = record.get("uploader_name") or "TA"
+        if now_subscribed:
+            text = f"已订阅 **{name}**，TA 以后发新资源会私信你。想取消再点一次这个按钮。"
+        else:
+            text = f"已取消订阅 **{name}**。"
+        await interaction.response.send_message(text, ephemeral=True)
 
     async def on_select(self, interaction: discord.Interaction):
         values = []
