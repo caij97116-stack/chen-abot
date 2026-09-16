@@ -91,9 +91,91 @@ async def check_live():
     return fail, url
 
 
+class FakeResp:
+    def __init__(self, status=200, ctype="application/json", body="{}"):
+        self.status = status
+        self.headers = {"Content-Type": ctype}
+        self._body = body
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def text(self):
+        return self._body
+
+
+class FakeSession:
+    """按脚本依次返回响应，用来模拟 B站 风控"""
+
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.calls = []
+
+    def get(self, url, params=None, headers=None):
+        self.calls.append({"url": url, "headers": dict(headers or {})})
+        return self._responses.pop(0) if self._responses else FakeResp()
+
+
+def check_risk_control_retry():
+    async def run():
+        fail = 0
+
+        # 风控页返回 HTML，重试第二次拿到正常 JSON
+        session = FakeSession([
+            FakeResp(412, "text/html", "<html>412</html>"),
+            FakeResp(200, "application/json", '{"code":0,"data":{"title":"ok"}}'),
+        ])
+        payload = await m._bili_get_json(session, "/x/web-interface/view", {"bvid": "BV1"})
+        ok = payload.get("data", {}).get("title") == "ok" and len(session.calls) == 2
+        print(f"[{'OK ' if ok else 'FAIL'}] 风控 412 后重试成功，调用次数={len(session.calls)}")
+        fail += 0 if ok else 1
+
+        # 两次都被风控 → 抛 _BiliRiskControl
+        session = FakeSession([FakeResp(412, "text/html", "<html>412</html>")] * m.BILI_FETCH_RETRIES)
+        try:
+            await m._bili_get_json(session, "/x/web-interface/view", {"bvid": "BV1"})
+            print("[FAIL] 持续风控时没有报错")
+            fail += 1
+        except m._BiliRiskControl as e:
+            print(f"[OK ] 持续风控抛出 _BiliRiskControl: {e}")
+
+        # 返回非 JSON 文本（yt-dlp 当年炸的那个场景）也不该抛出解析异常
+        session = FakeSession([FakeResp(200, "text/plain", "not json")] * m.BILI_FETCH_RETRIES)
+        try:
+            await m._bili_get_json(session, "/x/web-interface/view", {"bvid": "BV1"})
+            print("[FAIL] 非 JSON 内容没有报错")
+            fail += 1
+        except m._BiliRiskControl:
+            print("[OK ] 非 JSON 内容被识别为风控，未抛 JSONDecodeError")
+
+        return fail
+
+    return asyncio.run(run())
+
+
+def check_cookie_header():
+    fail = 0
+    m.BILI_COOKIE = "SESSDATA=abc; buvid3=def"
+    headers = m._bili_headers()
+    ok = headers.get("Cookie") == "SESSDATA=abc; buvid3=def" and headers.get("Referer")
+    print(f"[{'OK ' if ok else 'FAIL'}] 配了 Cookie 时请求头带上 Cookie: {bool(headers.get('Cookie'))}")
+    fail += 0 if ok else 1
+    m.BILI_COOKIE = ""
+    headers = m._bili_headers()
+    ok = "Cookie" not in headers
+    print(f"[{'OK ' if ok else 'FAIL'}] 未配 Cookie 时不带 Cookie 头")
+    fail += 0 if ok else 1
+    return fail
+
+
 def main():
     fail = check_regex()
     fail += check_filter()
+    fail += check_cookie_header()
+    fail += check_risk_control_retry()
     fail += asyncio.run(check_live())[0]
     print(f"\n=== 失败项: {fail} ===")
     sys.exit(1 if fail else 0)

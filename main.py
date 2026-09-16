@@ -78,6 +78,11 @@ BILI_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+# 机房 IP 直连 B站 容易被风控（412/HTML 页）。填上登录后的 Cookie 能大幅提高成功率。
+# 在面板环境变量里配置 BILI_COOKIE，格式形如：SESSDATA=xxx; buvid3=yyy
+BILI_COOKIE = (os.getenv("BILI_COOKIE") or "").strip()
+# B站风控时返回 412 或 HTML，换一次请求头重试可能就过了
+BILI_FETCH_RETRIES = 2
 # 音乐区主/子分区 tid：原创音乐、翻唱、VOCALOID、电音、演奏、MV、三次元音乐、音乐综合
 BILI_MUSIC_TIDS = {3, 28, 29, 30, 31, 59, 130, 193, 194}
 # 分区不在音乐区时，再用标题里的音乐关键词兜底
@@ -6073,7 +6078,56 @@ def _looks_like_bili_url(url: str) -> bool:
 
 
 def _bili_headers() -> dict:
-    return {"User-Agent": BILI_UA, "Referer": BILI_REFERER}
+    headers = {
+        "User-Agent": BILI_UA,
+        "Referer": BILI_REFERER,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "zh-CN,zh;q=0.9",
+        "Origin": "https://www.bilibili.com",
+    }
+    if BILI_COOKIE:
+        headers["Cookie"] = BILI_COOKIE
+    return headers
+
+
+class _BiliRiskControl(Exception):
+    """B站 风控拦截（412 或返回 HTML 页），通常是机房 IP 被判定为异常流量"""
+
+
+async def _bili_get_json(session, path: str, params: dict) -> dict:
+    """请求 B站 接口并解析 JSON，遇风控自动换头重试；失败抛 _BiliRiskControl"""
+    last_reason = "未知"
+    for attempt in range(BILI_FETCH_RETRIES):
+        try:
+            headers = _bili_headers()
+            if attempt:
+                # 重试时换一个 UA，规避按 UA 命中的风控
+                headers["User-Agent"] = BILI_UA.replace("Chrome/120.0.0.0", "Chrome/122.0.0.0")
+            async with session.get(f"{BILI_API}{path}", params=params, headers=headers) as resp:
+                status = resp.status
+                ctype = (resp.headers.get("Content-Type") or "").lower()
+                body = await resp.text()
+            if status in (412, 403) or "html" in ctype:
+                last_reason = f"B站风控（HTTP {status}）"
+                logger.warning(f"B站接口被风控: {path} status={status} ctype={ctype} 已配Cookie={bool(BILI_COOKIE)}")
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            try:
+                payload = json.loads(body)
+            except ValueError:
+                last_reason = "B站返回了无法解析的内容"
+                logger.warning(f"B站接口返回非 JSON: {path} status={status} 片段={body[:120]!r}")
+                await asyncio.sleep(1.0)
+                continue
+            if payload.get("code") == -412:
+                last_reason = "B站风控（code -412）"
+                await asyncio.sleep(1.5 * (attempt + 1))
+                continue
+            return payload
+        except aiohttp.ClientError as e:
+            last_reason = f"网络异常 {e.__class__.__name__}"
+            await asyncio.sleep(1.0)
+    raise _BiliRiskControl(last_reason)
 
 
 def _bili_bvid(url: str) -> str:
@@ -6124,40 +6178,44 @@ async def _resolve_bilibili(url: str, caption: str = "", enforce_filter: bool = 
     headers = _bili_headers()
     timeout = aiohttp.ClientTimeout(total=25)
     view_params = {"bvid": bvid} if bvid else {"aid": aid}
-    async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-        async with session.get(f"{BILI_API}/x/web-interface/view", params=view_params) as resp:
-            payload = await resp.json()
-        data = payload.get("data") or {}
-        if not data:
-            raise ValueError("B站 这条视频的信息没拿到，可能被风控了，稍后再试。")
-        title = (data.get("title") or "未命名")[:100]
-        tid = int(data.get("tid") or 0)
-        cid = int(data.get("cid") or 0)
-        if not cid:
-            pages = data.get("pages") or []
-            if pages:
-                cid = int(pages[0].get("cid") or 0)
-        if not cid:
-            raise ValueError("这条 B站 视频没有可播的音轨。")
-        key = bvid or f"av{aid}"
-        if enforce_filter and not _bili_looks_like_music(tid, title, caption):
-            raise _MusicRejected(
-                f"《{title}》看着不像音乐，没放进歌单。"
-                "贝多芬只收 MV、歌曲、纯音乐这类；游戏解说、直播实况请等观影室。"
-                "如果判错了，消息里带上「强制入库」再发一次。"
-            )
-        play_params = {
-            "bvid": bvid,
-            "cid": cid,
-            "fnval": 16,
-            "fnver": 0,
-            "fourk": 1,
-        }
-        if not bvid:
-            play_params.pop("bvid")
-            play_params["avid"] = aid
-        async with session.get(f"{BILI_API}/x/player/playurl", params=play_params) as resp:
-            play = await resp.json()
+    try:
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            payload = await _bili_get_json(session, "/x/web-interface/view", view_params)
+            data = payload.get("data") or {}
+            if not data:
+                raise ValueError("B站 这条视频的信息没拿到，可能被风控了，稍后再试。")
+            title = (data.get("title") or "未命名")[:100]
+            tid = int(data.get("tid") or 0)
+            cid = int(data.get("cid") or 0)
+            if not cid:
+                pages = data.get("pages") or []
+                if pages:
+                    cid = int(pages[0].get("cid") or 0)
+            if not cid:
+                raise ValueError("这条 B站 视频没有可播的音轨。")
+            key = bvid or f"av{aid}"
+            if enforce_filter and not _bili_looks_like_music(tid, title, caption):
+                raise _MusicRejected(
+                    f"《{title}》看着不像音乐，没放进歌单。"
+                    "贝多芬只收 MV、歌曲、纯音乐这类；游戏解说、直播实况请等观影室。"
+                    "如果判错了，消息里带上「强制入库」再发一次。"
+                )
+            play_params = {
+                "bvid": bvid,
+                "cid": cid,
+                "fnval": 16,
+                "fnver": 0,
+                "fourk": 1,
+            }
+            if not bvid:
+                play_params.pop("bvid")
+                play_params["avid"] = aid
+            play = await _bili_get_json(session, "/x/player/playurl", play_params)
+    except _BiliRiskControl as e:
+        raise ValueError(
+            f"B站 把请求拦下来了（{e}）。"
+            "机房 IP 很容易被风控，让岛主在面板环境变量里配好 BILI_COOKIE 就能稳定。"
+        ) from e
     play_data = play.get("data") or {}
     stream_url = _bili_pick_audio(play_data.get("dash") or {})
     if not stream_url:
@@ -6209,7 +6267,10 @@ async def _add_stream_track(guild: discord.Guild, user, url: str, caption: str =
     except _MusicRejected as e:
         return str(e)
     except Exception as e:
-        return f"这条链接解析失败: {e}"
+        # 用户侧只给一句可读原因，完整堆栈写进日志，避免把内部接口地址暴露到频道
+        reason = " ".join(str(e).split())[:160]
+        logger.warning(f"解析音乐链接失败 {url}: {e.__class__.__name__}: {e}", exc_info=True)
+        return f"这条链接解析失败：{reason}"
     display = _music_caption_title(caption) or title
     err = _commit_music_track(state, {
         "id": secrets.token_hex(6),
@@ -9049,6 +9110,10 @@ if __name__ == "__main__":
         bot.music_idle_task = asyncio.create_task(_music_idle_watchdog())
 
         logger.info("🚀 正在启动 Chen-Abot...")
+        logger.info(
+            f"构建标记: BILI_COOKIE={'已配置' if BILI_COOKIE else '未配置'}　"
+            f"缓存文件: {INVITE_CACHE_FILE}"
+        )
         try:
             await bot.start(token)
         except discord.LoginFailure as e:
