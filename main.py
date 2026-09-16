@@ -132,6 +132,7 @@ SUBSCRIBE_FILE = "subscribe_data.json"
 INVITE_DEFAULT_HOURS = 168
 INVITE_MAX_HOURS = 168
 INVITE_MAX_USES_LIMIT = 100
+INVITE_CARD_CHANNEL_KEYWORD = "邀请函发送处"
 _invite_cache: dict = {}
 INVITE_RE = re.compile(
     r"(discord(?:app)?\.com/invite/|discord\.gg/|dsc\.gg/|discord\.me/|discord\.com/invite)",
@@ -1077,6 +1078,7 @@ async def _record_invite_join(member: discord.Member):
     })
     inv_rec["uses"] = max(int(inv_rec.get("uses") or 0), uses.get(used_code))
     save_invites()
+    await _refresh_invite_card(guild)
     return used_code
 
 
@@ -2014,6 +2016,9 @@ async def on_ready():
     # 在指路频道中发布/更新频道导航
     await setup_guide_channels()
 
+    # 在邀请函发送处发布/更新邀请卡片
+    await setup_invite_card_channels()
+
     await setup_alert_channel()
 
 
@@ -2073,18 +2078,236 @@ def _invite_records_of_user(guild_id, user_id) -> list:
     return recs
 
 
-@bot.tree.command(name="邀请链接", description="生成带溯源的服务器邀请链接，记录谁用它进来的")
-@app_commands.describe(
-    有效期小时="多少小时后失效，0 表示永久（最长 168 小时）",
-    最多次数="最多可用次数，0 表示不限（最多 100）",
-    备注="给这条邀请加个备注，方便自己区分",
-)
-async def invite_create(
-    interaction: discord.Interaction,
-    有效期小时: app_commands.Range[int, 0, INVITE_MAX_HOURS] = INVITE_DEFAULT_HOURS,
-    最多次数: app_commands.Range[int, 0, INVITE_MAX_USES_LIMIT] = 0,
-    备注: str = "",
-):
+def _invite_card_channel_of(guild: discord.Guild):
+    for channel in getattr(guild, "text_channels", []) or []:
+        if INVITE_CARD_CHANNEL_KEYWORD in (channel.name or ""):
+            return channel
+    return None
+
+
+def _build_invite_card(guild: discord.Guild) -> discord.Embed:
+    records = _guild_invite_records(guild.id)
+    total_tracks = len(records)
+    total_joined = sum(len(rec.get("joined") or []) for rec in records.values())
+    settings = _invite_settings(guild.id)
+    role_name = (settings.get("creator_role") or "").strip()
+    who = f"「{role_name}」身份组和岛主" if role_name else "岛主"
+    embed = discord.Embed(
+        title="邀请函发送处",
+        description=(
+            "在这里生成属于你的服务器邀请函，也在这里看谁是你带进来的。\n\n"
+            "**怎么用**\n"
+            "▸ 点「生成邀请函」，填好有效期、可用次数和备注\n"
+            "▸ 把链接发给朋友，对方用它进岛就会记在你的名下\n"
+            "▸ 点「我的邀请函」随时回看自己的战绩\n\n"
+            "**当前数据**\n"
+            f"▸ 已发出邀请：**{total_tracks}** 条\n"
+            f"▸ 累计带来成员：**{total_joined}** 人\n"
+            f"▸ 生成权限：{who}"
+        ),
+        color=discord.Color.from_rgb(88, 101, 242),
+    )
+    embed.set_footer(text=f"有效期最长 {INVITE_MAX_HOURS // 24} 天，可用次数最多 {INVITE_MAX_USES_LIMIT} 次")
+    return embed
+
+
+async def _refresh_invite_card(guild: discord.Guild):
+    """邀请数据变化后，就地刷新卡片上的统计数字"""
+    if not guild:
+        return
+    channel = _invite_card_channel_of(guild)
+    if not channel:
+        return
+    msg_id = (_invite_settings(guild.id).get("card_message_id") or "").strip()
+    if not msg_id:
+        return
+    try:
+        msg = await channel.fetch_message(int(msg_id))
+        await msg.edit(embed=_build_invite_card(guild), view=PersistentInviteView())
+    except Exception:
+        pass
+
+
+class InviteCreateModal(discord.ui.Modal, title="生成邀请函"):
+    hours = discord.ui.TextInput(
+        label="有效期（小时，0 为永久）",
+        default=str(INVITE_DEFAULT_HOURS),
+        required=False,
+        max_length=3,
+    )
+    max_uses = discord.ui.TextInput(
+        label="可用次数（0 为不限）",
+        default="0",
+        required=False,
+        max_length=3,
+    )
+    note = discord.ui.TextInput(
+        label="备注（方便自己区分）",
+        required=False,
+        max_length=100,
+        placeholder="例如：给贴吧来的朋友",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            hours = int(str(self.hours.value or "").strip() or INVITE_DEFAULT_HOURS)
+            max_uses = int(str(self.max_uses.value or "").strip() or 0)
+        except ValueError:
+            await interaction.response.send_message("有效期和可用次数都要填数字。", ephemeral=True)
+            return
+        if hours < 0 or hours > INVITE_MAX_HOURS:
+            await interaction.response.send_message(f"有效期填 0 到 {INVITE_MAX_HOURS} 小时。", ephemeral=True)
+            return
+        if max_uses < 0 or max_uses > INVITE_MAX_USES_LIMIT:
+            await interaction.response.send_message(f"可用次数填 0 到 {INVITE_MAX_USES_LIMIT} 次。", ephemeral=True)
+            return
+        await _do_invite_create(interaction, hours, max_uses, str(self.note.value or ""))
+
+
+class InviteSettingsModal(discord.ui.Modal, title="邀请设置"):
+    role = discord.ui.TextInput(
+        label="允许生成邀请的身份组名称",
+        required=False,
+        max_length=100,
+        placeholder="留空表示仅岛主",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _do_invite_settings(interaction, str(self.role.value or ""))
+
+
+class InviteRecordsModal(discord.ui.Modal, title="邀请记录"):
+    code = discord.ui.TextInput(
+        label="邀请码或链接（留空看总览）",
+        required=False,
+        max_length=100,
+        placeholder="只看某条邀请带来的人",
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _do_invite_records(interaction, str(self.code.value or ""))
+
+
+class InviteRevokeModal(discord.ui.Modal, title="作废邀请"):
+    code = discord.ui.TextInput(
+        label="要作废的邀请码或完整链接",
+        required=True,
+        max_length=100,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await _do_invite_revoke(interaction, str(self.code.value or ""))
+
+
+class PersistentInviteView(discord.ui.View):
+    """邀请函发送处持久化按钮视图（无超时，重启后恢复）"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="生成邀请函",
+        style=discord.ButtonStyle.primary,
+        custom_id="invite_card_create",
+        row=0,
+    )
+    async def create_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+            return
+        if not _can_create_invite(interaction.user, interaction.guild):
+            role_name = (_invite_settings(interaction.guild.id).get("creator_role") or "").strip()
+            need = f"「{role_name}」身份组" if role_name else "岛主"
+            await interaction.response.send_message(f"你还没有生成邀请的权限，需要 {need}。", ephemeral=True)
+            return
+        await interaction.response.send_modal(InviteCreateModal())
+
+    @discord.ui.button(
+        label="我的邀请函",
+        style=discord.ButtonStyle.secondary,
+        custom_id="invite_card_mine",
+        row=0,
+    )
+    async def mine_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_my_invites(interaction)
+
+    @discord.ui.button(
+        label="邀请排行",
+        style=discord.ButtonStyle.secondary,
+        custom_id="invite_card_rank",
+        row=1,
+    )
+    async def rank_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_invite_rank(interaction)
+
+    @discord.ui.button(
+        label="邀请记录",
+        style=discord.ButtonStyle.secondary,
+        custom_id="invite_card_records",
+        row=1,
+    )
+    async def records_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_island_owner(interaction):
+            await interaction.response.send_message("这条只有岛主能看。", ephemeral=True)
+            return
+        await interaction.response.send_modal(InviteRecordsModal())
+
+    @discord.ui.button(
+        label="邀请设置",
+        style=discord.ButtonStyle.secondary,
+        custom_id="invite_card_settings",
+        row=2,
+    )
+    async def settings_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_island_owner(interaction):
+            await interaction.response.send_message("这条只有岛主能改。", ephemeral=True)
+            return
+        await interaction.response.send_modal(InviteSettingsModal())
+
+    @discord.ui.button(
+        label="作废邀请",
+        style=discord.ButtonStyle.danger,
+        custom_id="invite_card_revoke",
+        row=2,
+    )
+    async def revoke_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not _is_island_owner(interaction):
+            await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+            return
+        await interaction.response.send_modal(InviteRevokeModal())
+
+
+async def setup_invite_card_channels():
+    """在名称含「邀请函发送处」的频道里发布/更新邀请卡片"""
+    for guild in bot.guilds:
+        channel = _invite_card_channel_of(guild)
+        if not channel:
+            continue
+        settings = _invite_settings(guild.id)
+        embed = _build_invite_card(guild)
+        view = PersistentInviteView()
+        msg_id = settings.get("card_message_id")
+        if msg_id:
+            try:
+                msg = await channel.fetch_message(int(msg_id))
+                await msg.edit(embed=embed, view=view)
+                continue
+            except Exception:
+                pass
+        try:
+            msg = await channel.send(embed=embed, view=view)
+        except discord.Forbidden:
+            logger.warning(f"无权限在 #{channel.name} 发布邀请卡片")
+            continue
+        except Exception as e:
+            logger.error(f"邀请频道 #{channel.name} 设置失败: {e}")
+            continue
+        settings["card_message_id"] = str(msg.id)
+        save_invites()
+        logger.info(f"发布邀请卡片: #{channel.name}")
+
+
+async def _do_invite_create(interaction: discord.Interaction, 有效期小时: int, 最多次数: int, 备注: str):
     if not interaction.guild:
         await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
         return
@@ -2093,8 +2316,8 @@ async def invite_create(
         need = f"「{role_name}」身份组" if role_name else "岛主"
         await interaction.response.send_message(f"你还没有创建邀请的权限，需要 {need}。", ephemeral=True)
         return
-    await interaction.response.defer(ephemeral=True)
-    channel = interaction.channel
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    channel = _invite_card_channel_of(interaction.guild) or interaction.channel
     if not isinstance(channel, discord.TextChannel):
         channel = discord.utils.get(interaction.guild.text_channels)
     if channel is None:
@@ -2130,25 +2353,25 @@ async def invite_create(
     }
     _invite_cache[f"{interaction.guild.id}:{invite.code}"] = 0
     save_invites()
+    await _refresh_invite_card(interaction.guild)
     hours_txt = "永久" if max_age == 0 else f"{有效期小时} 小时"
     uses_txt = "不限" if int(最多次数) == 0 else f"{最多次数} 次"
     await interaction.followup.send(
-        f"邀请已生成：{_invite_link(invite.code)}\n"
+        f"邀请函已生成：{_invite_link(invite.code)}\n"
         f"有效期：{hours_txt}　可用次数：{uses_txt}\n"
         f"备注：{note or '（无）'}\n"
-        "有人用它进来就会记在你的名下，可用 `/我的邀请` 查看。",
+        "有人用它进来就会记在你的名下，点「我的邀请函」随时查看。",
         ephemeral=True,
     )
 
 
-@bot.tree.command(name="我的邀请", description="查看自己发出的邀请和带进来的成员")
-async def my_invites(interaction: discord.Interaction):
+async def _do_my_invites(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
         return
     recs = _invite_records_of_user(interaction.guild.id, interaction.user.id)
     if not recs:
-        await interaction.response.send_message("你还没发过邀请，可以用 `/邀请链接` 生成一条。", ephemeral=True)
+        await interaction.response.send_message("你还没发过邀请，点「生成邀请函」生成一条。", ephemeral=True)
         return
     total = sum(len(rec.get("joined") or []) for _, rec in recs)
     lines = [f"你一共带进来 **{total}** 人。", ""]
@@ -2160,16 +2383,14 @@ async def my_invites(interaction: discord.Interaction):
             lines.append(f"　　- {item.get('user_name', '?')}　{_format_beijing_minute(item.get('at'))}")
         lines.append("")
     embed = discord.Embed(
-        title="我的邀请",
+        title="我的邀请函",
         description="\n".join(lines)[:4000],
-        color=discord.Color.blurple(),
+        color=discord.Color.from_rgb(88, 101, 242),
     )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="邀请记录", description="查看邀请溯源记录（仅岛主）")
-@app_commands.describe(邀请码="只看某条邀请码带来的成员，可不填")
-async def invite_records(interaction: discord.Interaction, 邀请码: str = ""):
+async def _do_invite_records(interaction: discord.Interaction, 邀请码: str = ""):
     if not _is_island_owner(interaction):
         await interaction.response.send_message("这条只有岛主能看。", ephemeral=True)
         return
@@ -2194,7 +2415,7 @@ async def invite_records(interaction: discord.Interaction, 邀请码: str = ""):
         ]
         for item in items[-30:]:
             lines.append(f"- {item.get('user_name', '?')} `{item.get('user_id')}`　{_format_beijing_minute(item.get('at'))}")
-        embed = discord.Embed(title="邀请记录", description="\n".join(lines)[:4000], color=discord.Color.teal())
+        embed = discord.Embed(title="邀请记录", description="\n".join(lines)[:4000], color=discord.Color.from_rgb(88, 101, 242))
         await interaction.response.send_message(embed=embed, ephemeral=True)
         return
     if not records:
@@ -2213,14 +2434,13 @@ async def invite_records(interaction: discord.Interaction, 邀请码: str = ""):
     embed = discord.Embed(
         title="邀请记录总览",
         description="\n".join(lines)[:4000],
-        color=discord.Color.teal(),
+        color=discord.Color.from_rgb(88, 101, 242),
     )
-    embed.set_footer(text="输入 /邀请记录 邀请码 查看某条带来的人")
+    embed.set_footer(text="想只看某条带来的人，就点「邀请记录」并填上邀请码")
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="邀请排行", description="按带进来的人数排行")
-async def invite_rank(interaction: discord.Interaction):
+async def _do_invite_rank(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
         return
@@ -2241,13 +2461,15 @@ async def invite_rank(interaction: discord.Interaction):
     for i, (uid, count) in enumerate(ranked):
         prefix = medals[i] if i < len(medals) else f"{i + 1}."
         lines.append(f"{prefix} {names.get(uid, uid)} — **{count}** 人")
-    embed = discord.Embed(title="邀请排行", description="\n".join(lines), color=discord.Color.gold())
+    embed = discord.Embed(
+        title="邀请排行",
+        description="\n".join(lines),
+        color=discord.Color.from_rgb(255, 199, 44),
+    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@bot.tree.command(name="邀请设置", description="设置谁能创建邀请（仅岛主）")
-@app_commands.describe(身份组="允许创建邀请的身份组名称，留空表示仅岛主")
-async def invite_settings_cmd(interaction: discord.Interaction, 身份组: str = ""):
+async def _do_invite_settings(interaction: discord.Interaction, 身份组: str = ""):
     if not _is_island_owner(interaction):
         await interaction.response.send_message("这条只有岛主能改。", ephemeral=True)
         return
@@ -2258,6 +2480,7 @@ async def invite_settings_cmd(interaction: discord.Interaction, 身份组: str =
     settings = _invite_settings(interaction.guild.id)
     settings["creator_role"] = role_name
     save_invites()
+    await _refresh_invite_card(interaction.guild)
     await _audit_log(
         interaction.guild,
         "邀请设置变更",
@@ -2269,14 +2492,15 @@ async def invite_settings_cmd(interaction: discord.Interaction, 身份组: str =
     )
 
 
-@bot.tree.command(name="关闭邀请", description="作废一条邀请（仅岛主）")
-@app_commands.describe(邀请码="要作废的邀请码或完整链接")
-async def invite_revoke(interaction: discord.Interaction, 邀请码: str):
+async def _do_invite_revoke(interaction: discord.Interaction, 邀请码: str):
     if not _is_island_owner(interaction):
         await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
         return
     code = (邀请码 or "").strip().rstrip("/").split("/")[-1]
-    await interaction.response.defer(ephemeral=True)
+    if not code:
+        await interaction.response.send_message("得填一个邀请码或完整链接。", ephemeral=True)
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
     revoked = False
     try:
         invite = await bot.fetch_invite(code)
@@ -2288,6 +2512,7 @@ async def invite_revoke(interaction: discord.Interaction, 邀请码: str):
     records.pop(code, None)
     _invite_cache.pop(f"{interaction.guild.id}:{code}", None)
     save_invites()
+    await _refresh_invite_card(interaction.guild)
     await _audit_log(
         interaction.guild,
         "邀请作废",
@@ -2297,6 +2522,7 @@ async def invite_revoke(interaction: discord.Interaction, 邀请码: str):
         f"已作废邀请 `{code}`" + ("" if revoked else "（Discord 侧可能已过期或不存在，记录已移除）"),
         ephemeral=True,
     )
+
 
 
 async def setup_quiz_channels():
@@ -8735,6 +8961,7 @@ if __name__ == "__main__":
         bot.add_view(PersistentMusicView())
         bot.add_view(PersistentStoryEntryView())
         bot.add_view(PersistentStoryPostView())
+        bot.add_view(PersistentInviteView())
 
         # 启动心跳任务
         bot.heartbeat_task = asyncio.create_task(heartbeat())
