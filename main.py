@@ -128,11 +128,13 @@ AD_KEYWORDS = (
 )
 SECURITY_FILE = "security_data.json"
 INVITE_FILE = "invite_data.json"
+INVITE_CACHE_FILE = "invite_cache.json"
 SUBSCRIBE_FILE = "subscribe_data.json"
 INVITE_DEFAULT_HOURS = 168
 INVITE_MAX_HOURS = 168
 INVITE_MAX_USES_LIMIT = 100
 INVITE_CARD_CHANNEL_KEYWORD = "邀请函发送处"
+# 邀请计数缓存：{guild_id:code -> 上次已知 uses}，落盘保存，重启后仍能比出离线期间的加入
 _invite_cache: dict = {}
 INVITE_RE = re.compile(
     r"(discord(?:app)?\.com/invite/|discord\.gg/|dsc\.gg/|discord\.me/|discord\.com/invite)",
@@ -920,6 +922,26 @@ def save_invites():
         logger.error(f"保存邀请溯源记录失败: {e}")
 
 
+def load_invite_cache():
+    global _invite_cache
+    try:
+        if os.path.exists(INVITE_CACHE_FILE):
+            with open(INVITE_CACHE_FILE, "r", encoding="utf-8") as f:
+                _invite_cache = json.load(f) or {}
+        else:
+            _invite_cache = {}
+    except Exception:
+        _invite_cache = {}
+
+
+def save_invite_cache():
+    try:
+        with open(INVITE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(_invite_cache, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存邀请计数缓存失败: {e}")
+
+
 def load_subscriptions():
     global subscribe_data
     try:
@@ -1038,38 +1060,102 @@ def _can_create_invite(member, guild) -> bool:
 async def _fetch_guild_invite_uses(guild: discord.Guild):
     try:
         invites = await guild.invites()
+    except discord.Forbidden:
+        logger.warning(f"[{guild.name}] 缺少「管理服务器」权限，邀请溯源不可用")
+        return None
     except Exception as e:
         logger.warning(f"读取服务器邀请列表失败: {e}")
         return None
     return {inv.code: int(inv.uses or 0) for inv in invites}
 
 
+def _invite_cache_key(guild_id, code) -> str:
+    return f"{guild_id}:{code}"
+
+
 async def _seed_invite_cache(guild: discord.Guild):
+    """启动/重连时对账：把离线期间漏掉的加入记到 offline_missed，避免计数被吞。
+
+    只对机器人自己发出过的邀请做补记；陌生邀请（用户手动创建/vanity）只同步计数。
+    """
     uses = await _fetch_guild_invite_uses(guild)
     if uses is None:
-        return
+        return 0
+    records = _guild_invite_records(guild.id)
+    missed_total = 0
     for code, count in uses.items():
-        _invite_cache[f"{guild.id}:{code}"] = count
+        key = _invite_cache_key(guild.id, code)
+        prev = _invite_cache.get(key)
+        if prev is not None and count > prev and code in records:
+            missed = count - prev
+            rec = records[code]
+            rec["offline_missed"] = int(rec.get("offline_missed") or 0) + missed
+            rec["uses"] = max(int(rec.get("uses") or 0), count)
+            missed_total += missed
+            logger.info(f"[{guild.name}] 离线期间漏记 {missed} 次: {code}")
+        _invite_cache[key] = count
+    save_invite_cache()
+    if missed_total:
+        save_invites()
+    return missed_total
+
+
+def _record_unknown_join(guild: discord.Guild, member: discord.Member, reason: str, candidates=None):
+    """无法唯一溯源时留痕，方便事后人工核对，避免默默记错人"""
+    records = _guild_invite_records(guild.id)
+    bucket = records.setdefault("_unknown", {
+        "code": "_unknown",
+        "inviter_id": "",
+        "inviter_name": "未溯源",
+        "joined": [],
+    })
+    bucket.setdefault("joined", []).append({
+        "user_id": str(member.id),
+        "user_name": getattr(member, "display_name", None) or str(member),
+        "at": _beijing_now().isoformat(),
+        "reason": reason,
+        "candidates": list(candidates or []),
+    })
+    save_invites()
 
 
 async def _record_invite_join(member: discord.Member):
     guild = member.guild
     uses = await _fetch_guild_invite_uses(guild)
     if uses is None:
+        _record_unknown_join(guild, member, "读取邀请列表失败（可能缺权限）")
         return None
-    used_code = None
+    increased = []
     for code, count in uses.items():
-        prev = _invite_cache.get(f"{guild.id}:{code}")
+        prev = _invite_cache.get(_invite_cache_key(guild.id, code))
         if prev is not None and count > prev:
-            used_code = code
-            break
+            increased.append(code)
+    # 先全量同步缓存，避免后续事件重复计数
     for code, count in uses.items():
-        _invite_cache[f"{guild.id}:{code}"] = count
-    if not used_code:
-        return None
+        _invite_cache[_invite_cache_key(guild.id, code)] = count
+    save_invite_cache()
+
     records = _guild_invite_records(guild.id)
+    if not increased:
+        _record_unknown_join(guild, member, "没有邀请计数变化（可能用了陌生邀请或 vanity 链接）")
+        return None
+
+    # 优先认定机器人自己发出过的邀请
+    owned = [code for code in increased if code in records]
+    if len(owned) == 1:
+        used_code = owned[0]
+    elif len(owned) > 1:
+        # 同时多人用不同邀请加入，无法百分百确定谁是谁，留痕并取第一条
+        _record_unknown_join(guild, member, "同时命中多条邀请，归属存疑", candidates=owned)
+        used_code = owned[0]
+    else:
+        # 命中的都是陌生邀请（不是机器人发的），无从归属
+        _record_unknown_join(guild, member, "命中的邀请不是机器人发出的", candidates=increased)
+        return None
+
     inv_rec = records.get(used_code)
     if not inv_rec:
+        _record_unknown_join(guild, member, "邀请记录已不存在", candidates=increased)
         return used_code
     inv_rec.setdefault("joined", []).append({
         "user_id": str(member.id),
@@ -1985,11 +2071,15 @@ async def on_ready():
     load_channel_published()
     load_security()
     load_invites()
+    load_invite_cache()
     load_subscriptions()
     _install_slash_rate_limit()
     _ensure_file_store()
     for guild in bot.guilds:
         await _seed_invite_cache(guild)
+        me = guild.me
+        if me and not me.guild_permissions.manage_guild:
+            logger.warning(f"[{guild.name}] 缺少「管理服务器」权限，邀请溯源会全部失效")
     logger.info(f"✅ Bot 已上线: {bot.user.name} (ID: {bot.user.id})")
     logger.info(f"📡 正在服务 {len(bot.guilds)} 个服务器")
     try:
@@ -2051,13 +2141,15 @@ async def on_member_join(member: discord.Member):
 @bot.event
 async def on_invite_create(invite: discord.Invite):
     if invite.guild:
-        _invite_cache[f"{invite.guild.id}:{invite.code}"] = int(invite.uses or 0)
+        _invite_cache[_invite_cache_key(invite.guild.id, invite.code)] = int(invite.uses or 0)
+        save_invite_cache()
 
 
 @bot.event
 async def on_invite_delete(invite: discord.Invite):
     if invite.guild:
-        _invite_cache.pop(f"{invite.guild.id}:{invite.code}", None)
+        _invite_cache.pop(_invite_cache_key(invite.guild.id, invite.code), None)
+        save_invite_cache()
 
 
 # ═══════════════════════════════════════════
@@ -2072,6 +2164,8 @@ def _invite_records_of_user(guild_id, user_id) -> list:
     user_id = str(user_id)
     recs = []
     for code, rec in _guild_invite_records(guild_id).items():
+        if code == "_unknown":
+            continue
         if str(rec.get("inviter_id")) == user_id:
             recs.append((code, rec))
     recs.sort(key=lambda item: len(item[1].get("joined") or []), reverse=True)
@@ -2087,24 +2181,34 @@ def _invite_card_channel_of(guild: discord.Guild):
 
 def _build_invite_card(guild: discord.Guild) -> discord.Embed:
     records = _guild_invite_records(guild.id)
-    total_tracks = len(records)
-    total_joined = sum(len(rec.get("joined") or []) for rec in records.values())
+    real = {code: rec for code, rec in records.items() if code != "_unknown"}
+    unknown = (records.get("_unknown") or {}).get("joined") or []
+    offline_missed = sum(int(rec.get("offline_missed") or 0) for rec in real.values())
+    total_tracks = len(real)
+    total_joined = sum(len(rec.get("joined") or []) for rec in real.values())
     settings = _invite_settings(guild.id)
     role_name = (settings.get("creator_role") or "").strip()
     who = f"「{role_name}」身份组和岛主" if role_name else "岛主"
+    lines = [
+        "在这里生成属于你的服务器邀请函，也在这里看谁是你带进来的。",
+        "",
+        "**怎么用**",
+        "▸ 点「生成邀请函」，填好有效期、可用次数和备注",
+        "▸ 把链接发给朋友，对方用它进岛就会记在你的名下",
+        "▸ 点「我的邀请函」随时回看自己的战绩",
+        "",
+        "**当前数据**",
+        f"▸ 已发出邀请：**{total_tracks}** 条",
+        f"▸ 累计带来成员：**{total_joined}** 人",
+    ]
+    if unknown:
+        lines.append(f"▸ 未能溯源：**{len(unknown)}** 人（机器人离线或陌生邀请）")
+    if offline_missed:
+        lines.append(f"▸ 离线期间补记：**{offline_missed}** 次")
+    lines.append(f"▸ 生成权限：{who}")
     embed = discord.Embed(
         title="邀请函发送处",
-        description=(
-            "在这里生成属于你的服务器邀请函，也在这里看谁是你带进来的。\n\n"
-            "**怎么用**\n"
-            "▸ 点「生成邀请函」，填好有效期、可用次数和备注\n"
-            "▸ 把链接发给朋友，对方用它进岛就会记在你的名下\n"
-            "▸ 点「我的邀请函」随时回看自己的战绩\n\n"
-            "**当前数据**\n"
-            f"▸ 已发出邀请：**{total_tracks}** 条\n"
-            f"▸ 累计带来成员：**{total_joined}** 人\n"
-            f"▸ 生成权限：{who}"
-        ),
+        description="\n".join(lines)[:4000],
         color=discord.Color.from_rgb(88, 101, 242),
     )
     embed.set_footer(text=f"有效期最长 {INVITE_MAX_HOURS // 24} 天，可用次数最多 {INVITE_MAX_USES_LIMIT} 次")
@@ -2232,15 +2336,6 @@ class PersistentInviteView(discord.ui.View):
         await _do_my_invites(interaction)
 
     @discord.ui.button(
-        label="邀请排行",
-        style=discord.ButtonStyle.secondary,
-        custom_id="invite_card_rank",
-        row=1,
-    )
-    async def rank_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _do_invite_rank(interaction)
-
-    @discord.ui.button(
         label="邀请记录",
         style=discord.ButtonStyle.secondary,
         custom_id="invite_card_records",
@@ -2256,7 +2351,7 @@ class PersistentInviteView(discord.ui.View):
         label="邀请设置",
         style=discord.ButtonStyle.secondary,
         custom_id="invite_card_settings",
-        row=2,
+        row=1,
     )
     async def settings_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _is_island_owner(interaction):
@@ -2351,7 +2446,8 @@ async def _do_invite_create(interaction: discord.Interaction, 有效期小时: i
         "uses": 0,
         "joined": [],
     }
-    _invite_cache[f"{interaction.guild.id}:{invite.code}"] = 0
+    _invite_cache[_invite_cache_key(interaction.guild.id, invite.code)] = 0
+    save_invite_cache()
     save_invites()
     await _refresh_invite_card(interaction.guild)
     hours_txt = "永久" if max_age == 0 else f"{有效期小时} 小时"
@@ -2423,49 +2519,33 @@ async def _do_invite_records(interaction: discord.Interaction, 邀请码: str = 
         return
     rows = []
     for code, rec in records.items():
+        if code == "_unknown":
+            continue
         rows.append((code, rec, len(rec.get("joined") or [])))
     rows.sort(key=lambda r: r[2], reverse=True)
     lines = []
     for code, rec, joined in rows[:20]:
+        missed = int(rec.get("offline_missed") or 0)
+        extra = f"（另有 {missed} 次离线补记）" if missed else ""
         lines.append(
-            f"**{rec.get('inviter_name')}**　{joined} 人　{_invite_link(code)}　"
+            f"**{rec.get('inviter_name')}**　{joined} 人{extra}　{_invite_link(code)}　"
             f"{rec.get('note') or '（无备注）'}"
         )
+    unknown = (records.get("_unknown") or {}).get("joined") or []
+    if unknown:
+        lines.append("")
+        lines.append(f"**未能溯源　{len(unknown)} 人**（机器人离线、陌生邀请或同时命中多条）")
+        for item in unknown[-10:]:
+            lines.append(
+                f"　- {item.get('user_name', '?')}　{item.get('reason') or '未知原因'}"
+                f"　{_format_beijing_minute(item.get('at'))}"
+            )
     embed = discord.Embed(
         title="邀请记录总览",
         description="\n".join(lines)[:4000],
         color=discord.Color.from_rgb(88, 101, 242),
     )
     embed.set_footer(text="想只看某条带来的人，就点「邀请记录」并填上邀请码")
-    await interaction.response.send_message(embed=embed, ephemeral=True)
-
-
-async def _do_invite_rank(interaction: discord.Interaction):
-    if not interaction.guild:
-        await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
-        return
-    stats = defaultdict(int)
-    names = {}
-    for rec in _guild_invite_records(interaction.guild.id).values():
-        inviter = str(rec.get("inviter_id") or "")
-        if not inviter:
-            continue
-        stats[inviter] += len(rec.get("joined") or [])
-        names.setdefault(inviter, rec.get("inviter_name") or inviter)
-    if not stats:
-        await interaction.response.send_message("还没有邀请记录。", ephemeral=True)
-        return
-    ranked = sorted(stats.items(), key=lambda kv: kv[1], reverse=True)[:10]
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for i, (uid, count) in enumerate(ranked):
-        prefix = medals[i] if i < len(medals) else f"{i + 1}."
-        lines.append(f"{prefix} {names.get(uid, uid)} — **{count}** 人")
-    embed = discord.Embed(
-        title="邀请排行",
-        description="\n".join(lines),
-        color=discord.Color.from_rgb(255, 199, 44),
-    )
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
@@ -2510,7 +2590,8 @@ async def _do_invite_revoke(interaction: discord.Interaction, 邀请码: str):
         logger.warning(f"作废邀请失败: {e}")
     records = _guild_invite_records(interaction.guild.id)
     records.pop(code, None)
-    _invite_cache.pop(f"{interaction.guild.id}:{code}", None)
+    _invite_cache.pop(_invite_cache_key(interaction.guild.id, code), None)
+    save_invite_cache()
     save_invites()
     await _refresh_invite_card(interaction.guild)
     await _audit_log(

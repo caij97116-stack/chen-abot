@@ -42,5 +42,6 @@ file_records.json
 channel_published.json
 security_data.json
 invite_data.json
+invite_cache.json
 subscribe_data.json
 file_store/

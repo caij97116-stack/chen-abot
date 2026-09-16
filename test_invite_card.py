@@ -81,7 +81,7 @@ def test_view():
     view = m.PersistentInviteView()
     labels = [c.label for c in view.children]
     ids = [getattr(c, "custom_id", None) for c in view.children]
-    expected = ["生成邀请函", "我的邀请函", "邀请排行", "邀请记录", "邀请设置", "作废邀请"]
+    expected = ["生成邀请函", "我的邀请函", "邀请记录", "邀请设置", "作废邀请"]
     check(labels == expected, f"按钮顺序: {labels}")
     check(all(i for i in ids), f"全部有 custom_id: {ids}")
     check(view.timeout is None, "视图无超时，可重启恢复")
@@ -126,11 +126,51 @@ def test_modal_kinds():
     check(isinstance(m.InviteRevokeModal(), __import__("discord").ui.Modal), "作废弹窗是 Modal")
 
 
+def test_cache_key_and_persistence():
+    m._invite_cache = {}
+    key = m._invite_cache_key(999, "abc123")
+    check(key == "999:abc123", f"缓存键格式: {key}")
+    m._invite_cache[key] = 5
+    m.save_invite_cache()
+    m._invite_cache = {}
+    m.load_invite_cache()
+    check(m._invite_cache.get(key) == 5, f"缓存落盘后可恢复: {m._invite_cache.get(key)}")
+
+
+def test_unknown_join_recorded():
+    m.invite_data = {"_settings": {}, "999": {}}
+    member = type("M", (), {"id": 7, "display_name": "路人", "guild": FakeGuild()})()
+    m._record_unknown_join(member.guild, member, "同时命中多条邀请", candidates=["a", "b"])
+    bucket = m.invite_data["999"].get("_unknown")
+    check(bucket is not None, "存疑加入进入 _unknown 桶")
+    item = (bucket or {}).get("joined", [{}])[-1]
+    check(item.get("user_id") == "7", f"留痕用户: {item.get('user_id')}")
+    check(item.get("reason") == "同时命中多条邀请", f"留痕原因: {item.get('reason')}")
+    check(item.get("candidates") == ["a", "b"], f"留痕候选: {item.get('candidates')}")
+
+
+def test_isolation_from_inviter_lookup():
+    m.invite_data = {
+        "_settings": {},
+        "999": {
+            "_unknown": {"code": "_unknown", "inviter_id": "", "inviter_name": "未溯源", "joined": [{"user_name": "x"}]},
+            "abc123": {"code": "abc123", "inviter_id": "", "inviter_name": "阿蔡", "joined": []},
+        },
+    }
+    recs = m._invite_records_of_user(999, "")
+    check(all(code != "_unknown" for code, _ in recs), f"空 inviter 不匹配 _unknown: {[c for c, _ in recs]}")
+    embed = m._build_invite_card(FakeGuild())
+    check("未能溯源" in embed.description, "卡片展示未溯源人数")
+
+
 test_card()
 test_channel_keyword()
 test_view()
 test_defaults()
 test_create_validation()
 test_modal_kinds()
+test_cache_key_and_persistence()
+test_unknown_join_recorded()
+test_isolation_from_inviter_lookup()
 print(f"\n=== 失败项: {fail} ===")
 sys.exit(1 if fail else 0)
