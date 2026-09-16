@@ -158,6 +158,7 @@ def check_risk_control_retry():
 
 def check_cookie_header():
     fail = 0
+    m._bili_fingerprint = {"b_3": "", "b_4": ""}
     m.BILI_COOKIE = "SESSDATA=abc; buvid3=def"
     headers = m._bili_headers()
     ok = headers.get("Cookie") == "SESSDATA=abc; buvid3=def" and headers.get("Referer")
@@ -166,8 +167,46 @@ def check_cookie_header():
     m.BILI_COOKIE = ""
     headers = m._bili_headers()
     ok = "Cookie" not in headers
-    print(f"[{'OK ' if ok else 'FAIL'}] 未配 Cookie 时不带 Cookie 头")
+    print(f"[{'OK ' if ok else 'FAIL'}] 未配 Cookie 且无指纹时不带 Cookie 头")
     fail += 0 if ok else 1
+    return fail
+
+
+def check_fingerprint_merge():
+    """只给 SESSDATA 时，应自动补上 buvid3/buvid4（B站 对无指纹请求最容易 412）"""
+    fail = 0
+    m.BILI_COOKIE = "SESSDATA=only"
+    m._bili_fingerprint = {"b_3": "B3VALUE", "b_4": "B4VALUE"}
+    cookie = m._bili_cookie_string()
+    ok = "SESSDATA=only" in cookie and "buvid3=B3VALUE" in cookie and "buvid4=B4VALUE" in cookie
+    print(f"[{'OK ' if ok else 'FAIL'}] 仅有 SESSDATA 时自动补指纹: {cookie}")
+    fail += 0 if ok else 1
+
+    # 用户自己配了 buvid3 时不要覆盖
+    m.BILI_COOKIE = "SESSDATA=only; buvid3=USERB3"
+    cookie = m._bili_cookie_string()
+    ok = "buvid3=USERB3" in cookie and "buvid3=B3VALUE" not in cookie
+    print(f"[{'OK ' if ok else 'FAIL'}] 不覆盖用户自带的 buvid3: {cookie}")
+    fail += 0 if ok else 1
+
+    # 指纹不会写进用户可见的报错里
+    m.BILI_COOKIE = ""
+    m._bili_fingerprint = {"b_3": "", "b_4": ""}
+    return fail
+
+
+def check_fingerprint_persist():
+    import os
+    fail = 0
+    m._bili_fingerprint = {"b_3": "PERSISTB3", "b_4": "PERSISTB4"}
+    m.save_bili_fingerprint()
+    m._bili_fingerprint = {"b_3": "", "b_4": ""}
+    m.load_bili_fingerprint()
+    ok = m._bili_fingerprint.get("b_3") == "PERSISTB3"
+    print(f"[{'OK ' if ok else 'FAIL'}] 指纹落盘后可恢复: {m._bili_fingerprint.get('b_3')}")
+    fail += 0 if ok else 1
+    if os.path.exists(m.BILI_FINGERPRINT_FILE):
+        os.remove(m.BILI_FINGERPRINT_FILE)
     return fail
 
 
@@ -175,6 +214,8 @@ def main():
     fail = check_regex()
     fail += check_filter()
     fail += check_cookie_header()
+    fail += check_fingerprint_merge()
+    fail += check_fingerprint_persist()
     fail += check_risk_control_retry()
     fail += asyncio.run(check_live())[0]
     print(f"\n=== 失败项: {fail} ===")

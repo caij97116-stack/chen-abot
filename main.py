@@ -20,6 +20,21 @@ from typing import Optional
 from collections import defaultdict, deque
 from urllib.parse import quote, unquote, urlparse
 
+# 加载同目录下的 .env 文件：面板不好配环境变量时，直接在文件管理器里写 .env 更省事
+# 优先级：面板/系统环境变量 > .env 文件（override=False 保证面板里的配置不会被文件覆盖）
+try:
+    from dotenv import load_dotenv
+
+    _ENV_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if load_dotenv(_ENV_PATH, override=False):
+        print(f"[配置] 已加载 {_ENV_PATH}")
+    elif load_dotenv(override=False):
+        print("[配置] 已加载工作目录下的 .env")
+except ImportError:
+    print("[配置] 未安装 python-dotenv，跳过 .env 加载（面板环境变量仍然生效）")
+except Exception as _env_err:
+    print(f"[配置] .env 加载失败，跳过：{_env_err}")
+
 # 配置日志
 logging.basicConfig(
     level=logging.INFO,
@@ -83,6 +98,11 @@ BILI_UA = (
 BILI_COOKIE = (os.getenv("BILI_COOKIE") or "").strip()
 # B站风控时返回 412 或 HTML，换一次请求头重试可能就过了
 BILI_FETCH_RETRIES = 2
+# B站 对没有 buvid3 指纹的请求更容易判成机器人。首次请求自动领一份指纹并落盘复用。
+BILI_FINGERPRINT_FILE = "bili_fingerprint.json"
+_bili_fingerprint = {"b_3": "", "b_4": ""}
+# 开机第一行就打印，方便在面板 Console 里一眼确认配置有没有注入
+logger.info(f"B站 配置检查: BILI_COOKIE={'已配置' if BILI_COOKIE else '未配置'}")
 # 音乐区主/子分区 tid：原创音乐、翻唱、VOCALOID、电音、演奏、MV、三次元音乐、音乐综合
 BILI_MUSIC_TIDS = {3, 28, 29, 30, 31, 59, 130, 193, 194}
 # 分区不在音乐区时，再用标题里的音乐关键词兜底
@@ -2077,6 +2097,7 @@ async def on_ready():
     load_security()
     load_invites()
     load_invite_cache()
+    load_bili_fingerprint()
     load_subscriptions()
     _install_slash_rate_limit()
     _ensure_file_store()
@@ -6077,6 +6098,44 @@ def _looks_like_bili_url(url: str) -> bool:
     return bool(MUSIC_BILI_RE.search(url or ""))
 
 
+def load_bili_fingerprint():
+    """读取本地缓存的 B站 指纹，避免每次重启都重新领"""
+    global _bili_fingerprint
+    try:
+        if os.path.exists(BILI_FINGERPRINT_FILE):
+            with open(BILI_FINGERPRINT_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f) or {}
+            if isinstance(data, dict):
+                _bili_fingerprint = {
+                    "b_3": str(data.get("b_3") or ""),
+                    "b_4": str(data.get("b_4") or ""),
+                }
+    except Exception as e:
+        logger.warning(f"读取 B站 指纹缓存失败: {e}")
+
+
+def save_bili_fingerprint():
+    try:
+        with open(BILI_FINGERPRINT_FILE, "w", encoding="utf-8") as f:
+            json.dump(_bili_fingerprint, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.warning(f"保存 B站 指纹缓存失败: {e}")
+
+
+def _bili_cookie_string() -> str:
+    """拼出最终 Cookie：用户配置的 BILI_COOKIE 优先，再补上自动领的 buvid3/buvid4"""
+    parts = []
+    configured = (BILI_COOKIE or "").strip().rstrip(";").strip()
+    if configured:
+        parts.append(configured)
+    lower = configured.lower()
+    if "buvid3=" not in lower and _bili_fingerprint.get("b_3"):
+        parts.append(f"buvid3={_bili_fingerprint['b_3']}")
+    if "buvid4=" not in lower and _bili_fingerprint.get("b_4"):
+        parts.append(f"buvid4={_bili_fingerprint['b_4']}")
+    return "; ".join(parts)
+
+
 def _bili_headers() -> dict:
     headers = {
         "User-Agent": BILI_UA,
@@ -6084,9 +6143,13 @@ def _bili_headers() -> dict:
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9",
         "Origin": "https://www.bilibili.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
     }
-    if BILI_COOKIE:
-        headers["Cookie"] = BILI_COOKIE
+    cookie = _bili_cookie_string()
+    if cookie:
+        headers["Cookie"] = cookie
     return headers
 
 
@@ -6094,8 +6157,32 @@ class _BiliRiskControl(Exception):
     """B站 风控拦截（412 或返回 HTML 页），通常是机房 IP 被判定为异常流量"""
 
 
+async def _bili_ensure_fingerprint(session) -> None:
+    """没有 buvid3 的请求最容易被 412。这里用 SPI 接口自动领一份指纹并落盘复用。"""
+    global _bili_fingerprint
+    if _bili_fingerprint.get("b_3") or "buvid3=" in (BILI_COOKIE or "").lower():
+        return
+    try:
+        headers = _bili_headers()
+        async with session.get(f"{BILI_API}/x/frontend/finger/spi", headers=headers) as resp:
+            if resp.status != 200:
+                logger.warning(f"领取 B站 指纹失败: HTTP {resp.status}")
+                return
+            payload = json.loads(await resp.text())
+        data = payload.get("data") or {}
+        b_3 = str(data.get("b_3") or "")
+        b_4 = str(data.get("b_4") or "")
+        if b_3:
+            _bili_fingerprint = {"b_3": b_3, "b_4": b_4}
+            save_bili_fingerprint()
+            logger.info("已领取 B站 buvid3 指纹，后续请求会带上")
+    except Exception as e:
+        logger.warning(f"领取 B站 指纹异常: {e}")
+
+
 async def _bili_get_json(session, path: str, params: dict) -> dict:
     """请求 B站 接口并解析 JSON，遇风控自动换头重试；失败抛 _BiliRiskControl"""
+    await _bili_ensure_fingerprint(session)
     last_reason = "未知"
     for attempt in range(BILI_FETCH_RETRIES):
         try:
@@ -6109,7 +6196,12 @@ async def _bili_get_json(session, path: str, params: dict) -> dict:
                 body = await resp.text()
             if status in (412, 403) or "html" in ctype:
                 last_reason = f"B站风控（HTTP {status}）"
-                logger.warning(f"B站接口被风控: {path} status={status} ctype={ctype} 已配Cookie={bool(BILI_COOKIE)}")
+                has_cookie = bool(_bili_cookie_string())
+                logger.warning(
+                    f"B站接口被风控: {path} status={status} ctype={ctype} "
+                    f"带Cookie={has_cookie} 配了SESSDATA={bool(BILI_COOKIE)} "
+                    f"有指纹={bool(_bili_fingerprint.get('b_3'))}"
+                )
                 await asyncio.sleep(1.5 * (attempt + 1))
                 continue
             try:
@@ -6175,7 +6267,6 @@ async def _resolve_bilibili(url: str, caption: str = "", enforce_filter: bool = 
     aid = _bili_aid(expanded)
     if not bvid and not aid:
         raise ValueError("这条 B站 链接里没找到视频号。")
-    headers = _bili_headers()
     timeout = aiohttp.ClientTimeout(total=25)
     view_params = {"bvid": bvid} if bvid else {"aid": aid}
     try:
@@ -6212,10 +6303,12 @@ async def _resolve_bilibili(url: str, caption: str = "", enforce_filter: bool = 
                 play_params["avid"] = aid
             play = await _bili_get_json(session, "/x/player/playurl", play_params)
     except _BiliRiskControl as e:
-        raise ValueError(
-            f"B站 把请求拦下来了（{e}）。"
-            "机房 IP 很容易被风控，让岛主在面板环境变量里配好 BILI_COOKIE 就能稳定。"
-        ) from e
+        has_cookie = bool(_bili_cookie_string())
+        if has_cookie:
+            hint = "Cookie 已经带上了，还是被拦，说明这台机器的 IP 被 B站 拉黑了，换 IP 或过段时间再试。"
+        else:
+            hint = "让岛主在面板环境变量里填 BILI_COOKIE（值形如 SESSDATA=xx; buvid3=yy）就能稳定。"
+        raise ValueError(f"B站 把请求拦下来了（{e}）。{hint}") from e
     play_data = play.get("data") or {}
     stream_url = _bili_pick_audio(play_data.get("dash") or {})
     if not stream_url:
@@ -6225,7 +6318,8 @@ async def _resolve_bilibili(url: str, caption: str = "", enforce_filter: bool = 
     if not stream_url:
         raise ValueError("B站 这条视频拿不到可播音频，可能只对登录用户开放。")
     webpage = f"https://www.bilibili.com/video/{key}"
-    return title, stream_url, webpage, headers
+    # 指纹可能刚在请求过程中领到，这里重新取一次，保证播放音频时带上完整请求头
+    return title, stream_url, webpage, _bili_headers()
 
 
 async def _resolve_stream(url: str, caption: str = "", enforce_filter: bool = True) -> tuple:
@@ -9112,6 +9206,7 @@ if __name__ == "__main__":
         logger.info("🚀 正在启动 Chen-Abot...")
         logger.info(
             f"构建标记: BILI_COOKIE={'已配置' if BILI_COOKIE else '未配置'}　"
+            f"指纹={_bili_fingerprint.get('b_3')[:12] or '无'}　"
             f"缓存文件: {INVITE_CACHE_FILE}"
         )
         try:
