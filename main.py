@@ -1958,6 +1958,8 @@ QUIZ_COOLDOWN_MINUTES = 25         # 每次失败后增加的冷却时间（分�
 QUIZ_QUESTION_TIMEOUT = 300        # 每道题限时（秒），默认 5 分钟
 QUIZ_VERIFIED_ROLE = "你过关！小岛居民"        # 答题通过后赋予的身份组
 QUIZ_CHANNEL_KEYWORD = "答题"        # 答题频道名称关键词（包含此词即可）
+QUIZ_CHANNEL_EXCLUDE = ("交流",)      # 名称含这些词的频道不上答题卡（如「答题交流」）
+QUIZ_EMBED_TITLE = "📝 入群审核答题"  # 答题卡标题，用于识别误发卡片
 QUIZ_CHANNEL_FILE = "quiz_channels.json"     # 答题频道消息记录
 QUIZ_COOLDOWN_FILE = "quiz_cooldowns.json"   # 答题冷却记录
 quiz_questions: list = []            # 从 questions.json 加载的题目
@@ -2631,11 +2633,38 @@ async def _do_invite_revoke(interaction: discord.Interaction, 邀请码: str):
     )
 
 
+async def _remove_quiz_card(channel):
+    """从交流类频道里清掉误发的答题卡"""
+    recorded = quiz_channel_messages.pop(str(channel.id), None)
+    removed = False
+    if recorded:
+        try:
+            await (await channel.fetch_message(int(recorded))).delete()
+            removed = True
+        except Exception:
+            pass
+    try:
+        async for old_msg in channel.history(limit=50):
+            if old_msg.author.id != bot.user.id or not old_msg.embeds:
+                continue
+            if (old_msg.embeds[0].title or "") != QUIZ_EMBED_TITLE:
+                continue
+            try:
+                await old_msg.delete()
+                removed = True
+            except Exception:
+                pass
+    except Exception:
+        pass
+    if removed:
+        save_quiz_channels()
+        logger.info(f"清理交流频道误发的答题卡: #{channel.name}")
+
 
 async def setup_quiz_channels():
     """在名称包含 QUIZ_CHANNEL_KEYWORD 的频道中发布答题按钮消息"""
     quiz_embed = discord.Embed(
-        title="📝 入群审核答题",
+        title=QUIZ_EMBED_TITLE,
         description="点击下方按钮开始答题，需要 **答完题库全部题目且全部答对** 才能通过审核。\n\n"
                     "点「查询冷却」可查看自己还要等多久。\n"
                     "如果按钮无法使用，请使用 `/答题` 或 `/冷却` 命令。",
@@ -2646,6 +2675,10 @@ async def setup_quiz_channels():
     for guild in bot.guilds:
         for channel in guild.text_channels:
             if QUIZ_CHANNEL_KEYWORD not in channel.name:
+                continue
+            if any(word in channel.name for word in QUIZ_CHANNEL_EXCLUDE):
+                # 交流类频道不上答题卡，并清掉之前误发的
+                await _remove_quiz_card(channel)
                 continue
 
             try:
@@ -6384,11 +6417,43 @@ async def _add_stream_track(guild: discord.Guild, user, url: str, caption: str =
     return ""
 
 
+def _music_upload_limit(guild: discord.Guild) -> int:
+    """服务器端真正能传多大：取服务器上传上限与本机上限中更小的那个"""
+    try:
+        server_limit = int(getattr(guild, "filesize_limit", 0) or 0)
+    except Exception:
+        server_limit = 0
+    if server_limit <= 0:
+        return MUSIC_MAX_BYTES
+    return min(MUSIC_MAX_BYTES, server_limit)
+
+
+async def _read_music_attachment(att) -> bytes:
+    """读附件带重试，Discord CDN 偶发失败不该把整条消息丢掉"""
+    last = None
+    for attempt in range(3):
+        try:
+            return await att.read()
+        except Exception as e:
+            last = e
+            if attempt < 2:
+                await asyncio.sleep(1.5 * (attempt + 1))
+    raise last
+
+
 async def _add_music_track(guild: discord.Guild, user, att, caption: str = "") -> str:
     size = int(getattr(att, "size", 0) or 0)
-    if size > MUSIC_MAX_BYTES:
-        return f"{att.filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
-    data = await att.read()
+    limit = _music_upload_limit(guild)
+    if size > limit:
+        return (
+            f"{att.filename} 有 {size // (1024 * 1024)}MB，超过服务器能传的上限 "
+            f"{limit // (1024 * 1024)}MB。这种情况 Discord 在发送阶段就会取消上传，"
+            f"先压缩到 {limit // (1024 * 1024)}MB 以内再丢。"
+        )
+    try:
+        data = await _read_music_attachment(att)
+    except Exception as e:
+        return f"{att.filename} 没取到（附件读取失败），稍后重发一次。原因：{e}"
     return await _stage_music_bytes(guild, user, att.filename, data, caption)
 
 
@@ -6605,34 +6670,54 @@ async def _ingest_music_message(message: discord.Message) -> bool:
     errors = []
     caption = message.content or ""
     for att in audio_atts:
-        err = await _add_music_track(message.guild, message.author, att, caption)
+        try:
+            err = await _add_music_track(message.guild, message.author, att, caption)
+        except Exception as e:
+            logger.error(f"音乐入库失败 {att.filename}: {e}")
+            err = f"{att.filename} 处理失败，稍后重发一次。"
         if err:
             errors.append(err)
         else:
             staged += 1
     for url in audio_urls:
-        result, err = await _download_direct_audio(url)
+        try:
+            result, err = await _download_direct_audio(url)
+        except Exception as e:
+            logger.error(f"音频直链处理失败 {url}: {e}")
+            result, err = None, "这条音频地址处理失败，稍后重发一次。"
         if err:
             errors.append(err)
             continue
         filename, data = result
-        err = await _add_music_bytes(message.guild, message.author, filename, data, caption)
+        try:
+            err = await _add_music_bytes(message.guild, message.author, filename, data, caption)
+        except Exception as e:
+            logger.error(f"音频直链入库失败 {url}: {e}")
+            err = f"{filename} 处理失败，稍后重发一次。"
         if err:
             errors.append(err)
         else:
             staged += 1
     for url in stream_urls:
-        err = await _add_stream_track(message.guild, message.author, url, caption)
+        try:
+            err = await _add_stream_track(message.guild, message.author, url, caption)
+        except Exception as e:
+            logger.error(f"流媒体链接处理失败 {url}: {e}")
+            err = "这条链接处理失败，稍后重发一次。"
         if err:
             errors.append(err)
         else:
             added += 1
     if blocked_note:
         errors.append(blocked_note)
-    try:
-        await message.delete()
-    except Exception:
-        pass
+    # 只有确实收下了东西才删原消息；全失败就把文件留在频道里让用户重试
+    if added or staged:
+        try:
+            await message.delete()
+        except Exception:
+            pass
+    else:
+        errors.append("这条先留在频道里，重发一次或换个格式试试。")
     note = []
     if added:
         note.append(f"已收入歌单 {added} 首。")
