@@ -45,4 +45,5 @@ invite_data.json
 invite_cache.json
 bili_fingerprint.json
 subscribe_data.json
+role_data.json
 file_store/

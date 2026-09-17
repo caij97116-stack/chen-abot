@@ -155,6 +155,10 @@ SECURITY_FILE = "security_data.json"
 INVITE_FILE = "invite_data.json"
 INVITE_CACHE_FILE = "invite_cache.json"
 SUBSCRIBE_FILE = "subscribe_data.json"
+ROLE_CLAIM_FILE = "role_data.json"
+ROLE_CLAIM_CHANNEL_KEYWORD = "身份"   # 领取身份组频道关键词
+ROLE_CLAIM_MAX = 25                    # 一张卡最多几个按钮
+ROLE_CLAIM_STYLES = ("primary", "secondary", "success", "danger")
 INVITE_DEFAULT_HOURS = 168
 INVITE_MAX_HOURS = 168
 INVITE_MAX_USES_LIMIT = 100
@@ -192,6 +196,7 @@ MASK_REMINDER_SHORT = "API Key / Token / Cookie / 面板地址 / 服务器 IP �
 security_data: dict = {}
 invite_data: dict = {}
 subscribe_data: dict = {}
+role_claim_data: dict = {}
 _raid_join_times: dict = defaultdict(deque)
 _slash_last: dict = {}
 _slash_rate_installed = False
@@ -2101,6 +2106,7 @@ async def on_ready():
     load_invite_cache()
     load_bili_fingerprint()
     load_subscriptions()
+    load_role_claims()
     _install_slash_rate_limit()
     _ensure_file_store()
     for guild in bot.guilds:
@@ -2136,6 +2142,9 @@ async def on_ready():
 
     # 在邀请函发送处发布/更新邀请卡片
     await setup_invite_card_channels()
+
+    # 在领取身份组频道发布/更新身份卡
+    await setup_identity_channels()
 
     await setup_alert_channel()
 
@@ -2714,6 +2723,422 @@ async def setup_quiz_channels():
                 logger.warning(f"无权限在 #{channel.name} 发送消息")
             except Exception as e:
                 logger.error(f"答题频道 #{channel.name} 设置失败: {e}")
+
+
+# ═══════════════════════════════════════════
+#  领取身份组 - 常驻卡 + 按钮，岛主自行配置身份组
+#  数据: { "_settings": { guild_id: { card_message_id, channel_id,
+#          roles: [{ role_id, label, description, emoji, style, need_pass }] } } }
+# ═══════════════════════════════════════════
+
+def load_role_claims():
+    global role_claim_data
+    try:
+        if os.path.exists(ROLE_CLAIM_FILE):
+            with open(ROLE_CLAIM_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            role_claim_data = loaded if isinstance(loaded, dict) else {}
+        else:
+            role_claim_data = {}
+    except Exception:
+        role_claim_data = {}
+
+
+def save_role_claims():
+    try:
+        with open(ROLE_CLAIM_FILE, "w", encoding="utf-8") as f:
+            json.dump(role_claim_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存身份面板失败: {e}")
+
+
+def _role_claim_settings(guild_id) -> dict:
+    settings = role_claim_data.setdefault("_settings", {})
+    if not isinstance(settings, dict):
+        settings = {}
+        role_claim_data["_settings"] = settings
+    rec = settings.get(str(guild_id))
+    if not isinstance(rec, dict):
+        rec = {}
+        settings[str(guild_id)] = rec
+    rec.setdefault("card_message_id", "")
+    rec.setdefault("channel_id", "")
+    rec.setdefault("roles", [])
+    if not isinstance(rec.get("roles"), list):
+        rec["roles"] = []
+    return rec
+
+
+def _role_claim_channel_of(guild: discord.Guild):
+    for channel in getattr(guild, "text_channels", []) or []:
+        name = channel.name or ""
+        if ROLE_CLAIM_CHANNEL_KEYWORD in name and "测试" not in name:
+            return channel
+    return None
+
+
+def _resolve_role(guild: discord.Guild, key):
+    key = str(key or "").strip()
+    if not key:
+        return None
+    if key.isdigit():
+        role = guild.get_role(int(key))
+        if role:
+            return role
+    return discord.utils.get(guild.roles, name=key)
+
+
+def _role_entry_of(guild_id, key) -> dict:
+    entries = _role_claim_settings(guild_id).get("roles") or []
+    key = str(key or "").strip()
+    for entry in entries:
+        if str(entry.get("role_id")) == key:
+            return entry
+        if key and str(entry.get("label") or "") == key:
+            return entry
+    return None
+
+
+def _role_button_style(name):
+    return {
+        "primary": discord.ButtonStyle.primary,
+        "secondary": discord.ButtonStyle.secondary,
+        "success": discord.ButtonStyle.success,
+        "danger": discord.ButtonStyle.danger,
+    }.get(str(name or "").lower(), discord.ButtonStyle.secondary)
+
+
+def _parse_emoji(raw):
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    try:
+        return discord.PartialEmoji.from_str(raw)
+    except Exception:
+        return None
+
+
+def _build_role_claim_embed(guild: discord.Guild) -> discord.Embed:
+    settings = _role_claim_settings(guild.id)
+    entries = settings.get("roles") or []
+    lines = [
+        "这里是领身份组的地方。点下面的按钮戴上，再点一次摘掉。",
+        "",
+    ]
+    if not entries:
+        lines.append("岛主还没配置可以领的身份组。用 `/添加身份` 加进来。")
+    else:
+        for entry in entries[:ROLE_CLAIM_MAX]:
+            role = _resolve_role(guild, entry.get("role_id"))
+            name = entry.get("label") or (role.name if role else "（身份组已删除）")
+            gate = "需过审" if entry.get("need_pass", True) else "人人可领"
+            note = str(entry.get("description") or "").strip()
+            suffix = f" —— {note}" if note else ""
+            lines.append(f"▸ **{name}**（{gate}，当前 {len(role.members) if role else 0} 人）{suffix}")
+    embed = discord.Embed(
+        title="🎭 领身份组",
+        description="\n".join(lines)[:4000],
+        color=discord.Color.from_rgb(255, 183, 77),
+    )
+    embed.set_footer(text="只能领给你开放的身份组 | 领取和摘下都会记录")
+    return embed
+
+
+class IdentityToggleButton(discord.ui.Button):
+    def __init__(self, role_id: str, label: str, emoji=None, style=discord.ButtonStyle.secondary):
+        super().__init__(
+            label=(label or "身份组")[:80],
+            emoji=emoji,
+            style=style,
+            custom_id=f"identity_toggle:{role_id}",
+        )
+        self.role_id = str(role_id)
+
+    async def callback(self, interaction: discord.Interaction):
+        await _do_identity_toggle(interaction, self.role_id)
+
+
+class PersistentIdentityView(discord.ui.View):
+    """领取身份组常驻卡（无超时，重启后按配置重建）"""
+
+    def __init__(self, guild: discord.Guild = None):
+        super().__init__(timeout=None)
+        if guild is None:
+            return
+        settings = _role_claim_settings(guild.id)
+        for entry in (settings.get("roles") or [])[:ROLE_CLAIM_MAX]:
+            role_id = str(entry.get("role_id") or "")
+            if not role_id:
+                continue
+            role = _resolve_role(guild, role_id)
+            label = entry.get("label") or (role.name if role else "身份组")
+            emoji = _parse_emoji(entry.get("emoji"))
+            style = _role_button_style(entry.get("style"))
+            try:
+                button = IdentityToggleButton(role_id, label, emoji, style)
+            except Exception:
+                button = IdentityToggleButton(role_id, label, None, style)
+            self.add_item(button)
+
+
+async def _do_identity_toggle(interaction: discord.Interaction, role_id: str):
+    if not interaction.guild:
+        await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+        return
+    guild = interaction.guild
+    entry = _role_entry_of(guild.id, role_id)
+    if not entry:
+        await interaction.response.send_message("这个身份组已经不在面板上了。", ephemeral=True)
+        return
+    role = _resolve_role(guild, role_id)
+    if not role:
+        await interaction.response.send_message("这个身份组已经被删掉了，等岛主下架。", ephemeral=True)
+        return
+    if entry.get("need_pass", True) and not _user_passed_quiz(interaction.user):
+        await interaction.response.send_message(
+            f"这个身份组要答完入群题、拿到「{QUIZ_VERIFIED_ROLE}」才能领。先去答题频道。",
+            ephemeral=True,
+        )
+        return
+    me = guild.me
+    if me and role >= me.top_role:
+        await interaction.response.send_message(
+            "机器人身份组位置不够高，请把机器人的身份组拖到这个身份组上面。",
+            ephemeral=True,
+        )
+        return
+    member = interaction.user
+    try:
+        if role in member.roles:
+            await member.remove_roles(role, reason=f"身份面板自助摘下：{member} ({member.id})")
+            gained = False
+        else:
+            await member.add_roles(role, reason=f"身份面板自助领取：{member} ({member.id})")
+            gained = True
+    except discord.Forbidden:
+        await interaction.response.send_message("机器人没有「管理身份组」权限，领不了。", ephemeral=True)
+        return
+    except Exception as e:
+        await interaction.response.send_message(f"操作失败：{e}", ephemeral=True)
+        return
+    if gained:
+        text = f"已领取 **{role.name}**。想摘掉再点一次。"
+    else:
+        text = f"已摘下 **{role.name}**。"
+    await interaction.response.send_message(text, ephemeral=True)
+    await _audit_log(
+        guild,
+        "身份组自助变更",
+        f"**成员:** {member.mention} `{member.id}`\n"
+        f"**身份组:** {role.name}\n"
+        f"**动作:** {'领取' if gained else '摘下'}",
+    )
+
+
+async def _refresh_identity_card(guild: discord.Guild):
+    if not guild:
+        return None
+    channel = _role_claim_channel_of(guild)
+    if not channel:
+        return None
+    settings = _role_claim_settings(guild.id)
+    try:
+        view = PersistentIdentityView(guild)
+        bot.add_view(view)
+    except Exception as e:
+        logger.warning(f"注册身份卡按钮失败: {e}")
+        view = PersistentIdentityView()
+    embed = _build_role_claim_embed(guild)
+    msg_id = settings.get("card_message_id")
+    if msg_id:
+        try:
+            msg = await channel.fetch_message(int(msg_id))
+            await msg.edit(embed=embed, view=view)
+            return channel
+        except Exception:
+            pass
+    msg = await channel.send(embed=embed, view=view)
+    settings["card_message_id"] = str(msg.id)
+    settings["channel_id"] = str(channel.id)
+    save_role_claims()
+    return channel
+
+
+async def setup_identity_channels():
+    for guild in bot.guilds:
+        channel = _role_claim_channel_of(guild)
+        if not channel:
+            continue
+        settings = _role_claim_settings(guild.id)
+        settings["channel_id"] = str(channel.id)
+        try:
+            await _refresh_identity_card(guild)
+            logger.info(f"更新领取身份卡: #{channel.name}")
+        except Exception as e:
+            logger.error(f"领取身份卡 #{channel.name} 设置失败: {e}")
+
+
+async def _identity_role_autocomplete(interaction: discord.Interaction, current: str):
+    if not interaction.guild:
+        return []
+    cur = (current or "").strip().lower()
+    out = []
+    for role in interaction.guild.roles:
+        if role.is_default() or role.managed:
+            continue
+        if cur and cur not in role.name.lower():
+            continue
+        out.append(app_commands.Choice(name=role.name[:100], value=str(role.id)))
+        if len(out) >= 25:
+            break
+    return out
+
+
+@bot.tree.command(name="身份面板", description="重新发布/刷新领取身份组的卡片（仅岛主）")
+async def identity_panel(interaction: discord.Interaction):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+        return
+    channel = _role_claim_channel_of(interaction.guild)
+    if not channel:
+        await interaction.response.send_message(
+            f"没找到名称含「{ROLE_CLAIM_CHANNEL_KEYWORD}」的文字频道，先建一个。",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    await _refresh_identity_card(interaction.guild)
+    await interaction.followup.send(f"身份卡已刷新到 {channel.mention}。", ephemeral=True)
+
+
+@bot.tree.command(name="添加身份", description="把一个身份组加到领取面板（仅岛主）")
+@app_commands.describe(
+    角色="要开放的身份组",
+    显示名="按钮上显示的名字，留空用身份组名",
+    说明="卡片里的一句话说明，可留空",
+    表情="按钮小图标，可留空",
+    样式="按钮颜色，默认灰色",
+    必过审="是否要求先答题过关，默认需要",
+)
+@app_commands.autocomplete(角色=_identity_role_autocomplete)
+@app_commands.choices(
+    样式=[
+        app_commands.Choice(name="蓝色", value="primary"),
+        app_commands.Choice(name="灰色", value="secondary"),
+        app_commands.Choice(name="绿色", value="success"),
+        app_commands.Choice(name="红色", value="danger"),
+    ],
+    必过审=[
+        app_commands.Choice(name="需要过审", value="yes"),
+        app_commands.Choice(name="人人可领", value="no"),
+    ],
+)
+async def identity_add(
+    interaction: discord.Interaction,
+    角色: str,
+    显示名: str = "",
+    说明: str = "",
+    表情: str = "",
+    样式: app_commands.Choice[str] = None,
+    必过审: app_commands.Choice[str] = None,
+):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+        return
+    role = _resolve_role(interaction.guild, 角色)
+    if not role:
+        await interaction.response.send_message("没找到这个身份组，从候选里选一个。", ephemeral=True)
+        return
+    settings = _role_claim_settings(interaction.guild.id)
+    entries = settings.get("roles") or []
+    if _role_entry_of(interaction.guild.id, str(role.id)):
+        await interaction.response.send_message(f"「{role.name}」已经在面板上了。", ephemeral=True)
+        return
+    if len(entries) >= ROLE_CLAIM_MAX:
+        await interaction.response.send_message(f"面板最多 {ROLE_CLAIM_MAX} 个身份组，先下架几个。", ephemeral=True)
+        return
+    entry = {
+        "role_id": str(role.id),
+        "label": " ".join((显示名 or "").split())[:80],
+        "description": " ".join((说明 or "").split())[:100],
+        "emoji": (表情 or "").strip()[:50],
+        "style": (样式.value if 样式 else "secondary"),
+        "need_pass": (必过审.value != "no") if 必过审 else True,
+    }
+    entries.append(entry)
+    save_role_claims()
+    await _refresh_identity_card(interaction.guild)
+    await _audit_log(
+        interaction.guild,
+        "身份面板变更",
+        f"**操作人:** {interaction.user.mention}\n**新增身份组:** {role.name} `{role.id}`",
+    )
+    await interaction.response.send_message(f"已把 **{role.name}** 加进领取面板。", ephemeral=True)
+
+
+@bot.tree.command(name="移除身份", description="把一个身份组从领取面板下架（仅岛主）")
+@app_commands.describe(角色="身份组名字或 ID，也可以是面板上写的显示名")
+@app_commands.autocomplete(角色=_identity_role_autocomplete)
+async def identity_remove(interaction: discord.Interaction, 角色: str):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+        return
+    entry = _role_entry_of(interaction.guild.id, 角色)
+    if not entry:
+        role = _resolve_role(interaction.guild, 角色)
+        if role:
+            entry = _role_entry_of(interaction.guild.id, str(role.id))
+    if not entry:
+        await interaction.response.send_message("面板上没找到这个身份组。", ephemeral=True)
+        return
+    settings = _role_claim_settings(interaction.guild.id)
+    settings["roles"] = [e for e in (settings.get("roles") or []) if e is not entry]
+    save_role_claims()
+    role = _resolve_role(interaction.guild, entry.get("role_id"))
+    await _refresh_identity_card(interaction.guild)
+    name = entry.get("label") or (role.name if role else entry.get("role_id"))
+    await _audit_log(
+        interaction.guild,
+        "身份面板变更",
+        f"**操作人:** {interaction.user.mention}\n**下架身份组:** {name}",
+    )
+    await interaction.response.send_message(f"已把 **{name}** 从领取面板下架。", ephemeral=True)
+
+
+@bot.tree.command(name="身份列表", description="查看领取面板上配置了哪些身份组（仅岛主）")
+async def identity_list(interaction: discord.Interaction):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    if not interaction.guild:
+        await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+        return
+    entries = _role_claim_settings(interaction.guild.id).get("roles") or []
+    if not entries:
+        await interaction.response.send_message("面板还是空的，用 `/添加身份` 加。", ephemeral=True)
+        return
+    lines = []
+    for i, entry in enumerate(entries, start=1):
+        role = _resolve_role(interaction.guild, entry.get("role_id"))
+        name = entry.get("label") or (role.name if role else "（已删除）")
+        gate = "需过审" if entry.get("need_pass", True) else "人人可领"
+        lines.append(f"{i}. **{name}** `{entry.get('role_id')}`（{gate}，{entry.get('style') or 'secondary'}）")
+    embed = discord.Embed(
+        title="领取面板上的身份组",
+        description="\n".join(lines)[:4000],
+        color=discord.Color.from_rgb(255, 183, 77),
+    )
+    embed.set_footer(text=f"共 {len(entries)} / {ROLE_CLAIM_MAX} 个 | /添加身份 /移除身份 修改")
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ═══════════════════════════════════════════
