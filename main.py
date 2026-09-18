@@ -18,7 +18,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from collections import defaultdict, deque
-from urllib.parse import quote, unquote, urlparse
+from urllib.parse import quote
 
 # 加载同目录下的 .env 文件：面板不好配环境变量时，直接在文件管理器里写 .env 更省事
 # 优先级：面板/系统环境变量 > .env 文件（override=False 保证面板里的配置不会被文件覆盖）
@@ -73,46 +73,6 @@ MUSIC_IDLE_SEC = 300
 MUSIC_LOOP_MODES = ("off", "all", "one")
 MUSIC_AUDIO_EXTS = (".mp3", ".ogg", ".wav", ".m4a", ".flac", ".opus")
 MUSIC_URL_RE = re.compile(r"https?://[^\s<>\]\)\"']+", re.IGNORECASE)
-MUSIC_STREAM_RE = re.compile(
-    r"(youtu\.be|youtube\.com|music\.youtube\.com|soundcloud\.com|snd\.sc)",
-    re.IGNORECASE,
-)
-MUSIC_BILI_RE = re.compile(
-    r"(bilibili\.com|b23\.tv|bili2233\.cn|acg\.tv)",
-    re.IGNORECASE,
-)
-MUSIC_BLOCKED_RE = re.compile(
-    r"(music\.163\.com|163cn\.tv|y\.qq\.com|i\.y\.qq\.com|open\.spotify\.com|"
-    r"kugou\.com|kuwo\.cn)",
-    re.IGNORECASE,
-)
-# B站取流：view 接口拿元数据（分区 tid 用于筛选），playurl 接口拿纯音频轨
-BILI_API = "https://api.bilibili.com"
-BILI_REFERER = "https://www.bilibili.com/"
-BILI_UA = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-)
-# 机房 IP 直连 B站 容易被风控（412/HTML 页）。填上登录后的 Cookie 能大幅提高成功率。
-# 在面板环境变量里配置 BILI_COOKIE，格式形如：SESSDATA=xxx; buvid3=yyy
-BILI_COOKIE = (os.getenv("BILI_COOKIE") or "").strip()
-# B站风控时返回 412 或 HTML，换一次请求头重试可能就过了
-BILI_FETCH_RETRIES = 2
-# B站 对没有 buvid3 指纹的请求更容易判成机器人。首次请求自动领一份指纹并落盘复用。
-BILI_FINGERPRINT_FILE = "bili_fingerprint.json"
-_bili_fingerprint = {"b_3": "", "b_4": ""}
-# 开机第一行就打印，方便在面板 Console 里一眼确认配置有没有注入
-logger.info(f"B站 配置检查: BILI_COOKIE={'已配置' if BILI_COOKIE else '未配置'}")
-# 音乐区主/子分区 tid：原创音乐、翻唱、VOCALOID、电音、演奏、MV、三次元音乐、音乐综合
-BILI_MUSIC_TIDS = {3, 28, 29, 30, 31, 59, 130, 193, 194}
-# 分区不在音乐区时，再用标题里的音乐关键词兜底
-BILI_MUSIC_WORDS = (
-    "mv", "官方", "音乐", "歌曲", "高音质", "无损", "纯音乐", "伴奏", "翻唱",
-    "cover", "bgm", "ost", "主题曲", "片头曲", "片尾曲", "专辑", "remix",
-    "合唱", "歌", "live", "现场", "演唱会",
-)
-# 带这些词的消息可无视筛选强制入库，给用户留个口子
-BILI_FORCE_WORDS = ("强制入库", "就当音乐")
 GAMBLE_CHANNEL_KEYWORD = "赌王来一下"
 GAMBLE_DRAW_COST_POINTS = 10
 GAMBLE_DRAW_TEN = 10
@@ -2104,7 +2064,6 @@ async def on_ready():
     load_security()
     load_invites()
     load_invite_cache()
-    load_bili_fingerprint()
     load_subscriptions()
     load_role_claims()
     _install_slash_rate_limit()
@@ -2770,6 +2729,23 @@ def _role_claim_settings(guild_id) -> dict:
 
 
 def _role_claim_channel_of(guild: discord.Guild):
+    """优先用已记下的频道 ID，找不到再按名称关键词搜。"""
+    settings = _role_claim_settings(guild.id)
+    saved = str(settings.get("channel_id") or "").strip()
+    if saved.isdigit():
+        channel = guild.get_channel(int(saved))
+        if channel and getattr(channel, "type", None) in (
+            discord.ChannelType.text,
+            discord.ChannelType.news,
+        ):
+            return channel
+        try:
+            if hasattr(guild, "get_channel_or_thread"):
+                channel = guild.get_channel_or_thread(int(saved))
+                if channel:
+                    return channel
+        except Exception:
+            pass
     for channel in getattr(guild, "text_channels", []) or []:
         name = channel.name or ""
         if ROLE_CLAIM_CHANNEL_KEYWORD in name and "测试" not in name:
@@ -2844,29 +2820,41 @@ def _build_role_claim_embed(guild: discord.Guild) -> discord.Embed:
     return embed
 
 
-class IdentityToggleButton(discord.ui.Button):
-    def __init__(self, role_id: str, label: str, emoji=None, style=discord.ButtonStyle.secondary):
+class IdentityToggleItem(
+    discord.ui.DynamicItem[discord.ui.Button],
+    template=r"identity_toggle:(?P<role_id>\d+)",
+):
+    """动态按钮：重启后凭 custom_id 还原，不必每次 add_view。"""
+
+    def __init__(self, role_id: str, label: str = "身份组", emoji=None, style=discord.ButtonStyle.secondary, row: int = 0):
         super().__init__(
-            label=(label or "身份组")[:80],
-            emoji=emoji,
-            style=style,
-            custom_id=f"identity_toggle:{role_id}",
+            discord.ui.Button(
+                label=(label or "身份组")[:80],
+                emoji=emoji,
+                style=style,
+                custom_id=f"identity_toggle:{role_id}",
+                row=row,
+            )
         )
         self.role_id = str(role_id)
+
+    @classmethod
+    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]):
+        return cls(match.group("role_id"))
 
     async def callback(self, interaction: discord.Interaction):
         await _do_identity_toggle(interaction, self.role_id)
 
 
 class PersistentIdentityView(discord.ui.View):
-    """领取身份组常驻卡（无超时，重启后按配置重建）"""
+    """领取身份组常驻卡。按钮随配置动态生成。"""
 
     def __init__(self, guild: discord.Guild = None):
         super().__init__(timeout=None)
         if guild is None:
             return
         settings = _role_claim_settings(guild.id)
-        for entry in (settings.get("roles") or [])[:ROLE_CLAIM_MAX]:
+        for i, entry in enumerate((settings.get("roles") or [])[:ROLE_CLAIM_MAX]):
             role_id = str(entry.get("role_id") or "")
             if not role_id:
                 continue
@@ -2875,10 +2863,10 @@ class PersistentIdentityView(discord.ui.View):
             emoji = _parse_emoji(entry.get("emoji"))
             style = _role_button_style(entry.get("style"))
             try:
-                button = IdentityToggleButton(role_id, label, emoji, style)
+                item = IdentityToggleItem(role_id, label, emoji, style, row=i // 5)
             except Exception:
-                button = IdentityToggleButton(role_id, label, None, style)
-            self.add_item(button)
+                item = IdentityToggleItem(role_id, label, None, style, row=i // 5)
+            self.add_item(item)
 
 
 async def _do_identity_toggle(interaction: discord.Interaction, role_id: str):
@@ -2936,27 +2924,28 @@ async def _do_identity_toggle(interaction: discord.Interaction, role_id: str):
 
 
 async def _refresh_identity_card(guild: discord.Guild):
+    """刷新身份卡文案和按钮。动态按钮靠消息上的 View 生效，不走 bot.add_view。"""
     if not guild:
         return None
     channel = _role_claim_channel_of(guild)
     if not channel:
+        logger.warning(f"[{guild.name}] 找不到领取身份频道（名称需含「{ROLE_CLAIM_CHANNEL_KEYWORD}」）")
         return None
     settings = _role_claim_settings(guild.id)
-    try:
-        view = PersistentIdentityView(guild)
-        bot.add_view(view)
-    except Exception as e:
-        logger.warning(f"注册身份卡按钮失败: {e}")
-        view = PersistentIdentityView()
+    view = PersistentIdentityView(guild)
     embed = _build_role_claim_embed(guild)
-    msg_id = settings.get("card_message_id")
+    msg_id = str(settings.get("card_message_id") or "").strip()
     if msg_id:
         try:
             msg = await channel.fetch_message(int(msg_id))
             await msg.edit(embed=embed, view=view)
+            settings["channel_id"] = str(channel.id)
+            save_role_claims()
             return channel
-        except Exception:
-            pass
+        except discord.NotFound:
+            logger.info(f"[{guild.name}] 旧身份卡消息已不在，重新发一张")
+        except Exception as e:
+            logger.warning(f"[{guild.name}] 编辑身份卡失败，改为重发: {e}")
     msg = await channel.send(embed=embed, view=view)
     settings["card_message_id"] = str(msg.id)
     settings["channel_id"] = str(channel.id)
@@ -3010,8 +2999,11 @@ async def identity_panel(interaction: discord.Interaction):
         )
         return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    await _refresh_identity_card(interaction.guild)
-    await interaction.followup.send(f"身份卡已刷新到 {channel.mention}。", ephemeral=True)
+    refreshed = await _refresh_identity_card(interaction.guild)
+    if refreshed:
+        await interaction.followup.send(f"身份卡已刷新到 {refreshed.mention}。", ephemeral=True)
+    else:
+        await interaction.followup.send("刷新失败，看一眼控制台日志。", ephemeral=True)
 
 
 @bot.tree.command(name="添加身份", description="把一个身份组加到领取面板（仅岛主）")
@@ -3063,6 +3055,7 @@ async def identity_add(
     if len(entries) >= ROLE_CLAIM_MAX:
         await interaction.response.send_message(f"面板最多 {ROLE_CLAIM_MAX} 个身份组，先下架几个。", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True, thinking=True)
     entry = {
         "role_id": str(role.id),
         "label": " ".join((显示名 or "").split())[:80],
@@ -3073,13 +3066,22 @@ async def identity_add(
     }
     entries.append(entry)
     save_role_claims()
-    await _refresh_identity_card(interaction.guild)
+    refreshed = await _refresh_identity_card(interaction.guild)
     await _audit_log(
         interaction.guild,
         "身份面板变更",
         f"**操作人:** {interaction.user.mention}\n**新增身份组:** {role.name} `{role.id}`",
     )
-    await interaction.response.send_message(f"已把 **{role.name}** 加进领取面板。", ephemeral=True)
+    if refreshed:
+        await interaction.followup.send(
+            f"已把 **{role.name}** 加进领取面板，卡片已刷新到 {refreshed.mention}。",
+            ephemeral=True,
+        )
+    else:
+        await interaction.followup.send(
+            f"已记下 **{role.name}**，但没找到名称含「{ROLE_CLAIM_CHANNEL_KEYWORD}」的频道，先建一个再点 `/身份面板`。",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(name="移除身份", description="把一个身份组从领取面板下架（仅岛主）")
@@ -3100,18 +3102,20 @@ async def identity_remove(interaction: discord.Interaction, 角色: str):
     if not entry:
         await interaction.response.send_message("面板上没找到这个身份组。", ephemeral=True)
         return
+    await interaction.response.defer(ephemeral=True, thinking=True)
     settings = _role_claim_settings(interaction.guild.id)
     settings["roles"] = [e for e in (settings.get("roles") or []) if e is not entry]
     save_role_claims()
     role = _resolve_role(interaction.guild, entry.get("role_id"))
-    await _refresh_identity_card(interaction.guild)
+    refreshed = await _refresh_identity_card(interaction.guild)
     name = entry.get("label") or (role.name if role else entry.get("role_id"))
     await _audit_log(
         interaction.guild,
         "身份面板变更",
         f"**操作人:** {interaction.user.mention}\n**下架身份组:** {name}",
     )
-    await interaction.response.send_message(f"已把 **{name}** 从领取面板下架。", ephemeral=True)
+    extra = f"卡片已刷新到 {refreshed.mention}。" if refreshed else "没找到领取频道，先建一个再点 `/身份面板`。"
+    await interaction.followup.send(f"已把 **{name}** 从领取面板下架。{extra}", ephemeral=True)
 
 
 @bot.tree.command(name="身份列表", description="查看领取面板上配置了哪些身份组（仅岛主）")
@@ -6268,10 +6272,6 @@ def _ffmpeg_bin() -> Optional[str]:
     return shutil.which("ffmpeg")
 
 
-def _looks_like_stream_url(url: str) -> bool:
-    return bool(MUSIC_STREAM_RE.search(url or "") or MUSIC_BILI_RE.search(url or ""))
-
-
 def _music_state(guild_id) -> dict:
     key = str(guild_id)
     rec = music_data.get(key)
@@ -6363,13 +6363,13 @@ def _build_music_embed(state: dict) -> discord.Embed:
         start = page * MUSIC_PAGE_SIZE
         lines = []
         for i, track in enumerate(_music_page_tracks(state), start + 1):
-            kind = "链接" if track.get("kind") == "stream" else _format_size(track.get("size", 0))
+            kind = _format_size(track.get("size", 0))
             lines.append(
                 f"{i}. {track.get('title', '?')}  ·  {track.get('sharer_name', '?')}  ·  {kind}"
             )
         list_txt = "\n".join(lines)
     else:
-        list_txt = "歌单还空着。把 mp3 丢进这个频道，或发 B站 / YouTube / SoundCloud / 直接音频地址，就会进歌单。"
+        list_txt = "歌单还空着。把 mp3 / ogg / wav / m4a / flac / opus 丢进这个频道就会进歌单。"
     loop_mode = state.get("loop") or "off"
     loop_txt = {"off": "关", "all": "列表循环", "one": "单曲循环"}.get(loop_mode, "关")
     shuffle_txt = "开" if state.get("shuffle") else "关"
@@ -6406,7 +6406,7 @@ class PersistentMusicView(discord.ui.View):
         tracks = _music_page_tracks(state) if state else []
         options = []
         for i, track in enumerate(tracks[:25]):
-            kind = "链接" if track.get("kind") == "stream" else _format_size(track.get("size", 0))
+            kind = _format_size(track.get("size", 0))
             options.append(discord.SelectOption(
                 label=str(track.get("title") or "未命名")[:100],
                 description=f"{track.get('sharer_name', '?')} · {kind}"[:100],
@@ -6545,300 +6545,6 @@ def _commit_music_track(state: dict, track: dict) -> str:
     state.setdefault("tracks", []).append(track)
     state["page"] = _music_page_count(state) - 1
     save_music()
-    return ""
-
-
-class _MusicRejected(Exception):
-    """链接内容不像音乐，拒绝入库。消息会直接展示给用户。"""
-
-
-def _looks_like_bili_url(url: str) -> bool:
-    return bool(MUSIC_BILI_RE.search(url or ""))
-
-
-def load_bili_fingerprint():
-    """读取本地缓存的 B站 指纹，避免每次重启都重新领"""
-    global _bili_fingerprint
-    try:
-        if os.path.exists(BILI_FINGERPRINT_FILE):
-            with open(BILI_FINGERPRINT_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f) or {}
-            if isinstance(data, dict):
-                _bili_fingerprint = {
-                    "b_3": str(data.get("b_3") or ""),
-                    "b_4": str(data.get("b_4") or ""),
-                }
-    except Exception as e:
-        logger.warning(f"读取 B站 指纹缓存失败: {e}")
-
-
-def save_bili_fingerprint():
-    try:
-        with open(BILI_FINGERPRINT_FILE, "w", encoding="utf-8") as f:
-            json.dump(_bili_fingerprint, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        logger.warning(f"保存 B站 指纹缓存失败: {e}")
-
-
-def _bili_cookie_string() -> str:
-    """拼出最终 Cookie：用户配置的 BILI_COOKIE 优先，再补上自动领的 buvid3/buvid4"""
-    parts = []
-    configured = (BILI_COOKIE or "").strip().rstrip(";").strip()
-    if configured:
-        parts.append(configured)
-    lower = configured.lower()
-    if "buvid3=" not in lower and _bili_fingerprint.get("b_3"):
-        parts.append(f"buvid3={_bili_fingerprint['b_3']}")
-    if "buvid4=" not in lower and _bili_fingerprint.get("b_4"):
-        parts.append(f"buvid4={_bili_fingerprint['b_4']}")
-    return "; ".join(parts)
-
-
-def _bili_headers() -> dict:
-    headers = {
-        "User-Agent": BILI_UA,
-        "Referer": BILI_REFERER,
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Origin": "https://www.bilibili.com",
-        "Sec-Fetch-Dest": "empty",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Site": "same-site",
-    }
-    cookie = _bili_cookie_string()
-    if cookie:
-        headers["Cookie"] = cookie
-    return headers
-
-
-class _BiliRiskControl(Exception):
-    """B站 风控拦截（412 或返回 HTML 页），通常是机房 IP 被判定为异常流量"""
-
-
-async def _bili_ensure_fingerprint(session) -> None:
-    """没有 buvid3 的请求最容易被 412。这里用 SPI 接口自动领一份指纹并落盘复用。"""
-    global _bili_fingerprint
-    if _bili_fingerprint.get("b_3") or "buvid3=" in (BILI_COOKIE or "").lower():
-        return
-    try:
-        headers = _bili_headers()
-        async with session.get(f"{BILI_API}/x/frontend/finger/spi", headers=headers) as resp:
-            if resp.status != 200:
-                logger.warning(f"领取 B站 指纹失败: HTTP {resp.status}")
-                return
-            payload = json.loads(await resp.text())
-        data = payload.get("data") or {}
-        b_3 = str(data.get("b_3") or "")
-        b_4 = str(data.get("b_4") or "")
-        if b_3:
-            _bili_fingerprint = {"b_3": b_3, "b_4": b_4}
-            save_bili_fingerprint()
-            logger.info("已领取 B站 buvid3 指纹，后续请求会带上")
-    except Exception as e:
-        logger.warning(f"领取 B站 指纹异常: {e}")
-
-
-async def _bili_get_json(session, path: str, params: dict) -> dict:
-    """请求 B站 接口并解析 JSON，遇风控自动换头重试；失败抛 _BiliRiskControl"""
-    await _bili_ensure_fingerprint(session)
-    last_reason = "未知"
-    for attempt in range(BILI_FETCH_RETRIES):
-        try:
-            headers = _bili_headers()
-            if attempt:
-                # 重试时换一个 UA，规避按 UA 命中的风控
-                headers["User-Agent"] = BILI_UA.replace("Chrome/120.0.0.0", "Chrome/122.0.0.0")
-            async with session.get(f"{BILI_API}{path}", params=params, headers=headers) as resp:
-                status = resp.status
-                ctype = (resp.headers.get("Content-Type") or "").lower()
-                body = await resp.text()
-            if status in (412, 403) or "html" in ctype:
-                last_reason = f"B站风控（HTTP {status}）"
-                has_cookie = bool(_bili_cookie_string())
-                logger.warning(
-                    f"B站接口被风控: {path} status={status} ctype={ctype} "
-                    f"带Cookie={has_cookie} 配了SESSDATA={bool(BILI_COOKIE)} "
-                    f"有指纹={bool(_bili_fingerprint.get('b_3'))}"
-                )
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
-            try:
-                payload = json.loads(body)
-            except ValueError:
-                last_reason = "B站返回了无法解析的内容"
-                logger.warning(f"B站接口返回非 JSON: {path} status={status} 片段={body[:120]!r}")
-                await asyncio.sleep(1.0)
-                continue
-            if payload.get("code") == -412:
-                last_reason = "B站风控（code -412）"
-                await asyncio.sleep(1.5 * (attempt + 1))
-                continue
-            return payload
-        except aiohttp.ClientError as e:
-            last_reason = f"网络异常 {e.__class__.__name__}"
-            await asyncio.sleep(1.0)
-    raise _BiliRiskControl(last_reason)
-
-
-def _bili_bvid(url: str) -> str:
-    found = re.search(r"(BV[0-9A-Za-z]{10})", url or "")
-    return found.group(1) if found else ""
-
-
-def _bili_aid(url: str) -> str:
-    found = re.search(r"av(\d+)", url or "", re.IGNORECASE)
-    return found.group(1) if found else ""
-
-
-async def _bili_expand(url: str) -> str:
-    if not re.search(r"(b23\.tv|bili2233\.cn|acg\.tv)", url or "", re.IGNORECASE):
-        return url
-    timeout = aiohttp.ClientTimeout(total=15)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=_bili_headers()) as session:
-            async with session.get(url, allow_redirects=False) as resp:
-                return resp.headers.get("Location") or url
-    except Exception:
-        return url
-
-
-def _bili_pick_audio(dash: dict) -> str:
-    audios = (dash or {}).get("audio") or []
-    if not audios:
-        return ""
-    best = max(audios, key=lambda item: int(item.get("bandwidth") or 0))
-    return best.get("baseUrl") or best.get("base_url") or ""
-
-
-def _bili_looks_like_music(tid: int, title: str, caption: str) -> bool:
-    if any(word in (caption or "") for word in BILI_FORCE_WORDS):
-        return True
-    if tid in BILI_MUSIC_TIDS:
-        return True
-    text = (title or "").lower()
-    return any(word in text for word in BILI_MUSIC_WORDS)
-
-
-async def _resolve_bilibili(url: str, caption: str = "", enforce_filter: bool = True) -> tuple:
-    expanded = await _bili_expand(url)
-    bvid = _bili_bvid(expanded)
-    aid = _bili_aid(expanded)
-    if not bvid and not aid:
-        raise ValueError("这条 B站 链接里没找到视频号。")
-    timeout = aiohttp.ClientTimeout(total=25)
-    view_params = {"bvid": bvid} if bvid else {"aid": aid}
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            payload = await _bili_get_json(session, "/x/web-interface/view", view_params)
-            data = payload.get("data") or {}
-            if not data:
-                raise ValueError("B站 这条视频的信息没拿到，可能被风控了，稍后再试。")
-            title = (data.get("title") or "未命名")[:100]
-            tid = int(data.get("tid") or 0)
-            cid = int(data.get("cid") or 0)
-            if not cid:
-                pages = data.get("pages") or []
-                if pages:
-                    cid = int(pages[0].get("cid") or 0)
-            if not cid:
-                raise ValueError("这条 B站 视频没有可播的音轨。")
-            key = bvid or f"av{aid}"
-            if enforce_filter and not _bili_looks_like_music(tid, title, caption):
-                raise _MusicRejected(
-                    f"《{title}》看着不像音乐，没放进歌单。"
-                    "贝多芬只收 MV、歌曲、纯音乐这类；游戏解说、直播实况请等观影室。"
-                    "如果判错了，消息里带上「强制入库」再发一次。"
-                )
-            play_params = {
-                "bvid": bvid,
-                "cid": cid,
-                "fnval": 16,
-                "fnver": 0,
-                "fourk": 1,
-            }
-            if not bvid:
-                play_params.pop("bvid")
-                play_params["avid"] = aid
-            play = await _bili_get_json(session, "/x/player/playurl", play_params)
-    except _BiliRiskControl as e:
-        has_cookie = bool(_bili_cookie_string())
-        if has_cookie:
-            hint = "Cookie 已经带上了，还是被拦，说明这台机器的 IP 被 B站 拉黑了，换 IP 或过段时间再试。"
-        else:
-            hint = "让岛主在面板环境变量里填 BILI_COOKIE（值形如 SESSDATA=xx; buvid3=yy）就能稳定。"
-        raise ValueError(f"B站 把请求拦下来了（{e}）。{hint}") from e
-    play_data = play.get("data") or {}
-    stream_url = _bili_pick_audio(play_data.get("dash") or {})
-    if not stream_url:
-        durl = play_data.get("durl") or []
-        if durl:
-            stream_url = durl[0].get("url") or ""
-    if not stream_url:
-        raise ValueError("B站 这条视频拿不到可播音频，可能只对登录用户开放。")
-    webpage = f"https://www.bilibili.com/video/{key}"
-    # 指纹可能刚在请求过程中领到，这里重新取一次，保证播放音频时带上完整请求头
-    return title, stream_url, webpage, _bili_headers()
-
-
-async def _resolve_stream(url: str, caption: str = "", enforce_filter: bool = True) -> tuple:
-    if _looks_like_bili_url(url):
-        return await _resolve_bilibili(url, caption, enforce_filter)
-    return await asyncio.to_thread(_probe_stream_info, url)
-
-
-def _probe_stream_info(url: str) -> tuple:
-    import yt_dlp
-    opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True,
-        "format": "bestaudio/best",
-        "default_search": "auto",
-    }
-    cookiefile = (os.getenv("YTDLP_COOKIEFILE") or "").strip()
-    if cookiefile and os.path.isfile(cookiefile):
-        opts["cookiefile"] = cookiefile
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    if (info or {}).get("_type") == "playlist":
-        entries = [item for item in (info.get("entries") or []) if item]
-        info = entries[0] if entries else info
-    title = ((info or {}).get("title") or url or "未命名")[:100]
-    stream_url = (info or {}).get("url") or ""
-    webpage = (info or {}).get("webpage_url") or url
-    return title, stream_url, webpage, {}
-
-
-async def _add_stream_track(guild: discord.Guild, user, url: str, caption: str = "") -> str:
-    state = _music_state(guild.id)
-    if len(state.get("tracks") or []) >= MUSIC_MAX_TRACKS:
-        return "歌单满了，先下架几首再分享。"
-    try:
-        title, _stream, webpage, _headers = await _resolve_stream(url, caption)
-    except _MusicRejected as e:
-        return str(e)
-    except Exception as e:
-        # 用户侧只给一句可读原因，完整堆栈写进日志，避免把内部接口地址暴露到频道
-        reason = " ".join(str(e).split())[:160]
-        logger.warning(f"解析音乐链接失败 {url}: {e.__class__.__name__}: {e}", exc_info=True)
-        return f"这条链接解析失败：{reason}"
-    display = _music_caption_title(caption) or title
-    err = _commit_music_track(state, {
-        "id": secrets.token_hex(6),
-        "kind": "stream",
-        "title": display[:100],
-        "filename": "",
-        "path": "",
-        "url": webpage or url,
-        "size": 0,
-        "sharer_id": str(user.id),
-        "sharer_name": getattr(user, "display_name", None) or str(user),
-        "added_at": _beijing_now().isoformat(),
-    })
-    if err:
-        return err
-    await _refresh_music_card(guild, state)
     return ""
 
 
@@ -7015,85 +6721,17 @@ class MusicNameView(discord.ui.View):
         )
 
 
-def _filename_from_url(url: str) -> str:
-    path = unquote(urlparse(url).path or "")
-    name = os.path.basename(path.rstrip("/"))
-    if any(name.lower().endswith(ext) for ext in MUSIC_AUDIO_EXTS):
-        return name
-    return ""
-
-
-def _looks_like_audio_url(url: str) -> bool:
-    return bool(_filename_from_url(url))
-
-
-def _music_urls_in_text(text: str) -> list:
-    found = []
-    for raw in MUSIC_URL_RE.findall(text or ""):
-        url = raw.rstrip(".,;:!?)]}>\"'")
-        if url not in found:
-            found.append(url)
-    return found
-
-
-def _music_blocked_note(urls: list) -> str:
-    blocked = [url for url in urls if MUSIC_BLOCKED_RE.search(url)]
-    if not blocked:
-        return ""
-    return "网易云 / QQ 音乐 / 酷狗 / 酷我 / Spotify 页面链接不解析。YouTube、SoundCloud、B站 或直接音频地址可以入库。"
-
-
-async def _download_direct_audio(url: str):
-    filename = _filename_from_url(url)
-    if not filename:
-        return None, "不是直接音频地址。"
-    timeout = aiohttp.ClientTimeout(total=45)
-    headers = {"User-Agent": "Mozilla/5.0 Chen-Abot"}
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(url, allow_redirects=True) as resp:
-                if resp.status >= 400:
-                    return None, f"{filename} 下载失败（{resp.status}）。"
-                ctype = (resp.headers.get("Content-Type") or "").lower()
-                clen = resp.headers.get("Content-Length")
-                if clen and int(clen) > MUSIC_MAX_BYTES:
-                    return None, f"{filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
-                if ctype and not (
-                    ctype.startswith("audio/")
-                    or ctype in ("application/octet-stream", "binary/octet-stream")
-                    or "mpeg" in ctype
-                ):
-                    if not _looks_like_audio_url(str(resp.url)):
-                        return None, f"{filename} 看起来不是音频文件。"
-                data = bytearray()
-                async for chunk in resp.content.iter_chunked(64 * 1024):
-                    data.extend(chunk)
-                    if len(data) > MUSIC_MAX_BYTES:
-                        return None, f"{filename} 超过 {MUSIC_MAX_BYTES // (1024 * 1024)}MB，换小一点的。"
-                if not data:
-                    return None, f"{filename} 是空的。"
-                final_name = _filename_from_url(str(resp.url)) or filename
-                return (final_name, bytes(data)), ""
-    except Exception as e:
-        return None, f"{filename} 下载失败: {e}"
-
-
-async def _add_music_bytes(guild: discord.Guild, user, filename: str, data: bytes, caption: str = "") -> str:
-    return await _stage_music_bytes(guild, user, filename, data, caption)
-
-
 async def _ingest_music_message(message: discord.Message) -> bool:
     audio_atts = [att for att in (message.attachments or []) if _is_music_attachment(att)]
-    urls = _music_urls_in_text(message.content or "")
-    audio_urls = [url for url in urls if _looks_like_audio_url(url)]
-    stream_urls = [url for url in urls if _looks_like_stream_url(url)]
-    blocked_note = _music_blocked_note(urls)
-    if not audio_atts and not audio_urls and not stream_urls and not blocked_note:
+    text = (message.content or "").strip()
+    has_link = bool(MUSIC_URL_RE.search(text))
+    if not audio_atts and not has_link:
         return False
-    added = 0
     staged = 0
     errors = []
     caption = message.content or ""
+    if has_link and not audio_atts:
+        errors.append("贝多芬现在只收音频文件。把 mp3 / ogg / wav / m4a / flac / opus 直接丢进这个频道。")
     for att in audio_atts:
         try:
             err = await _add_music_track(message.guild, message.author, att, caption)
@@ -7104,53 +6742,18 @@ async def _ingest_music_message(message: discord.Message) -> bool:
             errors.append(err)
         else:
             staged += 1
-    for url in audio_urls:
-        try:
-            result, err = await _download_direct_audio(url)
-        except Exception as e:
-            logger.error(f"音频直链处理失败 {url}: {e}")
-            result, err = None, "这条音频地址处理失败，稍后重发一次。"
-        if err:
-            errors.append(err)
-            continue
-        filename, data = result
-        try:
-            err = await _add_music_bytes(message.guild, message.author, filename, data, caption)
-        except Exception as e:
-            logger.error(f"音频直链入库失败 {url}: {e}")
-            err = f"{filename} 处理失败，稍后重发一次。"
-        if err:
-            errors.append(err)
-        else:
-            staged += 1
-    for url in stream_urls:
-        try:
-            err = await _add_stream_track(message.guild, message.author, url, caption)
-        except Exception as e:
-            logger.error(f"流媒体链接处理失败 {url}: {e}")
-            err = "这条链接处理失败，稍后重发一次。"
-        if err:
-            errors.append(err)
-        else:
-            added += 1
-    if blocked_note:
-        errors.append(blocked_note)
     # 只有确实收下了东西才删原消息；全失败就把文件留在频道里让用户重试
-    if added or staged:
+    if staged:
         try:
             await message.delete()
         except Exception:
             pass
-    else:
+    elif audio_atts:
         errors.append("这条先留在频道里，重发一次或换个格式试试。")
-    note = []
-    if added:
-        note.append(f"已收入歌单 {added} 首。")
-    note.extend(errors)
-    if note:
+    if errors:
         try:
             await message.channel.send(
-                f"{message.author.mention} " + " ".join(note),
+                f"{message.author.mention} " + " ".join(errors),
                 delete_after=12,
             )
         except Exception:
@@ -7249,18 +6852,8 @@ async def _ensure_music_voice(guild: discord.Guild):
         return None, f"进音乐世家失败: {e}"
 
 
-def _ffmpeg_source(path_or_url: str, is_url: bool, headers: dict = None):
-    parts = []
-    if is_url:
-        parts.append("-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5")
-    if headers:
-        raw = "".join(f"{key}: {value}\r\n" for key, value in headers.items())
-        parts.append(f'-headers "{raw}"')
-    return discord.FFmpegPCMAudio(
-        path_or_url,
-        before_options=" ".join(parts) or None,
-        options="-vn",
-    )
+def _ffmpeg_source(path: str):
+    return discord.FFmpegPCMAudio(path, options="-vn")
 
 
 async def _mark_now_playing(guild: discord.Guild, track: dict, requester_name: str, voice: bool):
@@ -7346,27 +6939,14 @@ async def _start_voice_play(guild: discord.Guild, track: dict, requester) -> str
     vc, err = await _ensure_music_voice(guild)
     if err:
         return err
-    source_path = ""
-    is_url = False
-    stream_headers = {}
-    if track.get("kind") == "stream" or track.get("url"):
-        try:
-            _title, stream_url, _web, stream_headers = await _resolve_stream(
-                track.get("url"), enforce_filter=False
-            )
-        except Exception as e:
-            return f"链接失效或解析失败: {e}"
-        if not stream_url:
-            return "这条链接此刻没有可播的音频。"
-        source_path = stream_url
-        is_url = True
-    else:
-        path = track.get("path")
-        if not path or not os.path.isfile(path):
-            return "这首的文件丢了，先下架再重新分享。"
-        source_path = path
+    if track.get("kind") == "stream" or (track.get("url") and not track.get("path")):
+        return "外链点唱已经关掉了，把这首下架，重新丢一个音频文件进来。"
+    path = track.get("path")
+    if not path or not os.path.isfile(path):
+        return "这首的文件丢了，先下架再重新分享。"
+    source_path = path
     try:
-        source = _ffmpeg_source(source_path, is_url, stream_headers)
+        source = _ffmpeg_source(source_path)
     except Exception as e:
         return f"音频源打不开: {e}"
     if vc.is_playing() or vc.is_paused():
@@ -9708,17 +9288,14 @@ if __name__ == "__main__":
         bot.add_view(PersistentStoryEntryView())
         bot.add_view(PersistentStoryPostView())
         bot.add_view(PersistentInviteView())
+        bot.add_dynamic_items(IdentityToggleItem)
 
         # 启动心跳任务
         bot.heartbeat_task = asyncio.create_task(heartbeat())
         bot.music_idle_task = asyncio.create_task(_music_idle_watchdog())
 
         logger.info("🚀 正在启动 Chen-Abot...")
-        logger.info(
-            f"构建标记: BILI_COOKIE={'已配置' if BILI_COOKIE else '未配置'}　"
-            f"指纹={_bili_fingerprint.get('b_3')[:12] or '无'}　"
-            f"缓存文件: {INVITE_CACHE_FILE}"
-        )
+        logger.info(f"构建标记: 身份卡动态按钮已注册　缓存文件: {INVITE_CACHE_FILE}")
         try:
             await bot.start(token)
         except discord.LoginFailure as e:
