@@ -55,7 +55,10 @@ def test_empty_card():
     check(embed.title == "🎭 领身份组", f"卡片标题: {embed.title}")
     check("还没配置" in embed.description, "空面板提示去 /添加身份")
     view = m.PersistentIdentityView(guild)
-    check(len(view.children) == 0, f"空面板无按钮: {len(view.children)}")
+    check(len(view.children) == 1, f"空面板仍有一个禁用下拉: {len(view.children)}")
+    sel = view.children[0]
+    check(sel.custom_id == "identity_select", f"空面板 custom_id: {sel.custom_id}")
+    check(sel.disabled is True, "空面板下拉禁用")
 
 
 def test_card_with_roles():
@@ -78,12 +81,12 @@ def test_card_with_roles():
     check("晚睡的来" in embed.description, "说明出现在卡片")
     check("2 人" in embed.description, "人数统计")
     view = m.PersistentIdentityView(guild)
-    check(len(view.children) == 2, f"两个身份对应两个按钮: {len(view.children)}")
-    ids = []
-    for child in view.children:
-        inner = getattr(child, "item", child)
-        ids.append(getattr(inner, "custom_id", None) or getattr(child, "custom_id", None))
-    check(ids == ["identity_toggle:111", "identity_toggle:222"], f"custom_id: {ids}")
+    check(len(view.children) == 1, f"两个身份合成一个下拉: {len(view.children)}")
+    sel = view.children[0]
+    check(sel.custom_id == "identity_select", f"custom_id: {sel.custom_id}")
+    check(sel.disabled is False, "有身份时下拉可用")
+    values = [opt.value for opt in sel.options]
+    check(values == ["111", "222"], f"选项值: {values}")
     check(view.timeout is None, "视图无超时")
 
 
@@ -120,6 +123,11 @@ def test_no_stream_helpers():
     check(not hasattr(m, "_resolve_bilibili"), "已移除 B站解析")
     check(not hasattr(m, "_add_stream_track"), "已移除流媒体入库")
     check(not hasattr(m, "_probe_stream_info"), "已移除 yt-dlp 探测")
+    check(not hasattr(m, "IdentityToggleItem"), "已移除动态按钮")
+    check(not hasattr(m, "_refresh_published_card"), "已移除未调用的发布卡刷新")
+    check(not hasattr(m, "_is_subscribed"), "已移除未调用的订阅查询")
+    check(not hasattr(m, "_role_button_style"), "已移除按钮样式")
+    check(not hasattr(m, "_parse_emoji"), "已移除按钮表情解析")
 
 
 test_empty_card()

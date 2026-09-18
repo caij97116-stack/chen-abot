@@ -117,8 +117,7 @@ INVITE_CACHE_FILE = "invite_cache.json"
 SUBSCRIBE_FILE = "subscribe_data.json"
 ROLE_CLAIM_FILE = "role_data.json"
 ROLE_CLAIM_CHANNEL_KEYWORD = "身份"   # 领取身份组频道关键词
-ROLE_CLAIM_MAX = 25                    # 一张卡最多几个按钮
-ROLE_CLAIM_STYLES = ("primary", "secondary", "success", "danger")
+ROLE_CLAIM_MAX = 25                    # 下拉框最多几个身份组
 INVITE_DEFAULT_HOURS = 168
 INVITE_MAX_HOURS = 168
 INVITE_MAX_USES_LIMIT = 100
@@ -956,11 +955,6 @@ def _subscribe_map(guild_id) -> dict:
         rec = {}
         subscribe_data[str(guild_id)] = rec
     return rec
-
-
-def _is_subscribed(guild_id, subscriber_id, uploader_id) -> bool:
-    subs = _subscribe_map(guild_id).get(str(uploader_id)) or []
-    return str(subscriber_id) in {str(x) for x in subs}
 
 
 def _toggle_subscription(guild_id, subscriber_id, uploader_id) -> bool:
@@ -2775,30 +2769,11 @@ def _role_entry_of(guild_id, key) -> dict:
     return None
 
 
-def _role_button_style(name):
-    return {
-        "primary": discord.ButtonStyle.primary,
-        "secondary": discord.ButtonStyle.secondary,
-        "success": discord.ButtonStyle.success,
-        "danger": discord.ButtonStyle.danger,
-    }.get(str(name or "").lower(), discord.ButtonStyle.secondary)
-
-
-def _parse_emoji(raw):
-    raw = (raw or "").strip()
-    if not raw:
-        return None
-    try:
-        return discord.PartialEmoji.from_str(raw)
-    except Exception:
-        return None
-
-
 def _build_role_claim_embed(guild: discord.Guild) -> discord.Embed:
     settings = _role_claim_settings(guild.id)
     entries = settings.get("roles") or []
     lines = [
-        "这里是领身份组的地方。点下面的按钮戴上，再点一次摘掉。",
+        "这里是领身份组的地方。从下面的菜单里选一个，戴上或摘掉。",
         "",
     ]
     if not entries:
@@ -2820,53 +2795,47 @@ def _build_role_claim_embed(guild: discord.Guild) -> discord.Embed:
     return embed
 
 
-class IdentityToggleItem(
-    discord.ui.DynamicItem[discord.ui.Button],
-    template=r"identity_toggle:(?P<role_id>\d+)",
-):
-    """动态按钮：重启后凭 custom_id 还原，不必每次 add_view。"""
-
-    def __init__(self, role_id: str, label: str = "身份组", emoji=None, style=discord.ButtonStyle.secondary, row: int = 0):
-        super().__init__(
-            discord.ui.Button(
-                label=(label or "身份组")[:80],
-                emoji=emoji,
-                style=style,
-                custom_id=f"identity_toggle:{role_id}",
-                row=row,
-            )
-        )
-        self.role_id = str(role_id)
-
-    @classmethod
-    async def from_custom_id(cls, interaction: discord.Interaction, item: discord.ui.Button, match: re.Match[str]):
-        return cls(match.group("role_id"))
-
-    async def callback(self, interaction: discord.Interaction):
-        await _do_identity_toggle(interaction, self.role_id)
-
-
 class PersistentIdentityView(discord.ui.View):
-    """领取身份组常驻卡。按钮随配置动态生成。"""
+    """领取身份组常驻卡。下拉框用固定 custom_id，和歌单同一套刷新方式。"""
 
     def __init__(self, guild: discord.Guild = None):
         super().__init__(timeout=None)
-        if guild is None:
+        options = []
+        if guild is not None:
+            settings = _role_claim_settings(guild.id)
+            for entry in (settings.get("roles") or [])[:ROLE_CLAIM_MAX]:
+                role_id = str(entry.get("role_id") or "")
+                if not role_id:
+                    continue
+                role = _resolve_role(guild, role_id)
+                label = entry.get("label") or (role.name if role else "身份组")
+                gate = "需过审" if entry.get("need_pass", True) else "人人可领"
+                options.append(discord.SelectOption(
+                    label=str(label)[:100],
+                    description=gate,
+                    value=role_id,
+                ))
+        select = discord.ui.Select(
+            placeholder="选择要领取或摘下的身份组" if options else "岛主还没配置身份组",
+            options=options or [discord.SelectOption(label="暂无可领身份", value="none")],
+            min_values=1,
+            max_values=1,
+            row=0,
+            custom_id="identity_select",
+        )
+        if not options:
+            select.disabled = True
+        select.callback = self.on_select
+        self.add_item(select)
+
+    async def on_select(self, interaction: discord.Interaction):
+        values = []
+        if hasattr(interaction, "data") and interaction.data:
+            values = list(interaction.data.get("values") or [])
+        if not values or values[0] == "none":
+            await interaction.response.defer()
             return
-        settings = _role_claim_settings(guild.id)
-        for i, entry in enumerate((settings.get("roles") or [])[:ROLE_CLAIM_MAX]):
-            role_id = str(entry.get("role_id") or "")
-            if not role_id:
-                continue
-            role = _resolve_role(guild, role_id)
-            label = entry.get("label") or (role.name if role else "身份组")
-            emoji = _parse_emoji(entry.get("emoji"))
-            style = _role_button_style(entry.get("style"))
-            try:
-                item = IdentityToggleItem(role_id, label, emoji, style, row=i // 5)
-            except Exception:
-                item = IdentityToggleItem(role_id, label, None, style, row=i // 5)
-            self.add_item(item)
+        await _do_identity_toggle(interaction, values[0])
 
 
 async def _do_identity_toggle(interaction: discord.Interaction, role_id: str):
@@ -2923,11 +2892,11 @@ async def _do_identity_toggle(interaction: discord.Interaction, role_id: str):
     )
 
 
-async def _refresh_identity_card(guild: discord.Guild):
-    """刷新身份卡文案和按钮。动态按钮靠消息上的 View 生效，不走 bot.add_view。"""
+async def _refresh_identity_card(guild: discord.Guild, fallback_channel=None):
+    """刷新身份卡。优先发到名称含「身份」的频道；找不到就用 fallback。"""
     if not guild:
         return None
-    channel = _role_claim_channel_of(guild)
+    channel = _role_claim_channel_of(guild) or fallback_channel
     if not channel:
         logger.warning(f"[{guild.name}] 找不到领取身份频道（名称需含「{ROLE_CLAIM_CHANNEL_KEYWORD}」）")
         return None
@@ -2935,7 +2904,8 @@ async def _refresh_identity_card(guild: discord.Guild):
     view = PersistentIdentityView(guild)
     embed = _build_role_claim_embed(guild)
     msg_id = str(settings.get("card_message_id") or "").strip()
-    if msg_id:
+    saved_ch = str(settings.get("channel_id") or "")
+    if msg_id and saved_ch == str(channel.id):
         try:
             msg = await channel.fetch_message(int(msg_id))
             await msg.edit(embed=embed, view=view)
@@ -2991,15 +2961,8 @@ async def identity_panel(interaction: discord.Interaction):
     if not interaction.guild:
         await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
         return
-    channel = _role_claim_channel_of(interaction.guild)
-    if not channel:
-        await interaction.response.send_message(
-            f"没找到名称含「{ROLE_CLAIM_CHANNEL_KEYWORD}」的文字频道，先建一个。",
-            ephemeral=True,
-        )
-        return
     await interaction.response.defer(ephemeral=True, thinking=True)
-    refreshed = await _refresh_identity_card(interaction.guild)
+    refreshed = await _refresh_identity_card(interaction.guild, fallback_channel=interaction.channel)
     if refreshed:
         await interaction.followup.send(f"身份卡已刷新到 {refreshed.mention}。", ephemeral=True)
     else:
@@ -3009,20 +2972,12 @@ async def identity_panel(interaction: discord.Interaction):
 @bot.tree.command(name="添加身份", description="把一个身份组加到领取面板（仅岛主）")
 @app_commands.describe(
     角色="要开放的身份组",
-    显示名="按钮上显示的名字，留空用身份组名",
+    显示名="菜单上显示的名字，留空用身份组名",
     说明="卡片里的一句话说明，可留空",
-    表情="按钮小图标，可留空",
-    样式="按钮颜色，默认灰色",
     必过审="是否要求先答题过关，默认需要",
 )
 @app_commands.autocomplete(角色=_identity_role_autocomplete)
 @app_commands.choices(
-    样式=[
-        app_commands.Choice(name="蓝色", value="primary"),
-        app_commands.Choice(name="灰色", value="secondary"),
-        app_commands.Choice(name="绿色", value="success"),
-        app_commands.Choice(name="红色", value="danger"),
-    ],
     必过审=[
         app_commands.Choice(name="需要过审", value="yes"),
         app_commands.Choice(name="人人可领", value="no"),
@@ -3033,8 +2988,6 @@ async def identity_add(
     角色: str,
     显示名: str = "",
     说明: str = "",
-    表情: str = "",
-    样式: app_commands.Choice[str] = None,
     必过审: app_commands.Choice[str] = None,
 ):
     if not _is_island_owner(interaction):
@@ -3060,13 +3013,11 @@ async def identity_add(
         "role_id": str(role.id),
         "label": " ".join((显示名 or "").split())[:80],
         "description": " ".join((说明 or "").split())[:100],
-        "emoji": (表情 or "").strip()[:50],
-        "style": (样式.value if 样式 else "secondary"),
         "need_pass": (必过审.value != "no") if 必过审 else True,
     }
     entries.append(entry)
     save_role_claims()
-    refreshed = await _refresh_identity_card(interaction.guild)
+    refreshed = await _refresh_identity_card(interaction.guild, fallback_channel=interaction.channel)
     await _audit_log(
         interaction.guild,
         "身份面板变更",
@@ -3079,7 +3030,7 @@ async def identity_add(
         )
     else:
         await interaction.followup.send(
-            f"已记下 **{role.name}**，但没找到名称含「{ROLE_CLAIM_CHANNEL_KEYWORD}」的频道，先建一个再点 `/身份面板`。",
+            f"已记下 **{role.name}**，但卡片没发出去。再点一次 `/身份面板`。",
             ephemeral=True,
         )
 
@@ -3107,14 +3058,14 @@ async def identity_remove(interaction: discord.Interaction, 角色: str):
     settings["roles"] = [e for e in (settings.get("roles") or []) if e is not entry]
     save_role_claims()
     role = _resolve_role(interaction.guild, entry.get("role_id"))
-    refreshed = await _refresh_identity_card(interaction.guild)
+    refreshed = await _refresh_identity_card(interaction.guild, fallback_channel=interaction.channel)
     name = entry.get("label") or (role.name if role else entry.get("role_id"))
     await _audit_log(
         interaction.guild,
         "身份面板变更",
         f"**操作人:** {interaction.user.mention}\n**下架身份组:** {name}",
     )
-    extra = f"卡片已刷新到 {refreshed.mention}。" if refreshed else "没找到领取频道，先建一个再点 `/身份面板`。"
+    extra = f"卡片已刷新到 {refreshed.mention}。" if refreshed else "卡片没发出去，再点一次 `/身份面板`。"
     await interaction.followup.send(f"已把 **{name}** 从领取面板下架。{extra}", ephemeral=True)
 
 
@@ -3823,33 +3774,6 @@ def _find_channel_file_bundle(channel_id, uploader_id):
         published.sort(key=lambda x: x[1].get("upload_time", ""), reverse=True)
         return published[0]
     return None, None
-
-
-async def _refresh_published_card(interaction: discord.Interaction, file_id: str, record: dict):
-    channel_id = str(interaction.channel.id)
-    embed, view = _build_published_card(record, file_id)
-    pub = channel_published.get(channel_id)
-    if pub:
-        try:
-            old_msg = await interaction.channel.fetch_message(int(pub["message_id"]))
-            await old_msg.edit(embed=embed, view=view)
-            record["published_msg_id"] = str(old_msg.id)
-            save_records()
-            return
-        except Exception:
-            try:
-                old_msg = await interaction.channel.fetch_message(int(pub["message_id"]))
-                await old_msg.delete()
-            except Exception:
-                pass
-    pub_msg = await interaction.channel.send(embed=embed, view=view)
-    record["published_msg_id"] = str(pub_msg.id)
-    channel_published[channel_id] = {
-        "message_id": str(pub_msg.id),
-        "file_id": file_id,
-    }
-    save_records()
-    save_channel_published()
 
 
 async def _publish_file(interaction: discord.Interaction, file_id: str, record: dict):
@@ -9288,14 +9212,14 @@ if __name__ == "__main__":
         bot.add_view(PersistentStoryEntryView())
         bot.add_view(PersistentStoryPostView())
         bot.add_view(PersistentInviteView())
-        bot.add_dynamic_items(IdentityToggleItem)
+        bot.add_view(PersistentIdentityView())
 
         # 启动心跳任务
         bot.heartbeat_task = asyncio.create_task(heartbeat())
         bot.music_idle_task = asyncio.create_task(_music_idle_watchdog())
 
         logger.info("🚀 正在启动 Chen-Abot...")
-        logger.info(f"构建标记: 身份卡动态按钮已注册　缓存文件: {INVITE_CACHE_FILE}")
+        logger.info(f"构建标记: 身份卡固定下拉已注册　缓存文件: {INVITE_CACHE_FILE}")
         try:
             await bot.start(token)
         except discord.LoginFailure as e:
