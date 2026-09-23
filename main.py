@@ -1436,8 +1436,43 @@ def _build_storage_card_embed(file_id: str, record: dict) -> discord.Embed:
     return embed
 
 
-async def _upsert_storage_card(guild: discord.Guild, file_id: str, record: dict):
+def _storage_channel_of(guild: discord.Guild):
     if not guild:
+        return None
+    cid = storage_channels.get(str(guild.id))
+    if cid:
+        try:
+            channel = guild.get_channel(int(cid))
+        except Exception:
+            channel = None
+        if channel:
+            return channel
+    for channel in getattr(guild, "text_channels", []) or []:
+        if "文件存储" in (channel.name or ""):
+            return channel
+    return None
+
+
+async def _delete_storage_card(guild: discord.Guild, record: dict):
+    msg_id = str((record or {}).get("storage_card_msg_id") or "")
+    if record is not None:
+        record["storage_card_msg_id"] = None
+    if not guild or not msg_id:
+        return
+    channel = _storage_channel_of(guild)
+    if not channel:
+        return
+    try:
+        msg = await channel.fetch_message(int(msg_id))
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def _upsert_storage_card(guild: discord.Guild, file_id: str, record: dict):
+    if not guild or not record:
+        return
+    if record.get("status") != "published":
         return
     channel = await get_or_create_storage_channel(guild)
     embed = _build_storage_card_embed(file_id, record)
@@ -1453,6 +1488,24 @@ async def _upsert_storage_card(guild: discord.Guild, file_id: str, record: dict)
     msg = await channel.send(embed=embed, view=view)
     record["storage_card_msg_id"] = str(msg.id)
     save_records()
+
+
+async def _prune_unpublished_storage_cards():
+    """草稿阶段不再出存储卡。启动时把以前误发的草稿卡清掉。"""
+    changed = False
+    for guild in bot.guilds:
+        for rec in list(file_records.values()):
+            if str(rec.get("guild_id")) != str(guild.id):
+                continue
+            if rec.get("status") == "published":
+                continue
+            if not rec.get("storage_card_msg_id"):
+                continue
+            await _delete_storage_card(guild, rec)
+            rec["storage_card_msg_id"] = None
+            changed = True
+    if changed:
+        save_records()
 
 
 def _resource_download_logs(file_id: str, record: dict) -> list:
@@ -2062,6 +2115,7 @@ async def on_ready():
     load_role_claims()
     _install_slash_rate_limit()
     _ensure_file_store()
+    await _prune_unpublished_storage_cards()
     for guild in bot.guilds:
         await _seed_invite_cache(guild)
         me = guild.me
@@ -3233,7 +3287,6 @@ async def _ingest_uploaded_files(
     description: str = "",
     password: Optional[str] = None,
 ):
-    await get_or_create_storage_channel(interaction.guild)
     attachment_records = []
     total_size = 0
 
@@ -3272,7 +3325,6 @@ async def _ingest_uploaded_files(
         })
         _ensure_resource_code(existing)
         save_records()
-        await _upsert_storage_card(interaction.guild, existing_id, existing)
         await _show_draft_setup(interaction, existing_id, has_previous=True)
         return
 
@@ -3302,7 +3354,6 @@ async def _ingest_uploaded_files(
         "storage_card_msg_id": None,
     }
     save_records()
-    await _upsert_storage_card(interaction.guild, draft_id, file_records[draft_id])
     await _show_draft_setup(interaction, draft_id, has_previous=False)
 
 
@@ -3429,12 +3480,21 @@ class DraftSetupView(discord.ui.View):
             return
 
         await interaction.response.defer(ephemeral=True)
-        await _publish_file(interaction, self.file_id, record)
-
-        # 禁用所有按钮
+        ok = False
+        try:
+            ok = await _publish_file(interaction, self.file_id, record)
+        except Exception as e:
+            logger.error(f"快速发布异常: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ 发布失败: {e}", ephemeral=True)
+            return
+        if not ok:
+            return
         self.disable_all_items()
-        if hasattr(self, "message") and self.message:
-            await self.message.edit(view=self)
+        if getattr(self, "message", None):
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
 
     async def on_timeout(self):
         self.disable_all_items()
@@ -3507,7 +3567,8 @@ async def _pack_attachments_to_zip(interaction: discord.Interaction, file_id: st
     record["size"] = total_zip_size
     _ensure_resource_code(record)
     save_records()
-    await _upsert_storage_card(interaction.guild, file_id, record)
+    if record.get("status") == "published":
+        await _upsert_storage_card(interaction.guild, file_id, record)
 
     await interaction.followup.send(
         f"已将 {len(attachments)} 个附件整合为 **{zip_name}** ({_format_size(total_zip_size)})",
@@ -3602,7 +3663,8 @@ class RenameFileModal(discord.ui.Modal, title="修改文件标题"):
             return
         record["name"] = self.new_name.value.strip()
         save_records()
-        await _upsert_storage_card(interaction.guild, self.file_id, record)
+        if record.get("status") == "published":
+            await _upsert_storage_card(interaction.guild, self.file_id, record)
         await interaction.response.send_message(
             f"文件标题已修改为：**{record['name']}**",
             ephemeral=True,
@@ -3639,7 +3701,8 @@ class RenameAttachmentsModal(discord.ui.Modal, title="修改附件名称"):
                 record["attachments"][i]["custom_name"] = field.value.strip()
                 changed.append(field.value.strip())
         save_records()
-        await _upsert_storage_card(interaction.guild, self.file_id, record)
+        if record.get("status") == "published":
+            await _upsert_storage_card(interaction.guild, self.file_id, record)
         await interaction.response.send_message(
             f"已更新 {len(changed)} 个附件名称",
             ephemeral=True,
@@ -3702,7 +3765,11 @@ async def _show_publish_preview(interaction: discord.Interaction, file_id: str):
     embed.set_footer(text="确认无误后点击「确认发布」")
 
     view = PublishConfirmView(file_id, interaction.user.id)
-    view.message = await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+    try:
+        view.message = await interaction.original_response()
+    except Exception:
+        view.message = None
 
 
 class PublishConfirmView(discord.ui.View):
@@ -3726,13 +3793,22 @@ class PublishConfirmView(discord.ui.View):
             await interaction.followup.send("文件记录已丢失。", ephemeral=True)
             return
 
-        # 发布！
-        await _publish_file(interaction, self.file_id, record)
+        ok = False
+        try:
+            ok = await _publish_file(interaction, self.file_id, record)
+        except Exception as e:
+            logger.error(f"确认发布异常: {e}", exc_info=True)
+            await interaction.followup.send(f"❌ 发布失败: {e}", ephemeral=True)
+            return
+        if not ok:
+            return
 
-        # 禁用按钮
         self.disable_all_items()
-        if hasattr(self, "message") and self.message:
-            await self.message.edit(view=self)
+        if getattr(self, "message", None):
+            try:
+                await self.message.edit(view=self)
+            except Exception:
+                pass
 
     @discord.ui.button(label="↩️ 返回修改", style=discord.ButtonStyle.secondary)
     async def back_to_setup(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -3776,45 +3852,82 @@ def _find_channel_file_bundle(channel_id, uploader_id):
     return None, None
 
 
-async def _publish_file(interaction: discord.Interaction, file_id: str, record: dict):
-    """发布文件到频道：删除旧发布卡片，创建新卡片"""
+async def _refresh_published_card(interaction: discord.Interaction, file_id: str, record: dict):
     channel_id = str(interaction.channel.id)
+    embed, view = _build_published_card(record, file_id)
+    pub = channel_published.get(channel_id)
+    if pub:
+        try:
+            old_msg = await interaction.channel.fetch_message(int(pub["message_id"]))
+            await old_msg.edit(embed=embed, view=view)
+            record["published_msg_id"] = str(old_msg.id)
+            save_records()
+            return
+        except Exception:
+            try:
+                old_msg = await interaction.channel.fetch_message(int(pub["message_id"]))
+                await old_msg.delete()
+            except Exception:
+                pass
+    pub_msg = await interaction.channel.send(embed=embed, view=view)
+    record["published_msg_id"] = str(pub_msg.id)
+    channel_published[channel_id] = {
+        "message_id": str(pub_msg.id),
+        "file_id": file_id,
+    }
+    save_records()
+    save_channel_published()
 
-    # 删除该频道之前的发布卡片
+
+async def _publish_file(interaction: discord.Interaction, file_id: str, record: dict) -> bool:
+    """发布文件到频道：先发出公开卡，成功后才写存储卡。"""
+    channel_id = str(interaction.channel.id)
     old_pub = channel_published.get(channel_id)
-    if old_pub:
+    embed, view = _build_published_card(record, file_id)
+    try:
+        pub_msg = await interaction.channel.send(embed=embed, view=view)
+    except Exception as e:
+        logger.error(f"公开卡片发送失败: {e}", exc_info=True)
+        await interaction.followup.send(f"❌ 公开卡片发不出去：{e}", ephemeral=True)
+        return False
+
+    record["status"] = "published"
+    record["published_msg_id"] = str(pub_msg.id)
+    channel_published[channel_id] = {
+        "message_id": str(pub_msg.id),
+        "file_id": file_id,
+    }
+    save_records()
+    save_channel_published()
+
+    if old_pub and str(old_pub.get("message_id") or "") != str(pub_msg.id):
         try:
             old_msg = await interaction.channel.fetch_message(int(old_pub["message_id"]))
             await old_msg.delete()
         except Exception:
             pass
 
-    record["status"] = "published"
-    save_records()
-
-    # 创建公开卡片
-    embed, view = _build_published_card(record, file_id)
-
+    extras = []
     try:
-        pub_msg = await interaction.channel.send(embed=embed, view=view)
-        record["published_msg_id"] = str(pub_msg.id)
-        channel_published[channel_id] = {
-            "message_id": str(pub_msg.id),
-            "file_id": file_id,
-        }
-        save_records()
-        save_channel_published()
         await _upsert_storage_card(interaction.guild, file_id, record)
-        await _upsert_subscribe_card(interaction.channel, record)
-        await _notify_subscribers(interaction.guild, record, pub_msg.jump_url)
-
-        await interaction.followup.send(
-            f"文件 **{record['name']}** 已发布到频道！",
-            ephemeral=True,
-        )
     except Exception as e:
-        logger.error(f"发布文件失败: {e}")
-        await interaction.followup.send(f"❌ 发布失败: {e}", ephemeral=True)
+        logger.error(f"写存储卡失败: {e}", exc_info=True)
+        extras.append(f"存储卡没写上：{e}")
+    try:
+        await _upsert_subscribe_card(interaction.channel, record)
+    except Exception as e:
+        logger.error(f"写订阅卡失败: {e}", exc_info=True)
+        extras.append(f"订阅卡没写上：{e}")
+    try:
+        await _notify_subscribers(interaction.guild, record, pub_msg.jump_url)
+    except Exception as e:
+        logger.warning(f"通知订阅者失败: {e}")
+
+    text = f"文件 **{record['name']}** 已发布到频道！"
+    if extras:
+        text += "\n" + "\n".join(extras)
+    await interaction.followup.send(text, ephemeral=True)
+    return True
 
 
 # ─── 公开卡片构建 ───
@@ -8612,7 +8725,8 @@ def _collect_protected_message_ids() -> set:
             add(mid)
 
     for rec in file_records.values():
-        add(rec.get("storage_card_msg_id"))
+        add(rec.get("subscribe_msg_id"))
+        add(rec.get("published_msg_id"))
     for pub in channel_published.values():
         add((pub or {}).get("message_id"))
     for rec in report_data.values():
@@ -8631,9 +8745,11 @@ def _collect_protected_message_ids() -> set:
     return protected
 
 
-def _is_protected_message(msg: discord.Message, protected_ids: set) -> bool:
+def _is_protected_message(msg: discord.Message, protected_ids: set, keep_bot_cards: bool = True) -> bool:
     if str(msg.id) in protected_ids:
         return True
+    if not keep_bot_cards:
+        return False
     if msg.author.id == bot.user.id:
         if msg.pinned:
             return True
@@ -8645,7 +8761,7 @@ def _is_protected_message(msg: discord.Message, protected_ids: set) -> bool:
     return False
 
 
-async def _wipe_channel_messages(channel, protected: set = None) -> int:
+async def _wipe_channel_messages(channel, protected: set = None, keep_bot_cards: bool = True) -> int:
     if channel is None:
         return 0
     protected_ids = {str(x) for x in (protected or set()) if x}
@@ -8659,7 +8775,7 @@ async def _wipe_channel_messages(channel, protected: set = None) -> int:
             if not raw:
                 break
             before = raw[-1]
-            targets = [m for m in raw if not _is_protected_message(m, protected_ids)]
+            targets = [m for m in raw if not _is_protected_message(m, protected_ids, keep_bot_cards)]
             if targets:
                 try:
                     await channel.delete_messages(targets)
@@ -8714,6 +8830,7 @@ def _purge_guild_files(guild_id: str, extra_channel_ids=None):
 CLEANUP_ITEM_OPTIONS = [
     discord.SelectOption(label="举报工单与子区（含编号重置）", value="threads"),
     discord.SelectOption(label="帖子公开卡片", value="cards"),
+    discord.SelectOption(label="文件存储卡片（含未发布草稿）", value="storage"),
     discord.SelectOption(label="资源码 / 下载人码 / 下载记录重置", value="codes"),
 ]
 
@@ -8868,6 +8985,31 @@ async def _run_cleanup(guild: discord.Guild, items: set, channel_ids: set) -> st
         save_channel_published()
         lines.append(f"已删除帖子公开卡片 {deleted_cards} 张")
 
+    if "storage" in items:
+        storage_channel = _storage_channel_of(guild)
+        wiped_cards = 0
+        dropped_drafts = 0
+        for fid, rec in list(file_records.items()):
+            if str(rec.get("guild_id")) != guild_id:
+                continue
+            if rec.get("storage_card_msg_id"):
+                await _delete_storage_card(guild, rec)
+                rec["storage_card_msg_id"] = None
+                wiped_cards += 1
+            if rec.get("status") != "published":
+                _delete_record_files(rec)
+                file_records.pop(fid, None)
+                dropped_drafts += 1
+        save_records()
+        extra_wiped = 0
+        if storage_channel:
+            extra_wiped = await _wipe_channel_messages(storage_channel, set(), keep_bot_cards=False)
+        lines.append(
+            f"已清文件存储卡 {wiped_cards} 张"
+            + (f"，未发布草稿 {dropped_drafts} 份" if dropped_drafts else "")
+            + (f"，频道里额外清掉 {extra_wiped} 条" if extra_wiped else "")
+        )
+
     if channel_ids:
         protected = _collect_protected_message_ids()
         cleared_total = 0
@@ -8877,10 +9019,14 @@ async def _run_cleanup(guild: discord.Guild, items: set, channel_ids: set) -> st
             if channel is None:
                 continue
             cleared_channels += 1
-            cleared_total += await _wipe_channel_messages(channel, protected)
+            keep_cards = True
+            name = channel.name or ""
+            if "文件存储" in name:
+                keep_cards = False
+            cleared_total += await _wipe_channel_messages(channel, protected, keep_bot_cards=keep_cards)
         lines.append(
             f"已清空 {cleared_channels} 个频道，共 {cleared_total} 条消息"
-            "（机器人常驻卡和置顶消息已保留）"
+            "（常驻卡保留；文件存储频道整清）"
         )
 
     if "codes" in items:
