@@ -3479,13 +3479,15 @@ class DraftSetupView(discord.ui.View):
             await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
         ok = False
         try:
             ok = await _publish_file(interaction, self.file_id, record)
         except Exception as e:
             logger.error(f"快速发布异常: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ 发布失败: {e}", ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ 发布失败: {e}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ 发布失败: {e}", ephemeral=True)
             return
         if not ok:
             return
@@ -3786,11 +3788,9 @@ class PublishConfirmView(discord.ui.View):
             await interaction.response.send_message("只有上传者才能发布。", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True)
-
         record = file_records.get(self.file_id)
         if not record:
-            await interaction.followup.send("文件记录已丢失。", ephemeral=True)
+            await interaction.response.send_message("文件记录已丢失。", ephemeral=True)
             return
 
         ok = False
@@ -3798,7 +3798,10 @@ class PublishConfirmView(discord.ui.View):
             ok = await _publish_file(interaction, self.file_id, record)
         except Exception as e:
             logger.error(f"确认发布异常: {e}", exc_info=True)
-            await interaction.followup.send(f"❌ 发布失败: {e}", ephemeral=True)
+            if interaction.response.is_done():
+                await interaction.followup.send(f"❌ 发布失败: {e}", ephemeral=True)
+            else:
+                await interaction.response.send_message(f"❌ 发布失败: {e}", ephemeral=True)
             return
         if not ok:
             return
@@ -3852,6 +3855,63 @@ def _find_channel_file_bundle(channel_id, uploader_id):
     return None, None
 
 
+def _bot_send_gap(channel) -> str:
+    guild = getattr(channel, "guild", None)
+    me = getattr(guild, "me", None) if guild else None
+    if not channel or not me:
+        return ""
+    try:
+        perms = channel.permissions_for(me)
+    except Exception:
+        return ""
+    missing = []
+    if not getattr(perms, "view_channel", True):
+        missing.append("查看频道")
+    if not getattr(perms, "send_messages", True):
+        missing.append("发送消息")
+    ch_type = getattr(channel, "type", None)
+    in_thread = ch_type in (
+        discord.ChannelType.public_thread,
+        discord.ChannelType.private_thread,
+        discord.ChannelType.news_thread,
+    )
+    if in_thread and hasattr(perms, "send_messages_in_threads") and not perms.send_messages_in_threads:
+        missing.append("在帖子中发送消息")
+    if not getattr(perms, "embed_links", True):
+        missing.append("嵌入链接")
+    return "、".join(missing)
+
+
+async def _post_public_message(interaction: discord.Interaction, *, embed, view, channel=None):
+    """公开卡优先走交互 webhook，不依赖频道「发送消息」权限。"""
+    target = channel or interaction.channel
+    last_err = None
+    try:
+        if interaction.response.is_done():
+            msg = await interaction.followup.send(embed=embed, view=view, ephemeral=False, wait=True)
+        else:
+            await interaction.response.send_message(embed=embed, view=view, ephemeral=False)
+            msg = await interaction.original_response()
+        if msg:
+            return msg
+    except Exception as e:
+        last_err = e
+        logger.warning(f"交互 webhook 发公开消息失败: {e}")
+    if target is not None:
+        try:
+            return await target.send(embed=embed, view=view)
+        except Exception as e:
+            last_err = e
+            logger.error(f"频道发送公开消息失败: {e}", exc_info=True)
+    gap = _bot_send_gap(target)
+    where = getattr(target, "mention", None) or "这个频道"
+    hint = f"缺权限：{gap}。" if gap else f"{last_err}"
+    raise RuntimeError(
+        f"机器人在 {where} 发不出公开卡（{hint}）"
+        "请给机器人打开「查看频道、发送消息、嵌入链接」。"
+    )
+
+
 async def _refresh_published_card(interaction: discord.Interaction, file_id: str, record: dict):
     channel_id = str(interaction.channel.id)
     embed, view = _build_published_card(record, file_id)
@@ -3869,7 +3929,7 @@ async def _refresh_published_card(interaction: discord.Interaction, file_id: str
                 await old_msg.delete()
             except Exception:
                 pass
-    pub_msg = await interaction.channel.send(embed=embed, view=view)
+    pub_msg = await _post_public_message(interaction, embed=embed, view=view)
     record["published_msg_id"] = str(pub_msg.id)
     channel_published[channel_id] = {
         "message_id": str(pub_msg.id),
@@ -3885,10 +3945,14 @@ async def _publish_file(interaction: discord.Interaction, file_id: str, record: 
     old_pub = channel_published.get(channel_id)
     embed, view = _build_published_card(record, file_id)
     try:
-        pub_msg = await interaction.channel.send(embed=embed, view=view)
+        pub_msg = await _post_public_message(interaction, embed=embed, view=view)
     except Exception as e:
         logger.error(f"公开卡片发送失败: {e}", exc_info=True)
-        await interaction.followup.send(f"❌ 公开卡片发不出去：{e}", ephemeral=True)
+        text = f"❌ 公开卡片发不出去：{e}"
+        if interaction.response.is_done():
+            await interaction.followup.send(text, ephemeral=True)
+        else:
+            await interaction.response.send_message(text, ephemeral=True)
         return False
 
     record["status"] = "published"
@@ -3914,7 +3978,7 @@ async def _publish_file(interaction: discord.Interaction, file_id: str, record: 
         logger.error(f"写存储卡失败: {e}", exc_info=True)
         extras.append(f"存储卡没写上：{e}")
     try:
-        await _upsert_subscribe_card(interaction.channel, record)
+        await _upsert_subscribe_card(interaction.channel, record, interaction=interaction)
     except Exception as e:
         logger.error(f"写订阅卡失败: {e}", exc_info=True)
         extras.append(f"订阅卡没写上：{e}")
@@ -4014,20 +4078,32 @@ class PersistentSubscribeView(discord.ui.View):
         await interaction.response.send_message(text, ephemeral=True)
 
 
-async def _upsert_subscribe_card(channel: discord.TextChannel, record: dict):
+async def _upsert_subscribe_card(channel, record: dict, interaction: discord.Interaction = None):
     old_id = record.get("subscribe_msg_id")
-    if old_id:
+    if old_id and channel:
         try:
             old_msg = await channel.fetch_message(int(old_id))
             await old_msg.delete()
         except Exception:
             pass
-    try:
-        msg = await channel.send(embed=_build_subscribe_card(record), view=PersistentSubscribeView())
-        record["subscribe_msg_id"] = str(msg.id)
-        save_records()
-    except Exception as e:
-        logger.warning(f"发送订阅卡失败: {e}")
+    embed = _build_subscribe_card(record)
+    view = PersistentSubscribeView()
+    msg = None
+    if interaction is not None:
+        try:
+            msg = await _post_public_message(interaction, embed=embed, view=view, channel=channel)
+        except Exception as e:
+            logger.warning(f"交互 webhook 发订阅卡失败: {e}")
+    if msg is None and channel:
+        try:
+            msg = await channel.send(embed=embed, view=view)
+        except Exception as e:
+            logger.warning(f"发送订阅卡失败: {e}")
+            raise
+    if msg is None:
+        raise RuntimeError("订阅卡发不出去")
+    record["subscribe_msg_id"] = str(msg.id)
+    save_records()
 
 
 _download_selections: dict = {}
