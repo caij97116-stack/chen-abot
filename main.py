@@ -2802,14 +2802,19 @@ def _role_claim_channel_of(guild: discord.Guild):
 
 
 def _resolve_role(guild: discord.Guild, key):
-    key = str(key or "").strip()
-    if not key:
+    if isinstance(key, discord.Role):
+        return key
+    raw = str(key or "").strip()
+    if not raw:
         return None
-    if key.isdigit():
-        role = guild.get_role(int(key))
+    mention = re.fullmatch(r"<@&(\d+)>", raw)
+    if mention:
+        raw = mention.group(1)
+    if raw.isdigit():
+        role = guild.get_role(int(raw))
         if role:
             return role
-    return discord.utils.get(guild.roles, name=key)
+    return discord.utils.get(guild.roles, name=raw)
 
 
 def _role_entry_of(guild_id, key) -> dict:
@@ -2970,7 +2975,11 @@ async def _refresh_identity_card(guild: discord.Guild, fallback_channel=None):
             logger.info(f"[{guild.name}] 旧身份卡消息已不在，重新发一张")
         except Exception as e:
             logger.warning(f"[{guild.name}] 编辑身份卡失败，改为重发: {e}")
-    msg = await channel.send(embed=embed, view=view)
+    try:
+        msg = await channel.send(embed=embed, view=view)
+    except Exception as e:
+        logger.error(f"[{guild.name}] 发送身份卡失败: {e}")
+        return None
     settings["card_message_id"] = str(msg.id)
     settings["channel_id"] = str(channel.id)
     save_role_claims()
@@ -2991,22 +3000,6 @@ async def setup_identity_channels():
             logger.error(f"领取身份卡 #{channel.name} 设置失败: {e}")
 
 
-async def _identity_role_autocomplete(interaction: discord.Interaction, current: str):
-    if not interaction.guild:
-        return []
-    cur = (current or "").strip().lower()
-    out = []
-    for role in interaction.guild.roles:
-        if role.is_default() or role.managed:
-            continue
-        if cur and cur not in role.name.lower():
-            continue
-        out.append(app_commands.Choice(name=role.name[:100], value=str(role.id)))
-        if len(out) >= 25:
-            break
-    return out
-
-
 @bot.tree.command(name="身份面板", description="重新发布/刷新领取身份组的卡片（仅岛主）")
 async def identity_panel(interaction: discord.Interaction):
     if not _is_island_owner(interaction):
@@ -3025,12 +3018,11 @@ async def identity_panel(interaction: discord.Interaction):
 
 @bot.tree.command(name="添加身份", description="把一个身份组加到领取面板（仅岛主）")
 @app_commands.describe(
-    角色="要开放的身份组",
+    角色="要开放的身份组，直接从列表里点选",
     显示名="菜单上显示的名字，留空用身份组名",
     说明="卡片里的一句话说明，可留空",
     必过审="是否要求先答题过关，默认需要",
 )
-@app_commands.autocomplete(角色=_identity_role_autocomplete)
 @app_commands.choices(
     必过审=[
         app_commands.Choice(name="需要过审", value="yes"),
@@ -3039,7 +3031,7 @@ async def identity_panel(interaction: discord.Interaction):
 )
 async def identity_add(
     interaction: discord.Interaction,
-    角色: str,
+    角色: discord.Role,
     显示名: str = "",
     说明: str = "",
     必过审: app_commands.Choice[str] = None,
@@ -3050,12 +3042,15 @@ async def identity_add(
     if not interaction.guild:
         await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
         return
-    role = _resolve_role(interaction.guild, 角色)
-    if not role:
-        await interaction.response.send_message("没找到这个身份组，从候选里选一个。", ephemeral=True)
+    role = 角色
+    if role.is_default() or role.managed:
+        await interaction.response.send_message("这个身份组不能放到领取面板上。", ephemeral=True)
         return
     settings = _role_claim_settings(interaction.guild.id)
-    entries = settings.get("roles") or []
+    entries = settings["roles"]
+    if not isinstance(entries, list):
+        entries = []
+        settings["roles"] = entries
     if _role_entry_of(interaction.guild.id, str(role.id)):
         await interaction.response.send_message(f"「{role.name}」已经在面板上了。", ephemeral=True)
         return
@@ -3065,13 +3060,17 @@ async def identity_add(
     await interaction.response.defer(ephemeral=True, thinking=True)
     entry = {
         "role_id": str(role.id),
-        "label": " ".join((显示名 or "").split())[:80],
+        "label": " ".join((显示名 or "").split())[:80] or role.name[:80],
         "description": " ".join((说明 or "").split())[:100],
         "need_pass": (必过审.value != "no") if 必过审 else True,
     }
     entries.append(entry)
     save_role_claims()
-    refreshed = await _refresh_identity_card(interaction.guild, fallback_channel=interaction.channel)
+    refreshed = None
+    try:
+        refreshed = await _refresh_identity_card(interaction.guild, fallback_channel=interaction.channel)
+    except Exception as e:
+        logger.error(f"添加身份后刷新卡片失败: {e}", exc_info=True)
     await _audit_log(
         interaction.guild,
         "身份面板变更",
@@ -3084,26 +3083,21 @@ async def identity_add(
         )
     else:
         await interaction.followup.send(
-            f"已记下 **{role.name}**，但卡片没发出去。再点一次 `/身份面板`。",
+            f"已记下 **{role.name}**。卡片没刷新成功，再点一次 `/身份面板`。",
             ephemeral=True,
         )
 
 
 @bot.tree.command(name="移除身份", description="把一个身份组从领取面板下架（仅岛主）")
-@app_commands.describe(角色="身份组名字或 ID，也可以是面板上写的显示名")
-@app_commands.autocomplete(角色=_identity_role_autocomplete)
-async def identity_remove(interaction: discord.Interaction, 角色: str):
+@app_commands.describe(角色="要下架的身份组，直接从列表里点选")
+async def identity_remove(interaction: discord.Interaction, 角色: discord.Role):
     if not _is_island_owner(interaction):
         await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
         return
     if not interaction.guild:
         await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
         return
-    entry = _role_entry_of(interaction.guild.id, 角色)
-    if not entry:
-        role = _resolve_role(interaction.guild, 角色)
-        if role:
-            entry = _role_entry_of(interaction.guild.id, str(role.id))
+    entry = _role_entry_of(interaction.guild.id, str(角色.id))
     if not entry:
         await interaction.response.send_message("面板上没找到这个身份组。", ephemeral=True)
         return
@@ -3112,14 +3106,18 @@ async def identity_remove(interaction: discord.Interaction, 角色: str):
     settings["roles"] = [e for e in (settings.get("roles") or []) if e is not entry]
     save_role_claims()
     role = _resolve_role(interaction.guild, entry.get("role_id"))
-    refreshed = await _refresh_identity_card(interaction.guild, fallback_channel=interaction.channel)
+    refreshed = None
+    try:
+        refreshed = await _refresh_identity_card(interaction.guild, fallback_channel=interaction.channel)
+    except Exception as e:
+        logger.error(f"移除身份后刷新卡片失败: {e}", exc_info=True)
     name = entry.get("label") or (role.name if role else entry.get("role_id"))
     await _audit_log(
         interaction.guild,
         "身份面板变更",
         f"**操作人:** {interaction.user.mention}\n**下架身份组:** {name}",
     )
-    extra = f"卡片已刷新到 {refreshed.mention}。" if refreshed else "卡片没发出去，再点一次 `/身份面板`。"
+    extra = f"卡片已刷新到 {refreshed.mention}。" if refreshed else "卡片没刷新成功，再点一次 `/身份面板`。"
     await interaction.followup.send(f"已把 **{name}** 从领取面板下架。{extra}", ephemeral=True)
 
 
@@ -9441,7 +9439,7 @@ if __name__ == "__main__":
         bot.music_idle_task = asyncio.create_task(_music_idle_watchdog())
 
         logger.info("🚀 正在启动 Chen-Abot...")
-        logger.info(f"构建标记: 身份卡固定下拉已注册　缓存文件: {INVITE_CACHE_FILE}")
+        logger.info(f"构建标记: 添加身份改用原生身份组选择器　缓存文件: {INVITE_CACHE_FILE}")
         try:
             await bot.start(token)
         except discord.LoginFailure as e:
