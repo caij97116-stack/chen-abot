@@ -55,6 +55,7 @@ bot = commands.Bot(command_prefix=None, intents=intents)
 # ─── 数据文件路径 ───
 DATA_FILE = "file_records.json"
 QUESTIONS_FILE = "questions.json"
+JOINT_QUESTIONS_FILE = "joint_questions.json"
 STORAGE_CHANNEL_FILE = "storage_channel.json"
 FAQ_FILE = "faq.json"
 POINTS_FILE = "points.json"
@@ -122,6 +123,24 @@ INVITE_DEFAULT_HOURS = 168
 INVITE_MAX_HOURS = 168
 INVITE_MAX_USES_LIMIT = 100
 INVITE_CARD_CHANNEL_KEYWORD = "邀请函发送处"
+INVITE_DOCK_CHANNEL_KEYWORD = "入岛码头"
+INVITE_KIND_PUBLIC = "public"
+INVITE_KIND_FRIEND = "friend"
+INVITE_KIND_NORMAL = "normal"
+INVITE_KIND_RESIDENT = "resident"
+INVITE_KIND_LABELS = {
+    "public": "公开链接",
+    "friend": "友情链接",
+    "normal": "普通链接",
+    "resident": "居民邀请",
+}
+INVITE_RESIDENT_15_DAYS = 15
+INVITE_RESIDENT_30_DAYS = 30
+INVITE_RESIDENT_15_QUOTA = 1
+INVITE_RESIDENT_30_QUOTA = 2
+INVITE_RESIDENT_30_AGE_SEC = 3600
+NEWCOMER_ROLE_NAME = "入岛新人"
+INVITED_ROLE_NAME = "受邀前来"
 # 邀请计数缓存：{guild_id:code -> 上次已知 uses}，落盘保存，重启后仍能比出离线期间的加入
 _invite_cache: dict = {}
 INVITE_RE = re.compile(
@@ -1021,7 +1040,99 @@ def _invite_settings(guild_id) -> dict:
         rec = {}
         settings[str(guild_id)] = rec
     rec.setdefault("creator_role", "")
+    rec.setdefault("card_message_id", "")
+    rec.setdefault("closed", False)
+    extra = rec.get("extra_perms")
+    if not isinstance(extra, dict):
+        extra = {}
+        rec["extra_perms"] = extra
     return rec
+
+
+def _invite_kind_label(kind: str) -> str:
+    return INVITE_KIND_LABELS.get(kind, kind or "邀请")
+
+
+def _community_closed(guild_id) -> bool:
+    return bool(_invite_settings(guild_id).get("closed"))
+
+
+def _invite_extra_kinds(guild_id, user_id) -> set:
+    extra = _invite_settings(guild_id).get("extra_perms") or {}
+    raw = extra.get(str(user_id)) or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(x) for x in raw if x}
+
+
+def _set_invite_extra_kinds(guild_id, user_id, kinds):
+    settings = _invite_settings(guild_id)
+    extra = settings.setdefault("extra_perms", {})
+    user_id = str(user_id)
+    kinds = [k for k in kinds if k in INVITE_KIND_LABELS]
+    if kinds:
+        extra[user_id] = kinds
+    else:
+        extra.pop(user_id, None)
+    save_invites()
+
+
+def _find_named_text_channel(guild: discord.Guild, keyword: str):
+    if not guild or not keyword:
+        return None
+    for channel in getattr(guild, "text_channels", []) or []:
+        name = channel.name or ""
+        if keyword in name and "测试" not in name:
+            return channel
+    return None
+
+
+def _invite_target_channel(guild: discord.Guild):
+    return _find_named_text_channel(guild, INVITE_DOCK_CHANNEL_KEYWORD) or _invite_card_channel_of(guild)
+
+
+def _resident_invite_quota(member, guild) -> tuple:
+    """返回 (条数上限, 有效秒数, 每条人数)。不够资格则全是 0。"""
+    if not member or not guild:
+        return 0, 0, 0
+    if member.id == guild.owner_id:
+        return 999, 0, 0
+    if not _user_passed_quiz(member):
+        return 0, 0, 0
+    rec = _get_checkin_record(str(guild.id), str(member.id))
+    days = int(rec.get("total_days") or 0)
+    if days >= INVITE_RESIDENT_30_DAYS:
+        return INVITE_RESIDENT_30_QUOTA, INVITE_RESIDENT_30_AGE_SEC, 1
+    if days >= INVITE_RESIDENT_15_DAYS:
+        return INVITE_RESIDENT_15_QUOTA, 0, 1
+    return 0, 0, 0
+
+
+def _count_user_invites(guild_id, user_id, kind=None) -> int:
+    user_id = str(user_id)
+    n = 0
+    for code, rec in _guild_invite_records(guild_id).items():
+        if code == "_unknown":
+            continue
+        if str(rec.get("inviter_id")) != user_id:
+            continue
+        if kind and rec.get("kind") != kind:
+            continue
+        n += 1
+    return n
+
+
+def _can_create_invite_kind(member, guild, kind: str) -> bool:
+    if not member or not guild:
+        return False
+    if member.id == guild.owner_id:
+        return True
+    if kind in _invite_extra_kinds(guild.id, member.id):
+        return True
+    if kind == INVITE_KIND_RESIDENT:
+        quota, _, _ = _resident_invite_quota(member, guild)
+        return quota > 0
+    return False
 
 
 def _guild_invite_records(guild_id) -> dict:
@@ -1030,15 +1141,6 @@ def _guild_invite_records(guild_id) -> dict:
         rec = {}
         invite_data[str(guild_id)] = rec
     return rec
-
-
-def _can_create_invite(member, guild) -> bool:
-    if member.id == guild.owner_id:
-        return True
-    role_name = (_invite_settings(guild.id).get("creator_role") or "").strip()
-    if not role_name:
-        return False
-    return discord.utils.get(getattr(member, "roles", []), name=role_name) is not None
 
 
 async def _fetch_guild_invite_uses(guild: discord.Guild):
@@ -1145,11 +1247,54 @@ async def _record_invite_join(member: discord.Member):
         "user_id": str(member.id),
         "user_name": getattr(member, "display_name", None) or str(member),
         "at": _beijing_now().isoformat(),
+        "kind": inv_rec.get("kind") or "",
     })
     inv_rec["uses"] = max(int(inv_rec.get("uses") or 0), uses.get(used_code))
     save_invites()
     await _refresh_invite_card(guild)
+    await _apply_invite_join_effects(member, inv_rec)
     return used_code
+
+
+async def _apply_invite_join_effects(member: discord.Member, inv_rec: dict):
+    guild = member.guild
+    kind = inv_rec.get("kind") or ""
+    if _community_closed(guild.id) and kind in (INVITE_KIND_PUBLIC, INVITE_KIND_FRIEND):
+        try:
+            await member.kick(reason="社区已关闭，公开/友情链接暂不能进")
+            logger.info(f"[{guild.name}] 关闭社区期间请出 {member}（{kind}）")
+        except Exception as e:
+            logger.warning(f"关闭社区请出失败: {e}")
+        return
+    extra_roles = inv_rec.get("extra_roles") or []
+    granted = []
+    for item in extra_roles:
+        role = None
+        rid = str(item.get("id") or "")
+        if rid.isdigit():
+            role = guild.get_role(int(rid))
+        if not role:
+            role = discord.utils.get(guild.roles, name=item.get("name") or "")
+        if not role or role.is_default() or role.managed:
+            continue
+        try:
+            await member.add_roles(role, reason=f"邀请附加身份：{inv_rec.get('code')}")
+            granted.append(role.name)
+        except Exception as e:
+            logger.warning(f"进服附加身份失败 {role}: {e}")
+    skip_quiz = bool(inv_rec.get("skip_quiz"))
+    if not skip_quiz:
+        skip_quiz = any(
+            name == QUIZ_VERIFIED_ROLE or "免答题" in name
+            for name in granted
+        )
+    if skip_quiz:
+        verified = discord.utils.get(guild.roles, name=QUIZ_VERIFIED_ROLE)
+        if verified and verified not in member.roles:
+            try:
+                await member.add_roles(verified, reason="邀请免答题")
+            except Exception as e:
+                logger.warning(f"免答题身份发放失败: {e}")
 
 
 def _security_settings(guild_id) -> dict:
@@ -1970,27 +2115,50 @@ QUIZ_COOLDOWN_MINUTES = 25         # 每次失败后增加的冷却时间（分�
 QUIZ_QUESTION_TIMEOUT = 300        # 每道题限时（秒），默认 5 分钟
 QUIZ_VERIFIED_ROLE = "你过关！小岛居民"        # 答题通过后赋予的身份组
 QUIZ_CHANNEL_KEYWORD = "答题"        # 答题频道名称关键词（包含此词即可）
-QUIZ_CHANNEL_EXCLUDE = ("交流",)      # 名称含这些词的频道不上答题卡（如「答题交流」）
+QUIZ_CHANNEL_EXCLUDE = ("交流", "受邀登记")  # 名称含这些词的频道不上普通答题卡
 QUIZ_EMBED_TITLE = "📝 入群审核答题"  # 答题卡标题，用于识别误发卡片
+JOINT_QUIZ_CHANNEL_KEYWORD = "受邀登记"
+JOINT_QUIZ_EMBED_TITLE = "📝 受邀登记答题"
 QUIZ_CHANNEL_FILE = "quiz_channels.json"     # 答题频道消息记录
 QUIZ_COOLDOWN_FILE = "quiz_cooldowns.json"   # 答题冷却记录
+JOINT_REGISTER_FILE = "joint_quiz_register.json"
 quiz_questions: list = []            # 从 questions.json 加载的题目
-quiz_sessions: dict = {}             # 正在答题的用户: {user_id: {questions, current_index, answers, started_at}}
+joint_quiz_questions: list = []      # 从 joint_questions.json 加载的连坐题
+quiz_sessions: dict = {}             # 正在答题的用户: {user_id: {questions, current_index, answers, started_at, kind}}
 quiz_channel_messages: dict = {}     # 答题频道消息: {channel_id: message_id}
 quiz_cooldowns: dict = {}            # 冷却记录: {user_id: {fail_count: int, cooldown_until: str|None}}
+joint_register_data: dict = {}       # {guild_id: {user_id: {inviter, via, note, at}}}
+QUIZ_ALREADY_PASSED_LINES = (
+    "卷子都收了，你还来？小岛居民再来刷题，阅卷老师要用粉笔头砸人了。",
+    "你已经过关啦。这张桌子是给还在门口排队的人用的，去岛上玩吧。",
+    "再点也变不出第二份「你过关」。出门左转，岛上还有别的热闹。",
+    "审核章都盖过了，考官去喝茶了。你已经是小岛居民，别跟试卷过不去。",
+)
+
+
+def _load_question_file(path: str) -> list:
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    return data if isinstance(data, list) else []
 
 
 def load_questions():
-    """从 JSON 加载题目"""
-    global quiz_questions
+    """从 JSON 加载普通题和连坐题"""
+    global quiz_questions, joint_quiz_questions
     try:
-        if os.path.exists(QUESTIONS_FILE):
-            with open(QUESTIONS_FILE, "r", encoding="utf-8") as f:
-                quiz_questions = json.load(f)
-            logger.info(f"已加载 {len(quiz_questions)} 道题目")
+        quiz_questions = _load_question_file(QUESTIONS_FILE)
+        logger.info(f"已加载 {len(quiz_questions)} 道普通题目")
     except Exception as e:
-        logger.error(f"加载题目失败: {e}")
+        logger.error(f"加载普通题目失败: {e}")
         quiz_questions = []
+    try:
+        joint_quiz_questions = _load_question_file(JOINT_QUESTIONS_FILE)
+        logger.info(f"已加载 {len(joint_quiz_questions)} 道连坐题目")
+    except Exception as e:
+        logger.error(f"加载连坐题目失败: {e}")
+        joint_quiz_questions = []
 
 
 def save_records():
@@ -2047,12 +2215,42 @@ def load_quiz_cooldowns():
 
 
 def save_quiz_cooldowns():
-    """保存答题冷却记录"""
     try:
         with open(QUIZ_COOLDOWN_FILE, "w", encoding="utf-8") as f:
             json.dump(quiz_cooldowns, f)
     except Exception as e:
         logger.error(f"保存冷却记录失败: {e}")
+
+
+def load_joint_registers():
+    global joint_register_data
+    try:
+        if os.path.exists(JOINT_REGISTER_FILE):
+            with open(JOINT_REGISTER_FILE, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+            joint_register_data = loaded if isinstance(loaded, dict) else {}
+        else:
+            joint_register_data = {}
+    except Exception:
+        joint_register_data = {}
+
+
+def save_joint_registers():
+    try:
+        with open(JOINT_REGISTER_FILE, "w", encoding="utf-8") as f:
+            json.dump(joint_register_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"保存受邀登记失败: {e}")
+
+
+def _member_has_role(member, name: str) -> bool:
+    if not member or not name:
+        return False
+    return discord.utils.get(getattr(member, "roles", []), name=name) is not None
+
+
+def _quiz_already_passed_text() -> str:
+    return random.choice(QUIZ_ALREADY_PASSED_LINES)
 
 
 # ═══════════════════════════════════════════
@@ -2093,6 +2291,7 @@ async def on_ready():
     load_questions()
     load_quiz_channels()
     load_quiz_cooldowns()
+    load_joint_registers()
     load_storage_channels()
     load_faq()
     load_points()
@@ -2118,6 +2317,7 @@ async def on_ready():
     await _prune_unpublished_storage_cards()
     for guild in bot.guilds:
         await _seed_invite_cache(guild)
+        await _lock_native_invites(guild)
         me = guild.me
         if me and not me.guild_permissions.manage_guild:
             logger.warning(f"[{guild.name}] 缺少「管理服务器」权限，邀请溯源会全部失效")
@@ -2131,6 +2331,7 @@ async def on_ready():
 
     # 在答题频道中发布/更新答题按钮消息
     await setup_quiz_channels()
+    await setup_joint_quiz_channels()
 
     # 在签到频道中发布/更新签到按钮消息
     await setup_checkin_channels()
@@ -2157,21 +2358,14 @@ async def on_ready():
 
 
 # ═══════════════════════════════════════════
-#  新成员自动身份组
+#  新成员进服：不再自动戴身份，按邀请分路
 # ═══════════════════════════════════════════
 
-MEMBER_ROLE_NAME = "入岛新人"
+MEMBER_ROLE_NAME = NEWCOMER_ROLE_NAME
 
 
 @bot.event
 async def on_member_join(member: discord.Member):
-    role = discord.utils.get(member.guild.roles, name=MEMBER_ROLE_NAME)
-    if role:
-        try:
-            await member.add_roles(role)
-            logger.info(f"已为 {member.name} 分配 {MEMBER_ROLE_NAME} 身份组")
-        except discord.Forbidden:
-            pass
     try:
         await _security_on_join(member)
     except Exception as e:
@@ -2230,32 +2424,35 @@ def _build_invite_card(guild: discord.Guild) -> discord.Embed:
     offline_missed = sum(int(rec.get("offline_missed") or 0) for rec in real.values())
     total_tracks = len(real)
     total_joined = sum(len(rec.get("joined") or []) for rec in real.values())
-    settings = _invite_settings(guild.id)
-    role_name = (settings.get("creator_role") or "").strip()
-    who = f"「{role_name}」身份组和岛主" if role_name else "岛主"
+    closed = _community_closed(guild.id)
     lines = [
-        "在这里生成属于你的服务器邀请函，也在这里看谁是你带进来的。",
+        "邀请只在这里生成。客户端菜单里的「邀请好友」已经收起来了。",
         "",
-        "**怎么用**",
-        "▸ 点「生成邀请函」，填好有效期、可用次数和备注",
-        "▸ 把链接发给朋友，对方用它进岛就会记在你的名下",
-        "▸ 点「我的邀请函」随时回看自己的战绩",
+        "**谁能发**",
+        "▸ 先过审，拿到「你过关！小岛居民」",
+        "▸ 累计签到 15 天：可发 1 条，限邀 1 人",
+        "▸ 累计签到 30 天：可发 2 条；每条限 1 人、约 1 小时",
+        "▸ 岛主不限；公开 / 友情 / 普通 只有岛主，或岛主点名开放的人",
+        "",
+        "**进岛之后**",
+        "▸ 公开 / 友情链接：自己去领「入岛新人」，再去普通答题",
+        "▸ 普通链接和居民邀请：自己去领「受邀前来」，再去受邀登记处",
         "",
         "**当前数据**",
         f"▸ 已发出邀请：**{total_tracks}** 条",
         f"▸ 累计带来成员：**{total_joined}** 人",
+        f"▸ 社区状态：**{'已关闭（公开/友情进不来）' if closed else '开放中'}**",
     ]
     if unknown:
         lines.append(f"▸ 未能溯源：**{len(unknown)}** 人（机器人离线或陌生邀请）")
     if offline_missed:
         lines.append(f"▸ 离线期间补记：**{offline_missed}** 次")
-    lines.append(f"▸ 生成权限：{who}")
     embed = discord.Embed(
         title="邀请函发送处",
         description="\n".join(lines)[:4000],
         color=discord.Color.from_rgb(88, 101, 242),
     )
-    embed.set_footer(text=f"有效期最长 {INVITE_MAX_HOURS // 24} 天，可用次数最多 {INVITE_MAX_USES_LIMIT} 次")
+    embed.set_footer(text="默认落到「入岛码头」| 岛主用 /关闭社区 /开启社区")
     return embed
 
 
@@ -2277,51 +2474,77 @@ async def _refresh_invite_card(guild: discord.Guild):
 
 
 class InviteCreateModal(discord.ui.Modal, title="生成邀请函"):
-    hours = discord.ui.TextInput(
-        label="有效期（小时，0 为永久）",
-        default=str(INVITE_DEFAULT_HOURS),
-        required=False,
-        max_length=3,
-    )
-    max_uses = discord.ui.TextInput(
-        label="可用次数（0 为不限）",
-        default="0",
-        required=False,
-        max_length=3,
-    )
-    note = discord.ui.TextInput(
-        label="备注（方便自己区分）",
-        required=False,
-        max_length=100,
-        placeholder="例如：给贴吧来的朋友",
-    )
+    def __init__(
+        self,
+        kind: str,
+        hours_default: str = "0",
+        uses_default: str = "0",
+        allow_extra: bool = False,
+        lock_limit: bool = False,
+    ):
+        super().__init__(title=f"生成{_invite_kind_label(kind)}")
+        self.kind = kind
+        self.allow_extra = allow_extra
+        self.lock_limit = lock_limit
+        self.hours_default = hours_default
+        self.uses_default = uses_default
+        self.hours = discord.ui.TextInput(
+            label="有效期（小时，0 为永久）",
+            default=hours_default,
+            required=False,
+            max_length=4,
+        )
+        self.max_uses = discord.ui.TextInput(
+            label="可用次数（0 为不限）",
+            default=uses_default,
+            required=False,
+            max_length=3,
+        )
+        self.note = discord.ui.TextInput(
+            label="备注（方便自己区分）",
+            required=False,
+            max_length=100,
+            placeholder="例如：给贴吧来的朋友",
+        )
+        self.extra_roles = discord.ui.TextInput(
+            label="进服额外身份组（逗号分隔，可留空）",
+            required=False,
+            max_length=150,
+            placeholder="可写免答题相关身份组名",
+        )
+        if not lock_limit:
+            self.add_item(self.hours)
+            self.add_item(self.max_uses)
+        self.add_item(self.note)
+        if allow_extra:
+            self.add_item(self.extra_roles)
 
     async def on_submit(self, interaction: discord.Interaction):
-        try:
-            hours = int(str(self.hours.value or "").strip() or INVITE_DEFAULT_HOURS)
-            max_uses = int(str(self.max_uses.value or "").strip() or 0)
-        except ValueError:
-            await interaction.response.send_message("有效期和可用次数都要填数字。", ephemeral=True)
-            return
-        if hours < 0 or hours > INVITE_MAX_HOURS:
-            await interaction.response.send_message(f"有效期填 0 到 {INVITE_MAX_HOURS} 小时。", ephemeral=True)
-            return
-        if max_uses < 0 or max_uses > INVITE_MAX_USES_LIMIT:
-            await interaction.response.send_message(f"可用次数填 0 到 {INVITE_MAX_USES_LIMIT} 次。", ephemeral=True)
-            return
-        await _do_invite_create(interaction, hours, max_uses, str(self.note.value or ""))
-
-
-class InviteSettingsModal(discord.ui.Modal, title="邀请设置"):
-    role = discord.ui.TextInput(
-        label="允许生成邀请的身份组名称",
-        required=False,
-        max_length=100,
-        placeholder="留空表示仅岛主",
-    )
-
-    async def on_submit(self, interaction: discord.Interaction):
-        await _do_invite_settings(interaction, str(self.role.value or ""))
+        if self.lock_limit:
+            hours = int(self.hours_default or 0)
+            max_uses = int(self.uses_default or 0)
+        else:
+            try:
+                hours = int(str(self.hours.value or "").strip() or 0)
+                max_uses = int(str(self.max_uses.value or "").strip() or 0)
+            except ValueError:
+                await interaction.response.send_message("有效期和可用次数都要填数字。", ephemeral=True)
+                return
+            if hours < 0 or hours > INVITE_MAX_HOURS:
+                await interaction.response.send_message(f"有效期填 0 到 {INVITE_MAX_HOURS} 小时。", ephemeral=True)
+                return
+            if max_uses < 0 or max_uses > INVITE_MAX_USES_LIMIT:
+                await interaction.response.send_message(f"可用次数填 0 到 {INVITE_MAX_USES_LIMIT} 次。", ephemeral=True)
+                return
+        extra_text = str(self.extra_roles.value or "") if self.allow_extra else ""
+        await _do_invite_create(
+            interaction,
+            hours,
+            max_uses,
+            str(self.note.value or ""),
+            kind=self.kind,
+            extra_roles_text=extra_text,
+        )
 
 
 class InviteRecordsModal(discord.ui.Modal, title="邀请记录"):
@@ -2347,6 +2570,52 @@ class InviteRevokeModal(discord.ui.Modal, title="作废邀请"):
         await _do_invite_revoke(interaction, str(self.code.value or ""))
 
 
+async def _open_invite_create(interaction: discord.Interaction, kind: str):
+    if not interaction.guild:
+        await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+        return
+    if not _can_create_invite_kind(interaction.user, interaction.guild, kind):
+        if kind == INVITE_KIND_RESIDENT:
+            await interaction.response.send_message(
+                "居民邀请要先过审，再累计签到满 15 天。",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                f"{_invite_kind_label(kind)}只有岛主，或岛主点名开放的人能发。",
+                ephemeral=True,
+            )
+        return
+    hours_default = "0"
+    uses_default = "0"
+    if kind == INVITE_KIND_RESIDENT:
+        quota, age_sec, uses = _resident_invite_quota(interaction.user, interaction.guild)
+        used = _count_user_invites(interaction.guild.id, interaction.user.id, INVITE_KIND_RESIDENT)
+        if interaction.user.id != interaction.guild.owner_id and used >= quota:
+            await interaction.response.send_message(
+                f"你的居民邀请额度用完了（{used}/{quota}）。",
+                ephemeral=True,
+            )
+            return
+        hours_default = str(max(0, int(age_sec) // 3600))
+        uses_default = str(uses or 1)
+    elif kind in (INVITE_KIND_PUBLIC, INVITE_KIND_FRIEND):
+        hours_default = "0"
+        uses_default = "0"
+    await interaction.response.send_modal(
+        InviteCreateModal(
+            kind,
+            hours_default=hours_default,
+            uses_default=uses_default,
+            allow_extra=_is_island_owner(interaction),
+            lock_limit=(
+                kind in (INVITE_KIND_PUBLIC, INVITE_KIND_FRIEND)
+                or (kind == INVITE_KIND_RESIDENT and not _is_island_owner(interaction))
+            ),
+        )
+    )
+
+
 class PersistentInviteView(discord.ui.View):
     """邀请函发送处持久化按钮视图（无超时，重启后恢复）"""
 
@@ -2354,27 +2623,46 @@ class PersistentInviteView(discord.ui.View):
         super().__init__(timeout=None)
 
     @discord.ui.button(
-        label="生成邀请函",
+        label="公开链接",
         style=discord.ButtonStyle.primary,
-        custom_id="invite_card_create",
+        custom_id="invite_card_public",
         row=0,
     )
-    async def create_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not interaction.guild:
-            await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
-            return
-        if not _can_create_invite(interaction.user, interaction.guild):
-            role_name = (_invite_settings(interaction.guild.id).get("creator_role") or "").strip()
-            need = f"「{role_name}」身份组" if role_name else "岛主"
-            await interaction.response.send_message(f"你还没有生成邀请的权限，需要 {need}。", ephemeral=True)
-            return
-        await interaction.response.send_modal(InviteCreateModal())
+    async def public_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _open_invite_create(interaction, INVITE_KIND_PUBLIC)
+
+    @discord.ui.button(
+        label="友情链接",
+        style=discord.ButtonStyle.primary,
+        custom_id="invite_card_friend",
+        row=0,
+    )
+    async def friend_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _open_invite_create(interaction, INVITE_KIND_FRIEND)
+
+    @discord.ui.button(
+        label="普通链接",
+        style=discord.ButtonStyle.secondary,
+        custom_id="invite_card_normal",
+        row=0,
+    )
+    async def normal_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _open_invite_create(interaction, INVITE_KIND_NORMAL)
+
+    @discord.ui.button(
+        label="居民邀请",
+        style=discord.ButtonStyle.success,
+        custom_id="invite_card_resident",
+        row=1,
+    )
+    async def resident_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _open_invite_create(interaction, INVITE_KIND_RESIDENT)
 
     @discord.ui.button(
         label="我的邀请函",
         style=discord.ButtonStyle.secondary,
         custom_id="invite_card_mine",
-        row=0,
+        row=1,
     )
     async def mine_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _do_my_invites(interaction)
@@ -2383,25 +2671,13 @@ class PersistentInviteView(discord.ui.View):
         label="邀请记录",
         style=discord.ButtonStyle.secondary,
         custom_id="invite_card_records",
-        row=1,
+        row=2,
     )
     async def records_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if not _is_island_owner(interaction):
             await interaction.response.send_message("这条只有岛主能看。", ephemeral=True)
             return
         await interaction.response.send_modal(InviteRecordsModal())
-
-    @discord.ui.button(
-        label="邀请设置",
-        style=discord.ButtonStyle.secondary,
-        custom_id="invite_card_settings",
-        row=1,
-    )
-    async def settings_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if not _is_island_owner(interaction):
-            await interaction.response.send_message("这条只有岛主能改。", ephemeral=True)
-            return
-        await interaction.response.send_modal(InviteSettingsModal())
 
     @discord.ui.button(
         label="作废邀请",
@@ -2446,59 +2722,112 @@ async def setup_invite_card_channels():
         logger.info(f"发布邀请卡片: #{channel.name}")
 
 
-async def _do_invite_create(interaction: discord.Interaction, 有效期小时: int, 最多次数: int, 备注: str):
+def _parse_extra_roles(guild: discord.Guild, text: str) -> list:
+    names = []
+    for part in re.split(r"[,，、/]+", text or ""):
+        name = " ".join(part.split()).strip()
+        if name and name not in names:
+            names.append(name)
+    resolved = []
+    for name in names:
+        role = discord.utils.get(guild.roles, name=name) if guild else None
+        if role and not role.is_default():
+            resolved.append({"id": str(role.id), "name": role.name})
+    return resolved
+
+
+async def _do_invite_create(
+    interaction: discord.Interaction,
+    有效期小时: int,
+    最多次数: int,
+    备注: str,
+    kind: str = INVITE_KIND_NORMAL,
+    extra_roles_text: str = "",
+):
     if not interaction.guild:
         await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
         return
-    if not _can_create_invite(interaction.user, interaction.guild):
-        role_name = (_invite_settings(interaction.guild.id).get("creator_role") or "").strip()
-        need = f"「{role_name}」身份组" if role_name else "岛主"
-        await interaction.response.send_message(f"你还没有创建邀请的权限，需要 {need}。", ephemeral=True)
+    if not _can_create_invite_kind(interaction.user, interaction.guild, kind):
+        await interaction.response.send_message(
+            f"你还没有发{_invite_kind_label(kind)}的权限。",
+            ephemeral=True,
+        )
         return
+    hours = int(有效期小时)
+    max_uses = int(最多次数)
+    if kind in (INVITE_KIND_PUBLIC, INVITE_KIND_FRIEND):
+        hours = 0
+        max_uses = 0
+    elif kind == INVITE_KIND_RESIDENT and interaction.user.id != interaction.guild.owner_id:
+        quota, age_sec, uses = _resident_invite_quota(interaction.user, interaction.guild)
+        used = _count_user_invites(interaction.guild.id, interaction.user.id, INVITE_KIND_RESIDENT)
+        if used >= quota:
+            await interaction.response.send_message(
+                f"你的居民邀请额度用完了（{used}/{quota}）。",
+                ephemeral=True,
+            )
+            return
+        hours = max(0, int(age_sec) // 3600)
+        max_uses = uses or 1
     await interaction.response.defer(ephemeral=True, thinking=True)
-    channel = _invite_card_channel_of(interaction.guild) or interaction.channel
+    channel = _invite_target_channel(interaction.guild) or interaction.channel
     if not isinstance(channel, discord.TextChannel):
         channel = discord.utils.get(interaction.guild.text_channels)
     if channel is None:
         await interaction.followup.send("这个服务器没有可创建邀请的文字频道。", ephemeral=True)
         return
-    max_age = 0 if int(有效期小时) == 0 else int(有效期小时) * 3600
+    max_age = 0 if hours == 0 else hours * 3600
     try:
         invite = await channel.create_invite(
             max_age=max_age,
-            max_uses=int(最多次数),
+            max_uses=max_uses,
             unique=True,
-            reason=f"邀请溯源：{interaction.user} ({interaction.user.id})",
+            reason=f"邀请溯源：{interaction.user} ({interaction.user.id}) {kind}",
         )
     except discord.Forbidden:
-        await interaction.followup.send("机器人缺少「管理服务器」权限，创建不了邀请。", ephemeral=True)
+        await interaction.followup.send("机器人缺少「创建邀请」或「管理服务器」权限，创建不了邀请。", ephemeral=True)
         return
     except Exception as e:
         await interaction.followup.send(f"创建邀请失败: {e}", ephemeral=True)
         return
     note = " ".join((备注 or "").split())[:100]
+    extra_roles = _parse_extra_roles(interaction.guild, extra_roles_text)
+    if kind == INVITE_KIND_RESIDENT and interaction.user.id != interaction.guild.owner_id:
+        extra_roles = []
+    skip_quiz = any(
+        (item.get("name") or "") == QUIZ_VERIFIED_ROLE or "免答题" in (item.get("name") or "")
+        for item in extra_roles
+    )
     records = _guild_invite_records(interaction.guild.id)
     records[invite.code] = {
         "code": invite.code,
+        "kind": kind,
         "inviter_id": str(interaction.user.id),
         "inviter_name": getattr(interaction.user, "display_name", None) or str(interaction.user),
         "channel_id": str(channel.id),
         "created_at": _beijing_now().isoformat(),
-        "max_uses": int(最多次数),
+        "max_uses": max_uses,
         "max_age": max_age,
         "note": note,
         "uses": 0,
         "joined": [],
+        "extra_roles": extra_roles,
+        "skip_quiz": skip_quiz,
     }
     _invite_cache[_invite_cache_key(interaction.guild.id, invite.code)] = 0
     save_invite_cache()
     save_invites()
     await _refresh_invite_card(interaction.guild)
-    hours_txt = "永久" if max_age == 0 else f"{有效期小时} 小时"
-    uses_txt = "不限" if int(最多次数) == 0 else f"{最多次数} 次"
+    hours_txt = "永久" if max_age == 0 else f"{hours} 小时"
+    uses_txt = "不限" if max_uses == 0 else f"{max_uses} 次"
+    path_txt = "公开/友情：领「入岛新人」再去普通答题" if kind in (INVITE_KIND_PUBLIC, INVITE_KIND_FRIEND) else "领「受邀前来」再去受邀登记处"
+    extra_txt = "、".join(item["name"] for item in extra_roles) if extra_roles else "（无）"
     await interaction.followup.send(
-        f"邀请函已生成：{_invite_link(invite.code)}\n"
+        f"{_invite_kind_label(kind)}已生成：{_invite_link(invite.code)}\n"
         f"有效期：{hours_txt}　可用次数：{uses_txt}\n"
+        f"落地频道：{channel.mention}\n"
+        f"进服路径：{path_txt}\n"
+        f"额外身份：{extra_txt}\n"
         f"备注：{note or '（无）'}\n"
         "有人用它进来就会记在你的名下，点「我的邀请函」随时查看。",
         ephemeral=True,
@@ -2511,13 +2840,16 @@ async def _do_my_invites(interaction: discord.Interaction):
         return
     recs = _invite_records_of_user(interaction.guild.id, interaction.user.id)
     if not recs:
-        await interaction.response.send_message("你还没发过邀请，点「生成邀请函」生成一条。", ephemeral=True)
+        await interaction.response.send_message("你还没发过邀请，点上面的按钮生成一条。", ephemeral=True)
         return
     total = sum(len(rec.get("joined") or []) for _, rec in recs)
     lines = [f"你一共带进来 **{total}** 人。", ""]
     for code, rec in recs[:10]:
         joined = rec.get("joined") or []
-        lines.append(f"**{_invite_link(code)}**　{rec.get('note') or '（无备注）'}")
+        lines.append(
+            f"**{_invite_link(code)}**　{_invite_kind_label(rec.get('kind') or INVITE_KIND_NORMAL)}"
+            f"　{rec.get('note') or '（无备注）'}"
+        )
         lines.append(f"　带来 {len(joined)} 人，当前计数 {rec.get('uses', 0)}")
         for item in joined[-5:]:
             lines.append(f"　　- {item.get('user_name', '?')}　{_format_beijing_minute(item.get('at'))}")
@@ -2593,29 +2925,6 @@ async def _do_invite_records(interaction: discord.Interaction, 邀请码: str = 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-async def _do_invite_settings(interaction: discord.Interaction, 身份组: str = ""):
-    if not _is_island_owner(interaction):
-        await interaction.response.send_message("这条只有岛主能改。", ephemeral=True)
-        return
-    role_name = " ".join((身份组 or "").split())[:100]
-    if role_name and discord.utils.get(interaction.guild.roles, name=role_name) is None:
-        await interaction.response.send_message(f"找不到身份组「{role_name}」。", ephemeral=True)
-        return
-    settings = _invite_settings(interaction.guild.id)
-    settings["creator_role"] = role_name
-    save_invites()
-    await _refresh_invite_card(interaction.guild)
-    await _audit_log(
-        interaction.guild,
-        "邀请设置变更",
-        f"**操作人:** {interaction.user.mention}\n**创建权限:** {role_name or '仅岛主'}",
-    )
-    await interaction.response.send_message(
-        f"已设置：{'「' + role_name + '」身份组' if role_name else '仅岛主'} 可以创建邀请。",
-        ephemeral=True,
-    )
-
-
 async def _do_invite_revoke(interaction: discord.Interaction, 邀请码: str):
     if not _is_island_owner(interaction):
         await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
@@ -2647,6 +2956,94 @@ async def _do_invite_revoke(interaction: discord.Interaction, 邀请码: str):
         f"已作废邀请 `{code}`" + ("" if revoked else "（Discord 侧可能已过期或不存在，记录已移除）"),
         ephemeral=True,
     )
+
+
+async def _lock_native_invites(guild: discord.Guild):
+    """收回 @everyone 的创建邀请，让客户端菜单点了也生成不了。"""
+    if not guild:
+        return
+    everyone = guild.default_role
+    if not everyone:
+        return
+    try:
+        if everyone.permissions.create_instant_invite:
+            perms = everyone.permissions
+            perms.update(create_instant_invite=False)
+            await everyone.edit(permissions=perms, reason="邀请只走邀请函发送处")
+            logger.info(f"[{guild.name}] 已收回 @everyone 的创建邀请")
+    except Exception as e:
+        logger.warning(f"[{guild.name}] 收回原生邀请失败: {e}")
+
+
+@bot.tree.command(name="关闭社区", description="关闭后，别人用公开/友情链接进不来（仅岛主）")
+async def close_community(interaction: discord.Interaction):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    settings = _invite_settings(interaction.guild.id)
+    settings["closed"] = True
+    save_invites()
+    await _refresh_invite_card(interaction.guild)
+    await _audit_log(interaction.guild, "关闭社区", f"**操作人:** {interaction.user.mention}")
+    await interaction.response.send_message(
+        "社区已关闭。公开链接和友情链接现在进不来；普通链接和居民邀请照常。再用 `/开启社区` 打开。",
+        ephemeral=True,
+    )
+
+
+@bot.tree.command(name="开启社区", description="重新开放公开/友情链接（仅岛主）")
+async def open_community(interaction: discord.Interaction):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    settings = _invite_settings(interaction.guild.id)
+    settings["closed"] = False
+    save_invites()
+    await _refresh_invite_card(interaction.guild)
+    await _audit_log(interaction.guild, "开启社区", f"**操作人:** {interaction.user.mention}")
+    await interaction.response.send_message("社区已重新开放，公开/友情链接又能用了。", ephemeral=True)
+
+
+@bot.tree.command(name="邀请权限", description="指定某人能发哪种邀请链接（仅岛主）")
+@app_commands.describe(
+    成员="要开放权限的人",
+    种类="公开 / 友情 / 普通 / 清空",
+)
+@app_commands.choices(
+    种类=[
+        app_commands.Choice(name="公开链接", value="public"),
+        app_commands.Choice(name="友情链接", value="friend"),
+        app_commands.Choice(name="普通链接", value="normal"),
+        app_commands.Choice(name="公开+友情+普通", value="all"),
+        app_commands.Choice(name="清空额外权限", value="clear"),
+    ],
+)
+async def invite_perm_command(
+    interaction: discord.Interaction,
+    成员: discord.Member,
+    种类: app_commands.Choice[str],
+):
+    if not _is_island_owner(interaction):
+        await interaction.response.send_message("这条只有岛主能用。", ephemeral=True)
+        return
+    value = 种类.value
+    if value == "clear":
+        _set_invite_extra_kinds(interaction.guild.id, 成员.id, [])
+        text = f"已清空 {成员.mention} 的额外邀请权限。"
+    elif value == "all":
+        kinds = [INVITE_KIND_PUBLIC, INVITE_KIND_FRIEND, INVITE_KIND_NORMAL]
+        _set_invite_extra_kinds(interaction.guild.id, 成员.id, kinds)
+        text = f"已允许 {成员.mention} 发公开、友情、普通链接。"
+    else:
+        kinds = sorted(_invite_extra_kinds(interaction.guild.id, 成员.id) | {value})
+        _set_invite_extra_kinds(interaction.guild.id, 成员.id, kinds)
+        text = f"已允许 {成员.mention} 发{_invite_kind_label(value)}。"
+    await _audit_log(
+        interaction.guild,
+        "邀请权限变更",
+        f"**操作人:** {interaction.user.mention}\n**对象:** {成员.mention}\n**结果:** {text}",
+    )
+    await interaction.response.send_message(text, ephemeral=True)
 
 
 async def _remove_quiz_card(channel):
@@ -2681,9 +3078,9 @@ async def setup_quiz_channels():
     """在名称包含 QUIZ_CHANNEL_KEYWORD 的频道中发布答题按钮消息"""
     quiz_embed = discord.Embed(
         title=QUIZ_EMBED_TITLE,
-        description="点击下方按钮开始答题，需要 **答完题库全部题目且全部答对** 才能通过审核。\n\n"
-                    "点「查询冷却」可查看自己还要等多久。\n"
-                    "如果按钮无法使用，请使用 `/答题` 或 `/冷却` 命令。",
+        description="先去身份卡领「入岛新人」，再点按钮开始答题。需要 **答完全部题目且全部答对** 才能过审。\n\n"
+                    "过关后会拿到「你过关！小岛居民」。已经过关的人再点，会收到一句玩笑，不用再答。\n"
+                    "点「查询冷却」可查看自己还要等多久。",
         color=discord.Color.blue(),
     )
     quiz_embed.set_footer(text="答题消息仅自己可见")
@@ -2730,6 +3127,54 @@ async def setup_quiz_channels():
                 logger.warning(f"无权限在 #{channel.name} 发送消息")
             except Exception as e:
                 logger.error(f"答题频道 #{channel.name} 设置失败: {e}")
+
+
+async def setup_joint_quiz_channels():
+    """在名称含「受邀登记」的频道发布登记表 + 连坐答题卡"""
+    embed = discord.Embed(
+        title=JOINT_QUIZ_EMBED_TITLE,
+        description=(
+            "被请来的人走这条。先领「受邀前来」，再填登记表，然后答完连坐题。\n\n"
+            "连坐的意思很简单：你请来的人翻车，邀请人也要一起湿。\n"
+            "点「填写登记表」留下是谁把你请来的，再点「开始连坐答题」。"
+        ),
+        color=discord.Color.from_rgb(255, 183, 77),
+    )
+    embed.set_footer(text="答题消息仅自己可见 | 必须先有「受邀前来」")
+    for guild in bot.guilds:
+        for channel in guild.text_channels:
+            if JOINT_QUIZ_CHANNEL_KEYWORD not in (channel.name or ""):
+                continue
+            if "测试" in (channel.name or ""):
+                continue
+            try:
+                existing_msg_id = quiz_channel_messages.get(f"joint:{channel.id}")
+                kept = False
+                async for old_msg in channel.history(limit=50):
+                    if old_msg.author.id != bot.user.id:
+                        continue
+                    title = (old_msg.embeds[0].title or "") if old_msg.embeds else ""
+                    if existing_msg_id and str(old_msg.id) == existing_msg_id:
+                        try:
+                            await old_msg.edit(embed=embed, view=PersistentJointQuizView())
+                            kept = True
+                            logger.info(f"更新受邀登记卡: #{channel.name}")
+                        except Exception:
+                            pass
+                    elif title in (JOINT_QUIZ_EMBED_TITLE, QUIZ_EMBED_TITLE):
+                        try:
+                            await old_msg.delete()
+                        except Exception:
+                            pass
+                if not kept:
+                    msg = await channel.send(embed=embed, view=PersistentJointQuizView())
+                    quiz_channel_messages[f"joint:{channel.id}"] = str(msg.id)
+                    save_quiz_channels()
+                    logger.info(f"发布受邀登记卡: #{channel.name}")
+            except discord.Forbidden:
+                logger.warning(f"无权限在 #{channel.name} 发送受邀登记卡")
+            except Exception as e:
+                logger.error(f"受邀登记频道 #{channel.name} 设置失败: {e}")
 
 
 # ═══════════════════════════════════════════
@@ -3021,12 +3466,12 @@ async def identity_panel(interaction: discord.Interaction):
     角色="要开放的身份组，直接从列表里点选",
     显示名="菜单上显示的名字，留空用身份组名",
     说明="卡片里的一句话说明，可留空",
-    必过审="是否要求先答题过关，默认需要",
+    必过审="这个身份组要不要先过审才能领。入岛新人、受邀前来请选无过审",
 )
 @app_commands.choices(
     必过审=[
-        app_commands.Choice(name="需要过审", value="yes"),
-        app_commands.Choice(name="人人可领", value="no"),
+        app_commands.Choice(name="需过审", value="yes"),
+        app_commands.Choice(name="无过审", value="no"),
     ],
 )
 async def identity_add(
@@ -4695,13 +5140,49 @@ class PersistentQuizView(discord.ui.View):
         custom_id="persistent_quiz_start",
     )
     async def quiz_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await _do_quiz(interaction)
+        await _do_quiz(interaction, kind="normal")
 
     @discord.ui.button(
         label="查询冷却",
         style=discord.ButtonStyle.secondary,
         emoji="⏳",
         custom_id="persistent_quiz_cooldown",
+    )
+    async def cooldown_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_cooldown_check(interaction)
+
+
+class PersistentJointQuizView(discord.ui.View):
+    """受邀登记处：登记表 + 连坐答题"""
+
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @discord.ui.button(
+        label="填写登记表",
+        style=discord.ButtonStyle.secondary,
+        custom_id="persistent_joint_register",
+        row=0,
+    )
+    async def register_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_joint_register_open(interaction)
+
+    @discord.ui.button(
+        label="开始连坐答题",
+        style=discord.ButtonStyle.primary,
+        emoji="✍️",
+        custom_id="persistent_joint_quiz_start",
+        row=0,
+    )
+    async def quiz_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await _do_quiz(interaction, kind="joint")
+
+    @discord.ui.button(
+        label="查询冷却",
+        style=discord.ButtonStyle.secondary,
+        emoji="⏳",
+        custom_id="persistent_joint_quiz_cooldown",
+        row=1,
     )
     async def cooldown_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         await _do_cooldown_check(interaction)
@@ -4849,7 +5330,12 @@ async def _show_results(interaction: discord.Interaction, session: dict):
         color=color,
     )
 
-    result_view = None if passed else PersistentQuizView()
+    if passed:
+        result_view = None
+    elif session.get("kind") == "joint":
+        result_view = PersistentJointQuizView()
+    else:
+        result_view = PersistentQuizView()
     msg = await interaction.response.edit_message(embed=embed, view=result_view)
 
     # 通过结果一段时间后自动删除；失败结果保留按钮供查询冷却
@@ -4899,14 +5385,68 @@ def _get_quiz_cooldown_status(user_id: int) -> tuple[bool, int, int]:
     return True, minutes, fail_count
 
 
+class JointRegisterModal(discord.ui.Modal, title="受邀登记表"):
+    inviter = discord.ui.TextInput(
+        label="是谁把你请来的（名字或备注）",
+        required=True,
+        max_length=80,
+        placeholder="邀请人的称呼，方便出事对得上",
+    )
+    note = discord.ui.TextInput(
+        label="补充（可留空）",
+        required=False,
+        max_length=120,
+        placeholder="例如：朋友介绍、哪个群认识的",
+        style=discord.TextStyle.paragraph,
+    )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        if not interaction.guild:
+            await interaction.response.send_message("只能在服务器里用。", ephemeral=True)
+            return
+        if not _member_has_role(interaction.user, INVITED_ROLE_NAME) and not _is_island_owner(interaction):
+            await interaction.response.send_message(
+                f"先去身份卡领「{INVITED_ROLE_NAME}」，再来填这张表。",
+                ephemeral=True,
+            )
+            return
+        guild_id = str(interaction.guild.id)
+        bucket = joint_register_data.setdefault(guild_id, {})
+        if not isinstance(bucket, dict):
+            bucket = {}
+            joint_register_data[guild_id] = bucket
+        bucket[str(interaction.user.id)] = {
+            "user_id": str(interaction.user.id),
+            "user_name": getattr(interaction.user, "display_name", None) or str(interaction.user),
+            "inviter": " ".join(str(self.inviter.value or "").split())[:80],
+            "note": " ".join(str(self.note.value or "").split())[:120],
+            "at": _beijing_now().isoformat(),
+        }
+        save_joint_registers()
+        await interaction.response.send_message(
+            "登记表已收下。接下来点「开始连坐答题」。",
+            ephemeral=True,
+        )
+
+
+async def _do_joint_register_open(interaction: discord.Interaction):
+    if _user_passed_quiz(interaction.user):
+        await interaction.response.send_message(_quiz_already_passed_text(), ephemeral=True)
+        return
+    if not _is_island_owner(interaction) and not _member_has_role(interaction.user, INVITED_ROLE_NAME):
+        await interaction.response.send_message(
+            f"先去身份卡领「{INVITED_ROLE_NAME}」，再来填登记表。",
+            ephemeral=True,
+        )
+        return
+    await interaction.response.send_modal(JointRegisterModal())
+
+
 async def _do_cooldown_check(interaction: discord.Interaction):
     """查询答题冷却，供按钮和 /冷却 命令共用"""
     role = discord.utils.get(interaction.user.roles, name=QUIZ_VERIFIED_ROLE)
     if role:
-        await interaction.response.send_message(
-            f"✅ 你已经通过了入群审核，拥有「{QUIZ_VERIFIED_ROLE}」身份组，没有冷却。",
-            ephemeral=True,
-        )
+        await interaction.response.send_message(_quiz_already_passed_text(), ephemeral=True)
         return
 
     in_cooldown, minutes, fail_count = _get_quiz_cooldown_status(interaction.user.id)
@@ -4932,20 +5472,38 @@ async def _do_cooldown_check(interaction: discord.Interaction):
     )
 
 
-async def _do_quiz(interaction: discord.Interaction):
-    """答题核心逻辑，供 /答题 命令和答题频道按钮共用"""
+async def _do_quiz(interaction: discord.Interaction, kind: str = "normal"):
+    """答题核心逻辑。kind=normal 走普通题库，kind=joint 走连坐题库。"""
     user_id = interaction.user.id
 
-    # 检查是否已经通过答题
-    role = discord.utils.get(interaction.user.roles, name=QUIZ_VERIFIED_ROLE)
-    if role:
-        await interaction.response.send_message(
-            "✅ 你已经通过了入群审核，拥有「{0}」身份组，无需再次答题！".format(QUIZ_VERIFIED_ROLE),
-            ephemeral=True,
-        )
+    if _user_passed_quiz(interaction.user):
+        await interaction.response.send_message(_quiz_already_passed_text(), ephemeral=True)
         return
 
-    # 检查是否有进行中的答题
+    if not _is_island_owner(interaction):
+        if kind == "joint":
+            if not _member_has_role(interaction.user, INVITED_ROLE_NAME):
+                await interaction.response.send_message(
+                    f"这条路给被请来的人。先去身份卡领「{INVITED_ROLE_NAME}」。",
+                    ephemeral=True,
+                )
+                return
+            guild_id = str(interaction.guild.id) if interaction.guild else ""
+            registered = (joint_register_data.get(guild_id) or {}).get(str(user_id))
+            if not registered:
+                await interaction.response.send_message(
+                    "先点「填写登记表」，再开始连坐答题。",
+                    ephemeral=True,
+                )
+                return
+        else:
+            if not _member_has_role(interaction.user, NEWCOMER_ROLE_NAME):
+                await interaction.response.send_message(
+                    f"先去身份卡领「{NEWCOMER_ROLE_NAME}」，领完再来答这张卷。",
+                    ephemeral=True,
+                )
+                return
+
     if user_id in quiz_sessions:
         await interaction.response.send_message(
             "你有一个答题正在进行中！请先完成它。",
@@ -4953,7 +5511,6 @@ async def _do_quiz(interaction: discord.Interaction):
         )
         return
 
-    # 检查冷却时间
     in_cooldown, minutes, fail_count = _get_quiz_cooldown_status(user_id)
     if in_cooldown:
         await interaction.response.send_message(
@@ -4963,16 +5520,15 @@ async def _do_quiz(interaction: discord.Interaction):
         )
         return
 
-    # 检查题库
-    if not quiz_questions:
+    bank = joint_quiz_questions if kind == "joint" else quiz_questions
+    if not bank:
         await interaction.response.send_message(
             "题库中没有题目，请联系管理员添加题目。",
             ephemeral=True,
         )
         return
 
-    # 打乱全部题目后开始答题
-    selected = quiz_questions[:]
+    selected = bank[:]
     random.shuffle(selected)
     total = len(selected)
     quiz_sessions[user_id] = {
@@ -4980,6 +5536,7 @@ async def _do_quiz(interaction: discord.Interaction):
         "current_index": 0,
         "answers": [],
         "started_at": datetime.now().isoformat(),
+        "kind": kind,
     }
 
     q = selected[0]
@@ -4994,7 +5551,9 @@ async def _do_quiz(interaction: discord.Interaction):
 
 @bot.tree.command(name="答题", description="开始入群审核答题，须答完全部题目且全部答对（备用命令）")
 async def start_quiz(interaction: discord.Interaction):
-    await _do_quiz(interaction)
+    channel_name = getattr(getattr(interaction, "channel", None), "name", "") or ""
+    kind = "joint" if JOINT_QUIZ_CHANNEL_KEYWORD in channel_name else "normal"
+    await _do_quiz(interaction, kind=kind)
 
 
 @bot.tree.command(name="冷却", description="查询自己的答题冷却剩余时间")
@@ -9417,6 +9976,7 @@ if __name__ == "__main__":
 
         # 注册持久化视图（必须在 bot.start() 之前）
         bot.add_view(PersistentQuizView())
+        bot.add_view(PersistentJointQuizView())
         bot.add_view(PersistentCheckinView())
         bot.add_view(PersistentGambleView())
         bot.add_view(PersistentRedPacketView())
@@ -9439,7 +9999,7 @@ if __name__ == "__main__":
         bot.music_idle_task = asyncio.create_task(_music_idle_watchdog())
 
         logger.info("🚀 正在启动 Chen-Abot...")
-        logger.info(f"构建标记: 添加身份改用原生身份组选择器　缓存文件: {INVITE_CACHE_FILE}")
+        logger.info(f"构建标记: 邀请分路+连坐登记+关闭社区　缓存文件: {INVITE_CACHE_FILE}")
         try:
             await bot.start(token)
         except discord.LoginFailure as e:
